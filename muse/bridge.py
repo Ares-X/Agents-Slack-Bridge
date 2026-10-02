@@ -36,6 +36,9 @@ _ENV = load_env(ENV_PATH) if os.path.exists(ENV_PATH) else {}
 PROXY_URL = _ENV.get("PROXY_URL") or None      # 出站代理，直连留空
 CA_BUNDLE = _ENV.get("CA_BUNDLE") or None      # 自签 CA 路径，默认系统 CA 留空
 
+# 多 agent 协作默认：放行其他 bot 的 @mention（自己的消息永远过滤，防自循环）。
+# 可选白名单：.env 里 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔）。
+# 两者都留空 = 允许任意其他 bot（协作默认）；任一非空 = 白名单模式，仅放行列出的 ID。
 def _parse_csv_set(raw):
     """Comma-separated IDs → set of non-empty stripped strings."""
     if not raw:
@@ -43,12 +46,9 @@ def _parse_csv_set(raw):
     return {x.strip() for x in raw.split(",") if x.strip()}
 
 
-# 白名单：多 agent 协作时放行对端 bot 的 @/发言。
-# 默认空 = 丢弃全部 bot 消息（muse 安全默认；只防自循环不够，还防陌生 bot）。
-# 协作时在 .env 填 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔 U…/B…），二者满足其一即放行。
-# 自己的消息永远被过滤，不会自循环。
 ALLOWED_BOT_USERS = _parse_csv_set(_ENV.get("ALLOWED_BOT_USERS", ""))
 ALLOWED_BOT_IDS = _parse_csv_set(_ENV.get("ALLOWED_BOT_IDS", ""))
+WHITELIST_MODE = bool(ALLOWED_BOT_USERS or ALLOWED_BOT_IDS)
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -136,12 +136,14 @@ def main():
             if not kind:
                 return
 
-            # 自己的消息永远丢弃；.env 白名单 bot 放行（协作）；其余 bot 丢弃（muse 默认）
+            # 自己的消息永远丢弃（防自循环）；
+            # 其他 bot 默认放行（多 agent 协作）；白名单模式仅放行列出的 ID。
             if event.get("user") == me:
                 return
             is_bot_msg = bool(event.get("bot_id")) or \
                 event.get("subtype") == "bot_message"
-            if is_bot_msg and event.get("user") not in ALLOWED_BOT_USERS \
+            if is_bot_msg and WHITELIST_MODE \
+                    and event.get("user") not in ALLOWED_BOT_USERS \
                     and event.get("bot_id") not in ALLOWED_BOT_IDS:
                 return
 

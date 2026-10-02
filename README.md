@@ -10,7 +10,7 @@ Slack ↔ Agent 双向桥接：**Socket Mode** 出站长连接，机器只需出
 
 | 目录 | 面向 | 消费 | 其它 bot @ | 默认回复位置 |
 |---|---|---|---|---|
-| **[`muse/`](./muse/README.md)** | Muse / 任意带 `generate_reply()` 的通用 LLM agent | ~30s 轮询 consumer（或平台 side chat） | 默认丢弃；白名单 `ALLOWED_BOT_*` 放行 | 有 `thread_ts` 则跟帖 |
+| **[`muse/`](./muse/README.md)** | Muse / 任意带 `generate_reply()` 的通用 LLM agent | ~30s 轮询 consumer（或平台 side chat） | **默认允许**其他 bot @（仅丢弃自己）；可选白名单收紧 | 有 `thread_ts` 则跟帖 |
 | **[`grokbot/`](./grokbot/README.md)** | Grok Bot / Cursor Grok Bot | **5s** 本地 consumer，或可选 **5min** agent 例程（`pending.json`） | **默认允许**其他 bot（仅丢弃自己）；可选白名单收紧 | 默认**频道顶层**（`REPLY_IN_THREAD=0`） |
 | **[`hermes/`](./hermes/README.md)** | **Hermes Agent 本体**（原生 Slack 平台插件，非自建桥） | 无需 consumer——事件直达 agent 回合 | `allow_bots: mentions`（对方消息明确 @ 才受理） | `reply_in_thread` 可配 |
 
@@ -61,6 +61,12 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
 规则：
 - 永不提交 .env；永不把 xoxb-/xapp- token 贴进聊天；用 0600 文件或 secret store。
 - 只在 /workspace 或用户指定的持久目录操作。
+- 多 agent 协作是默认行为，不是可选项：其他 bot 的 @mention 默认放行，
+  装完即可互相对话。若用户明确要求收紧，才设白名单（muse/grokbot 的
+  ALLOWED_BOT_USERS/ALLOWED_BOT_IDS；hermes 的 allow_bots 已是安全默认 mentions）。
+- 防回环纪律（写进协作 agent 的系统提示）：被 @ 才回；回一轮就停，
+  不要连环自言自语；需要另一个 agent 接手时在消息里明确 @ 对方；
+  转述/引用别人说过的 @ 时写纯文本名字，不要写真实 @mention。
 
 多 agent 频道协作默认（配置与回复行为都按此执行）：
 - 允许其他 bot @ 本 bot：grokbot 默认放行其他 bot（仅丢弃自己）；muse 默认丢弃全部 bot，协作时把对端写入 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（或 bridge.py 白名单）；hermes 用 allow_bots: mentions。

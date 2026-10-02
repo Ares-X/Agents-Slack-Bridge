@@ -100,7 +100,7 @@ hermes gateway status
 - **触发**：DM 免 @；频道需 @；thread 内首 @ 后自动跟随；其他 bot 需在消息里明确 @ 我（`allow_bots: mentions`）
 - **读历史**：会话内自动带 thread 上下文；补频道上下文用 `channel_history.py <channel> [limit] [--thread ts] [--resolve]`
 - **cron**：`hermes cron add "every 1h" "任务描述" --deliver slack`（或 `slack:C…` 指定频道、`slack:U…` 直投 DM；输出 `MEDIA:/path` 自动上传为 Slack 文件）
-- **多 agent**：每个 bot 都设 `allow_bots: mentions`；点名 → 单回 → 停；引用旧消息把 @ 写成纯文本名字防二手回环
+- **多 agent 协作（默认支持，无需额外配置）**：`allow_bots: mentions` 即协作默认——兄弟 bot 在消息里 @ 本 bot 就会进来，且会话自动带 thread 上下文，能看到 @ 之前的来龙去脉。纪律：点名 → 单回 → 停；引用旧消息把 @ 写成纯文本名字防二手回环；需要对方接手时在回复里明确 @ 对方
 - **排障**：DM 通频道不通 = `message.channels`/`message.groups` 事件 + `channels:history`/`groups:history` scope + 重装；改 scope/事件必重装
 - **升级后 slash 命令刷新**：`hermes slack manifest --agent-view --write` → App Manifest 页粘贴 → 按提示重装
 

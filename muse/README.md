@@ -113,7 +113,7 @@ Agents-Slack-Bridge/
 2. **`/etc` 文件消失** → 见 §2.3 警告，正本放本目录 + 健康检查自愈。
 3. **出站代理/TLS 拦截** → `.env` 配 `PROXY_URL` / `CA_BUNDLE`，三个脚本都会读。
 4. **频道必须先邀请 bot**，否则收不到 `app_mention`。
-5. **多 agent / 防自循环**：`bridge.py` 默认丢弃所有 bot 消息。协作时在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS` 放行对端（自己的消息永远过滤）。不要为了省事改成放行全部 bot（易回环）。
+5. **多 agent 协作（默认开）**：其他 bot 的 @mention 默认放行，自己的消息永远过滤（防自循环）。要收紧成白名单，把协作对象的 user ID / bot ID 填进 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（任一非空即白名单模式）。防回环纪律：被 @ 才回、回一轮就停、转述别人 @ 时写纯文本名字不写实 @。
 6. **回复前读上下文**：消费层应先 `channel_history.py` 再生成回复（参考 `poll_consumer.py`）。
 7. **Socket Mode 先 ack 再处理**，否则 Slack 重发。
 8. **中断期消息会丢**（Slack 不补发），健康检查把中断窗口压到分钟级。
