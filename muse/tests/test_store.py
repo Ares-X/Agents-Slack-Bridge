@@ -93,7 +93,11 @@ class StoreTest(unittest.TestCase):
         inbox_store.append_record(rec("C1", "2.2"))
         inbox_store.ack([inbox_store.msg_id("C1", "1.1")])
         stats = inbox_store.compact()
-        self.assertEqual(stats, {"kept": 1, "dropped": 1})
+        self.assertEqual(stats["kept"], 1)
+        self.assertEqual(stats["dropped"], 1)
+        # tombstone 保留（保留期内），不是和消息一起删掉
+        self.assertEqual(stats["tombstones_kept"], 1)
+        self.assertEqual(stats["tombstones_expired"], 0)
         rest = inbox_store.read_undelivered()
         self.assertEqual([m["msg_id"] for m in rest], ["C1:2.2"])
 

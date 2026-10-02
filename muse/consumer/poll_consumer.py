@@ -4,11 +4,25 @@
 生产使用必须换成真实模型调用，见 README §2.4。
 
 发送状态机（consumer/send_state.json 持久化，防重复发送）：
-  pending --发送--> sent_ok --ack--> done
-                     |           \u2514 ack 失败 -> sent_unacked（只重试 ack，绝不重发正文）
-                     |--明确失败--> pending（下轮重试）
-                     \u2514--结果不确定--> uncertain（经 history 核验；核验无结论则延迟，
-                                          绝不盲目重发；3 轮仍无结论转人工日志）
+  claim(发送前持久化领取) --发送--> ok --ack--> done（条目删除）
+                                     |--ack 失败--> unacked（只重试 ack，
+                                     |                        绝不重发正文）
+                                     |--明确失败--> claim 释放，下轮干净重试
+                                     └--结果不确定--> uncertain（经 history
+                                        严格核验；核验无结论则延迟，绝不盲目
+                                        重发；3 轮仍无结论转人工日志）
+
+关键不变量：
+- claim 在 spawn send.py 子进程之前落盘（fsync）。进程崩溃后重启，
+  "sending" 条目一律转为 uncertain，永远不会恢复成"可直接发送"。
+- send_reply 只有在"明确证明未发送"时返回 fail（API 明确拒绝 / 死在
+  API 调用之前）；其余（超时、连接中断、输出含糊）一律 uncertain。
+- verify_sent 必须同时核对：是我们自己的 bot、目标频道/线程一致、
+  消息时间不早于本次发送尝试、全文精确匹配。证明不了就保持
+  uncertain，绝不猜测成功。
+- send_state.json 损坏绝不静默当成空状态：优先从 .bak/.tmp 恢复；
+  都损坏则隔离为 send_state.json.corrupt.* 并抛 StateCorruptError，
+  consumer 在此期间拒绝发送（fail-closed），直到人工恢复。
 
 历史降级策略：history 拉取失败时延迟处理（3 轮），3 轮后降级进行，
 在会话日志里留下可见标记，不向 Slack 泄露内部细节。
@@ -16,6 +30,7 @@
 脚本 cwd：本文件在 consumer/ 下，inbox_peek / send / channel_history
 都在上一层（muse/），因此 ROOT = dirname(BASE)，所有子进程在 ROOT 跑。
 """
+import hashlib
 import json
 import os
 import re
@@ -31,6 +46,9 @@ POLL_INTERVAL = 30          # 秒
 HISTORY_DEFER_LIMIT = 3     # history 连续失败这么多轮后降级进行
 VERIFY_LIMIT = 3            # 发送结果不确定时，最多核验这么多轮
 SEND_TIMEOUT = 60           # send.py 单次超时（秒）
+VERIFY_SKEW_SECONDS = 60    # 核验时允许的本机/Slack 时钟偏差
+
+from send_state import SendState, StateCorruptError
 
 MENTION_RE = re.compile(r"<@([UB][A-Z0-9]+)>")
 CHANNEL_REF_RE = re.compile(r"<#(C[A-Z0-9]+)\|([^>]+)>")
@@ -47,6 +65,22 @@ def strip_mentions(text):
     text = MENTION_RE.sub(r"@\1", text)
     text = CHANNEL_REF_RE.sub(r"#\2", text)
     text = SPECIAL_MENTION_RE.sub(r"@\1", text)
+    return text
+
+
+def text_hash(text):
+    """回复全文的稳定指纹：核验用精确匹配，不再用 60 字前缀猜测。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def wire_text(text, mentions):
+    """send.py 实际发出的最终正文：--mention 追加在正文末尾。
+
+    全文 hash 必须对它计算，否则核验永远对不上。
+    拼接规则与 send.py 保持一致（见该文件注释），改一处必须改另一处。
+    """
+    if mentions:
+        text = text.rstrip() + " " + " ".join(f"<@{u}>" for u in mentions)
     return text
 
 
@@ -112,6 +146,47 @@ def channel_history(channel, limit=15):
     return msgs, err
 
 
+_bot_identity = None
+
+
+def resolve_bot_identity():
+    """返回 (bot_id, bot_user_id)，任一可能为 None。进程内只解析一次。
+
+    bot_id（B 开头）来自 .env 的 SLACK_BOT_ID；bot_user_id（U 开头）来自
+    .env 的 SLACK_BOT_USER_ID，缺失时用 auth_test 解析一次。
+    """
+    global _bot_identity
+    if _bot_identity is not None:
+        return _bot_identity
+    env_path = os.path.join(ROOT, ".env")
+    env = {}
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    bot_id = env.get("SLACK_BOT_ID") or None
+    bot_user_id = env.get("SLACK_BOT_USER_ID") or None
+    token = env.get("SLACK_BOT_TOKEN")
+    if not bot_user_id and token:
+        try:
+            import ssl as _ssl
+            from slack_sdk.web import WebClient
+            proxy = env.get("PROXY_URL") or None
+            ca = env.get("CA_BUNDLE") or None
+            ctx = _ssl.create_default_context(
+                cafile=ca if ca and os.path.exists(ca) else None)
+            c = WebClient(token=token,
+                          **({"proxy": proxy} if proxy else {}), ssl=ctx)
+            bot_user_id = c.auth_test().get("user_id") or None
+        except Exception as e:
+            print(f"bot identity resolve failed: {e}", file=sys.stderr)
+    _bot_identity = (bot_id, bot_user_id)
+    return _bot_identity
+
+
 def generate_reply(channel, message, session, history):
     """★ 换成你家 agent 的真实模型调用。
 
@@ -131,7 +206,12 @@ def normalize_reply(ret):
 
 
 def send_reply(channel, text, thread_ts=None, mentions=()):
-    """返回 "ok" | "fail" | "uncertain"。"""
+    """返回 "ok" | "fail" | "uncertain"。
+
+    只有"明确证明未发送"才返回 "fail"（API 明确拒绝 / 死在 API 调用
+    之前）；其余一律 "uncertain"——请求可能已被 Slack 接受但响应丢失，
+    调用方绝不能自动重发，必须走 history 核验。
+    """
     cmd = [sys.executable, "send.py", channel]
     if thread_ts:
         cmd += ["--thread-ts", thread_ts]
@@ -144,61 +224,114 @@ def send_reply(channel, text, thread_ts=None, mentions=()):
     except Exception as e:
         print(f"send subprocess error: {e}", file=sys.stderr)
         return "uncertain"
-    if r.returncode == 0 and "sent ok: True" in r.stdout:
+    out = r.stdout or ""
+    err = r.stderr or ""
+    if "sent ok: True" in out:
         return "ok"
-    if r.returncode != 0 or "sent ok: False" in r.stdout:
-        return "fail"
-    return "uncertain"  # 输出含糊：无法判定是否发出
+    if "sent ok: False" in out:
+        return "fail"          # API 明确拒绝：证明未发送
+    if "RESULT not-sent" in out or "RESULT not-sent" in err:
+        return "fail"          # 死在 API 调用之前：证明未发送
+    # 超时、连接中断（RESULT uncertain）、输出含糊：可能已发出
+    return "uncertain"
 
 
-def verify_sent(channel, text):
-    """经 history 核验正文是否已发出。返回 True/False/None（无法核验）。"""
-    msgs, err = channel_history(channel, limit=10)
+def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
+                sent_after=0.0, limit=30):
+    """经 history 严格核验本次发送是否已出现在频道里。
+
+    候选必须同时满足（缺一不可）：
+      1. 是 bot 消息，且身份是我们自己的 bot
+         （bot_id 或 user id 命中其一）；
+      2. 频道/线程一致（thread_ts 必须相等；顶层回复双方都为空）；
+      3. 消息 ts 不早于本次发送尝试（允许 VERIFY_SKEW_SECONDS 时钟偏差）；
+      4. 全文精确匹配（sha256，不再是 60 字前缀）。
+    返回 True（已证实发出）/ False（无证据）/ None（历史不可用）。
+    身份未知（bot_id/bot_user_id 都拿不到）时永远返回 False：
+    证明不了就保持 uncertain，绝不猜测成功。
+    """
+    msgs, err = channel_history(channel, limit=limit)
     if err:
         return None
-    needle = text.strip()[:60]
+    if not thash:
+        return False
     for m in msgs:
-        if m.get("is_bot") and (m.get("text") or "").strip().startswith(needle):
-            return True
+        if not m.get("is_bot"):
+            continue
+        ident_ok = (bot_id and m.get("bot_id") == bot_id) or \
+                   (bot_user_id and m.get("user") == bot_user_id)
+        if not ident_ok:
+            continue
+        if (m.get("thread_ts") or "") != (thread_ts or ""):
+            continue
+        try:
+            mts = float(m.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mts < sent_after - VERIFY_SKEW_SECONDS:
+            continue
+        if m.get("text_sha256") != thash:
+            continue
+        return True
     return False
 
 
-def handle_one(m, sessions, state):
+def _verify_hold(m, entry, state, bot_id, bot_user_id, why):
+    """核验优先：能证明发出则 ack，否则保持 uncertain。绝不发送正文。
+
+    用于 uncertain 条目、sending 残留条目、以及 claim 被并发抢占的
+    情况——调用方不确定消息是否已发出时唯一的合法动作。
+    """
     mid = m["msg_id"]
     ch = m["channel"]
-
-    # --- sent_unacked：只重试 ack，绝不重发正文 ---
-    if mid in state.get("sent_unacked", []):
+    thread_ts = m.get("thread_ts") or ""
+    if entry.get("attempts", 0) >= VERIFY_LIMIT:
+        print(f"MANUAL REVIEW needed: send result uncertain after "
+              f"{VERIFY_LIMIT} verifications ({why}), {mid} left pending",
+              file=sys.stderr)
+        return "uncertain-held"
+    v = verify_sent(ch, entry.get("text_hash"), thread_ts,
+                    bot_id, bot_user_id, entry.get("claimed_at", 0.0))
+    if v is True:
         if ack([mid]):
-            state["sent_unacked"].remove(mid)
+            state.resolve(mid)
+            return "verified-acked"
+        state.set_unacked(mid)
+        return "verified-unacked"
+    state.set_uncertain(mid, entry.get("attempts", 0) + 1)
+    print(f"send unverified ({why}; {entry.get('attempts', 0) + 1}/"
+          f"{VERIFY_LIMIT}), holding {mid}")
+    return "uncertain-held"
+
+
+def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
+    mid = m["msg_id"]
+    ch = m["channel"]
+    thread_ts = m.get("thread_ts") or ""
+
+    # --- unacked：只重试 ack，绝不重发正文 ---
+    entry = state.get(mid)
+    if entry and entry.get("status") == "unacked":
+        if ack([mid]):
+            state.resolve(mid)
             print(f"ack recovered for {mid}")
         return "acked-later"
 
-    # --- uncertain：先核验，不盲目重发 ---
-    unc = state.get("uncertain", {}).get(mid)
-    if unc:
-        if unc.get("attempts", 0) >= VERIFY_LIMIT:
-            print(f"MANUAL REVIEW needed: send result uncertain after "
-                  f"{VERIFY_LIMIT} verifications, {mid} left pending",
-                  file=sys.stderr)
-            return "uncertain-held"
-        v = verify_sent(ch, unc.get("text", ""))
-        if v is True:
-            if ack([mid]):
-                state["uncertain"].pop(mid, None)
-                return "verified-acked"
-            state["sent_unacked"].append(mid)
-            return "verified-unacked"
-        unc["attempts"] = unc.get("attempts", 0) + 1
-        unc["last"] = time.time()
-        print(f"send unverified ({unc['attempts']}/{VERIFY_LIMIT}), holding {mid}")
-        return "uncertain-held"
+    # --- uncertain / sending：先严格核验，不盲目重发 ---
+    # sending 只有两种来源：另一个存活 consumer 正在发送，或上一轮死在
+    # claim 与结果处理之间（重启时已转 uncertain，剩下的就是并发）。
+    # 两种都不能直接重发，只能核验。
+    if entry and entry.get("status") in ("uncertain", "sending"):
+        return _verify_hold(
+            m, entry, state, bot_id, bot_user_id,
+            why=("previous attempt unfinished"
+                 if entry.get("status") == "sending" else "uncertain result"))
 
     # --- history 降级策略：失败先延迟，3 轮后降级进行并留可见标记 ---
     hist, herr = channel_history(ch)
     if herr:
-        n = state.get("hist_deferred", {}).get(mid, 0) + 1
-        state.setdefault("hist_deferred", {})[mid] = n
+        n = state.get_hist_deferred(mid) + 1
+        state.set_hist_deferred(mid, n)
         if n < HISTORY_DEFER_LIMIT:
             print(f"deferring {mid}: history unavailable "
                   f"({n}/{HISTORY_DEFER_LIMIT}): {herr}")
@@ -208,63 +341,94 @@ def handle_one(m, sessions, state):
         degraded_note = (f"[degraded] history unavailable after {n} attempts: "
                          f"{herr}")
     else:
-        state.get("hist_deferred", {}).pop(mid, None)
+        state.set_hist_deferred(mid, 0)
         degraded_note = None
 
     sess = sessions.setdefault(ch, [])
     if degraded_note:
         sess.append({"role": "system", "text": degraded_note})
 
-    # --- 生成并发送 ---
+    # --- 生成、领取、发送 ---
     text, mentions = normalize_reply(generate_reply(ch, m, sess, hist))
-    result = send_reply(ch, text, thread_ts=m.get("thread_ts") or None,
+    # hash 必须对最终发出的正文计算（含 send.py 追加的显式 mention），
+    # 否则核验时全文永远对不上。
+    thash = text_hash(wire_text(text, mentions))
+    # 先持久化领取（fsync），再 spawn 子进程：崩溃后重启走 uncertain，
+    # 绝不直接重发。
+    claim_entry, owned = state.claim(mid, channel=ch, thread_ts=thread_ts,
+                                     text_hash=thash)
+    if not owned:
+        # TOCTOU：get 与 claim 之间被另一个存活 consumer 抢先领取。
+        # 对方可能正在发送：本轮只核验，绝不并行发送。
+        fresh = state.get(mid) or claim_entry
+        return _verify_hold(m, fresh, state, bot_id, bot_user_id,
+                            why="claim lost to concurrent consumer")
+    result = send_reply(ch, text, thread_ts=thread_ts or None,
                         mentions=mentions)
 
     if result == "ok":
         if ack([mid]):
+            state.resolve(mid)
             sess.append({"role": "user", "text": m["text"]})
             sess.append({"role": "assistant", "text": text})
             sessions[ch] = sess[-40:]
             return "replied"
-        # 发送成功但确认失败：记 sent_unacked，只重试 ack
-        state.setdefault("sent_unacked", []).append(mid)
+        # 发送成功但确认失败：记 unacked，只重试 ack
+        state.set_unacked(mid)
         sess.append({"role": "user", "text": m["text"]})
         sess.append({"role": "assistant", "text": text})
         sessions[ch] = sess[-40:]
         return "sent-unacked"
     if result == "fail":
+        # 已证明未发送：释放 claim，下轮干净重试
+        state.resolve(mid)
         print(f"send failed for {mid}, will retry next round", file=sys.stderr)
         return "send-failed"
-    # uncertain：立即核验一次，不盲目重发
-    v = verify_sent(ch, text)
+    # uncertain：立即严格核验一次，不盲目重发
+    v = verify_sent(ch, thash, thread_ts, bot_id, bot_user_id,
+                    claim_entry["claimed_at"])
     if v is True:
         if ack([mid]):
+            state.resolve(mid)
             return "verified-acked"
-        state.setdefault("sent_unacked", []).append(mid)
+        state.set_unacked(mid)
         return "verified-unacked"
-    state.setdefault("uncertain", {})[mid] = {
-        "attempts": 1, "last": time.time(), "text": text[:200]}
+    state.set_uncertain(mid, 1)
     print(f"send result uncertain for {mid}, holding for verification")
     return "uncertain-held"
 
 
 def main():
     print(f"consumer polling every {POLL_INTERVAL}s (ROOT={ROOT}) ...")
+    bot_id, bot_user_id = resolve_bot_identity()
+    print(f"bot identity: bot_id={bot_id or '?'} "
+          f"bot_user_id={bot_user_id or '?'}")
+    state = None
     while True:
         try:
+            if state is None:
+                state = SendState(STATE_PATH)
+            state.ensure_usable()
             msgs = peek()
             if msgs:
                 sessions = load_json(SESSIONS_PATH, {})
-                state = load_json(STATE_PATH, {})
                 for m in msgs:
                     try:
-                        res = handle_one(m, sessions, state)
+                        res = handle_one(m, sessions, state,
+                                         bot_id=bot_id,
+                                         bot_user_id=bot_user_id)
                         print(f"{m['msg_id']}: {res}")
+                    except StateCorruptError:
+                        raise
                     except Exception as e:
                         print(f"error handling {m.get('msg_id')}: {e}",
                               file=sys.stderr)
                 save_json(SESSIONS_PATH, sessions)
-                save_json(STATE_PATH, state)
+        except StateCorruptError as e:
+            # fail-closed：状态不可用时拒绝发送，直到人工恢复。
+            state = None
+            print(f"CRITICAL: send state unusable, refusing to send: {e}",
+                  file=sys.stderr)
         except Exception as e:
             print(f"poll error: {e}", file=sys.stderr)
         time.sleep(POLL_INTERVAL)

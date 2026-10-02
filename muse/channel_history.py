@@ -10,6 +10,7 @@ Usage: python channel_history.py <channel> [limit]
 """
 import json
 import os
+import hashlib
 import ssl
 import sys
 import time
@@ -72,10 +73,17 @@ def main():
         return names[uid]
 
     for m in reversed(msgs):  # chronological order
+        full_text = m.get("text") or ""
         print(json.dumps({
             "user_name": nm(m.get("user", "")),
-            "text": (m.get("text") or "")[:500],
+            "user": m.get("user", ""),
+            "bot_id": m.get("bot_id", ""),
+            "text": full_text[:500],
+            # 全文哈希：发送核验用精确匹配，不再用 60 字前缀猜测。
+            "text_sha256": hashlib.sha256(
+                full_text.encode("utf-8")).hexdigest(),
             "ts": m.get("ts", ""),
+            "thread_ts": m.get("thread_ts", ""),
             "is_bot": bool(m.get("bot_id")),
         }, ensure_ascii=False))
 

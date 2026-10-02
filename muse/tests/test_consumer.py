@@ -5,6 +5,7 @@ Run:  python -m unittest discover -s tests -v   (from muse/consumer/.. i.e. muse
 """
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "consumer"))
 
 import poll_consumer as pc
+from send_state import SendState
+
+
+def fresh_state():
+    tmp = tempfile.mkdtemp(prefix="sendstate_test_")
+    return SendState(os.path.join(tmp, "send_state.json"))
 
 
 def msg(mid="C1:1.1", text="hi <@U999>"):
@@ -39,7 +46,7 @@ class MentionHygieneTest(unittest.TestCase):
 class SendStateMachineTest(unittest.TestCase):
     def setUp(self):
         self.sessions = {}
-        self.state = {}
+        self.state = fresh_state()
         self.sent_texts = []
         self.ack_calls = []
         self.ack_results = [True]
@@ -70,7 +77,7 @@ class SendStateMachineTest(unittest.TestCase):
         self.assertEqual(self.run_one(msg()), "replied")
         self.assertEqual(len(self.sent_texts), 1)
         self.assertEqual(self.ack_calls, [["C1:1.1"]])
-        self.assertNotIn("sent_unacked", self.state)
+        self.assertIsNone(self.state.get("C1:1.1"))  # resolved, no leftover
 
     def test_ack_failure_does_not_resend(self):
         self.ack_results = [False]
@@ -102,7 +109,7 @@ class SendStateMachineTest(unittest.TestCase):
 
 class UncertainSendTest(unittest.TestCase):
     def test_uncertain_does_not_blind_resend(self):
-        sessions, state = {}, {}
+        sessions, state = {}, fresh_state()
         m = msg()
         sends = []
 
@@ -137,7 +144,7 @@ class UncertainSendTest(unittest.TestCase):
         self.assertEqual(res2, "uncertain-held")
 
     def test_uncertain_verified_then_acked(self):
-        sessions, state = {}, {}
+        sessions, state = {}, fresh_state()
         m = msg()
         with patch.object(pc, "sh", side_effect=TimeoutError("hung")), \
              patch.object(pc, "channel_history", return_value=([], None)), \
@@ -151,7 +158,7 @@ class UncertainSendTest(unittest.TestCase):
 
 class HistoryDegradationTest(unittest.TestCase):
     def test_history_error_defers_then_degrades(self):
-        sessions, state = {}, {}
+        sessions, state = {}, fresh_state()
         m = msg()
         results = []
         for _ in range(4):

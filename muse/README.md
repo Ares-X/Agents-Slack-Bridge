@@ -77,7 +77,7 @@ tail -f bridge.log                          # → "socket mode connected, listen
 >
 > 真实回复位置：`send.py <channel>` 发到频道顶层；带 `--thread-ts` 则跟帖。多 agent 协作想让同伴看见时用顶层（不传 `--thread-ts`）。
 >
-> 已验证范围：`tests/` 30 个隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤）全部通过；**真实 Slack 联调（NOT_EXERCISED）**——未在授权测试频道执行，需部署者按 §6 自行验证。
+> 已验证范围：`tests/` 61 个隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤）全部通过；**真实 Slack 联调（NOT_EXERCISED）**——未在授权测试频道执行，需部署者按 §6 自行验证。
 
 用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；需要同伴看见回复时不要默认跟帖。
 
@@ -123,6 +123,20 @@ Agents-Slack-Bridge/
 - 确认是追加 tombstone（`{"type":"ack",...}`），**不做原地重写**——中途中断不会损坏已存消息。
 - 消费流程：`inbox_peek.py` 读未确认消息 → 处理 → `inbox_ack.py <channel:ts>` 确认（失败不确认，下轮重试；退出码非 0 = 未确认，调用方不得重发正文）。
 - 维护：`python -c "import inbox_store; print(inbox_store.compact())"` 清理已确认记录。
+- 旧队列升级：pre-`msg_id` 时代的队列（无 `msg_id`、用 `delivered` 标记）首次被操作时自动迁移为 v2：`delivered=true` 转成 ack tombstone（**绝不**重播已处理消息），`delivered=false` 补上计算出的 `msg_id`。迁移是 temp+fsync+replace 原子重写，可重复跑、可崩溃恢复。
+
+## 4b. 可靠性语义（防重复发送 / 队列 / 恢复）
+
+发送端（`consumer/poll_consumer.py` + `send_state.py`）：
+- **发送前先持久化领取**：`spawn send.py` 之前把 `sending` 状态 fsync 落盘。进程崩溃后重启，`sending` 一律转为 `uncertain`，**永远不会**恢复成"可直接发送"。
+- **只有"明确证明未发送"才重试**：`send.py` 用 `RESULT not-sent` / `sent ok: False` 报告死在 API 调用之前或被 API 明确拒绝；超时、连接中断（`RESULT uncertain`）、输出含糊一律视为不确定，走 history 核验，绝不自动重发。
+- **核验必须四项全中**：是我们自己的 bot（`SLACK_BOT_ID`/`SLACK_BOT_USER_ID` 命中其一）、频道/线程一致、消息时间不早于本次发送尝试（允许 60s 时钟偏差）、全文精确匹配（sha256）。证明不了就保持 uncertain，3 轮无结论转人工日志。
+- **状态文件损坏不静默**：`send_state.json` 损坏时按 primary → `.tmp` → `.bak` 顺序恢复；都损坏则隔离为 `send_state.json.corrupt.*`（保留证据）并抛 `StateCorruptError`，consumer 在此期间**拒绝发送**（fail-closed），直到人工恢复。
+
+队列端（`inbox_store.py`）：
+- **去重 tombstone 保留期限：7 天**（`TOMBSTONE_RETENTION_SECONDS`）。Slack 的 at-least-once 重投发生在分钟级，7 天是慷慨上界。
+- **恢复规则**：(1) 保留期内重投 → tombstone 命中 → 不再入队；(2) tombstone 过期并被 compact 清掉后重投 → 视为新消息重新入队（at-least-once 的显式取舍；需要更长可调大保留期）；(3) 崩溃导致的队尾残行在下次写入前被隔离为 `inbox.jsonl.corrupt.*`（保留证据）再截断，绝不把新记录粘到残行上。
+- **重复入队先确认持久化**：`append_record` 命中已存在 `msg_id` 时，先 fsync 确认落盘再返回"重复"；fsync 失败则抛异常、调用方不得向 Slack ACK（等重投）。
 
 ## 5. 踩坑清单（实测）
 
@@ -149,7 +163,7 @@ Agents-Slack-Bridge/
 ```bash
 cd muse && python3 -m unittest discover -s tests -v
 ```
-30 个测试，覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。仅标准库，无新增依赖。
+61 个测试，覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。`test_reliability.py` 另有行为测试：旧队列升级（含 delivered=false→true 顺序无关的完成标记优先）、发送结果三态判定、发送后崩溃恢复、并发 claim 互斥、存储失败（fsync/损坏隔离）、错误回执匹配、wire text 哈希（含 mention 追加）、队尾截断、compact 后重投。仅标准库，无新增依赖。
 
 **NOT_EXERCISED**：真实 Slack 联调未在授权测试频道执行（无凭据、无部署修改），需部署者按 §6 自行验证。
 
