@@ -862,3 +862,172 @@ class TestWakeAgentConsumerBackoff(unittest.TestCase):
         self.assertEqual(calls["wake"], 2)
         self.assertEqual(st3["wake_fail_count"], 2)
         self.assertEqual(st3["wake_backoff_until"], 5005.0 + 10.0)
+
+
+
+class TestWakeBackoffOverflowCap(unittest.TestCase):
+    """Cap exponent before 2**n — huge fail_count must stay finite."""
+
+    def test_backoff_over_1025_finite_no_raise(self):
+        pc = _load_consumer()
+        for n in (1, 2, 5, 10, 100, 1024, 1025, 1026, 5000, 10**6):
+            delay = pc._wake_backoff_sec(n)
+            self.assertIsInstance(delay, float)
+            self.assertGreater(delay, 0.0)
+            self.assertLessEqual(delay, pc.WAKE_BACKOFF_CAP)
+            self.assertTrue(delay == delay)  # not NaN
+            # Must not be inf
+            self.assertNotEqual(delay, float("inf"))
+
+    def test_sequence_matches_bounded_exp_until_cap(self):
+        pc = _load_consumer()
+        self.assertEqual(pc._wake_backoff_sec(1), 5.0)
+        self.assertEqual(pc._wake_backoff_sec(2), 10.0)
+        self.assertEqual(pc._wake_backoff_sec(3), 20.0)
+        self.assertEqual(pc._wake_backoff_sec(4), 40.0)
+        self.assertEqual(pc._wake_backoff_sec(5), 60.0)  # capped
+        self.assertEqual(pc._wake_backoff_sec(1025), 60.0)
+
+    def test_continuous_failures_beyond_1025_still_backoff(self):
+        pc = _load_consumer()
+        clock = {"t": 0.0}
+        calls = {"wake": 0}
+
+        def runner(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                return _fake(3, "", "wake_agent: HTTPError status=500")
+            return _fake(0, "")
+
+        claimable = [{"channel": "C9", "ts": "9.0"}]
+        st = {
+            "last_fp": "", "last_keys": frozenset(), "last_at": 0.0,
+            "wake_fail_count": 1024, "wake_retry_after_until": 0.0,
+            "wake_backoff_until": 0.0,
+        }
+        # fail_count starts at 1024; next failure → 1025
+        st1 = pc.maybe_wake_agent(
+            claimable, st, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(st1["wake_fail_count"], 1025)
+        self.assertEqual(st1["wake_backoff_until"], 0.0 + 60.0)
+        self.assertEqual(calls["wake"], 1)
+
+        # During backoff — skip
+        clock["t"] = 30.0
+        st2 = pc.maybe_wake_agent(
+            claimable, st1, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+
+        # After backoff — another failure still finite
+        clock["t"] = 60.0
+        st3 = pc.maybe_wake_agent(
+            claimable, st2, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(st3["wake_fail_count"], 1026)
+        self.assertEqual(st3["wake_backoff_until"], 60.0 + 60.0)
+        self.assertEqual(calls["wake"], 2)
+
+
+class TestWakeBackoffTimingAfterReturn(unittest.TestCase):
+    """Retry-After / failure backoff must start AFTER the operation returns."""
+
+    def test_429_retry_after_accounts_for_request_duration(self):
+        pc = _load_consumer()
+        clock = {"t": 1000.0}
+        calls = {"wake": 0}
+
+        def runner(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                # Simulate non-zero HTTP duration: 5s wall clock
+                clock["t"] += 5.0
+                return _fake(4, "retry_after_sec=10\n", "wake_agent: 429")
+            return _fake(0, "")
+
+        claimable = [{"channel": "C1", "ts": "1.0", "reply_status": None}]
+        st = {
+            "last_fp": "", "last_keys": frozenset(), "last_at": 0.0,
+            "wake_fail_count": 0, "wake_retry_after_until": 0.0,
+            "wake_backoff_until": 0.0,
+        }
+        st1 = pc.maybe_wake_agent(
+            claimable, st, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+        # Call started at 1000, returned at 1005 → until = 1005 + 10 = 1015
+        # (NOT 1000 + 10 = 1010 which would under-wait by request duration)
+        self.assertEqual(st1.get("wake_retry_after_until"), 1015.0)
+        self.assertEqual(clock["t"], 1005.0)
+
+        # At 1010 (< 1015) must still skip
+        clock["t"] = 1010.0
+        st2 = pc.maybe_wake_agent(
+            claimable, st1, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+        self.assertEqual(st2.get("wake_retry_after_until"), 1015.0)
+
+        # At 1015 may wake again
+        clock["t"] = 1015.0
+
+        def runner_ok(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                clock["t"] += 1.0
+                return _fake(0, "ok\n")
+            return _fake(0, "")
+
+        st3 = pc.maybe_wake_agent(
+            claimable, st2, time_fn=lambda: clock["t"], runner=runner_ok
+        )
+        self.assertEqual(calls["wake"], 2)
+        self.assertEqual(st3.get("last_at"), 1016.0)  # after +1s duration
+
+    def test_failure_backoff_accounts_for_request_duration(self):
+        pc = _load_consumer()
+        clock = {"t": 5000.0}
+        calls = {"wake": 0}
+
+        def runner(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                clock["t"] += 3.0  # non-zero request duration
+                return _fake(3, "", "wake_agent: HTTPError status=500")
+            return _fake(0, "")
+
+        claimable = [{"channel": "C9", "ts": "9.0"}]
+        st = {
+            "last_fp": "", "last_keys": frozenset(), "last_at": 0.0,
+            "wake_fail_count": 0, "wake_retry_after_until": 0.0,
+            "wake_backoff_until": 0.0,
+        }
+        st1 = pc.maybe_wake_agent(
+            claimable, st, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+        # Started 5000, returned 5003 → backoff until 5003 + 5
+        self.assertEqual(st1["wake_fail_count"], 1)
+        self.assertEqual(st1["wake_backoff_until"], 5003.0 + 5.0)
+        self.assertEqual(clock["t"], 5003.0)
+
+        # Old bug would have set until=5005; at t=5006 would wake early.
+        # Correct: until=5008, so at 5006 still skip.
+        clock["t"] = 5006.0
+        st2 = pc.maybe_wake_agent(
+            claimable, st1, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)

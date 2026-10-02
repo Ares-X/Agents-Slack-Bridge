@@ -63,12 +63,20 @@ def consume_one(
             "claimable row requires non-empty --text "
             f"(got empty for {channel}:{ts})"
         )
-    # kind=thread_reply always stays in-thread even if REPLY_IN_THREAD=0 /
-    # --reply-in-thread omitted.
-    force_thread = reply_in_thread or (m.get("kind") == "thread_reply")
+    # kind=thread_reply OR real in-thread payload (thread_ts != ts) always
+    # stays in-thread even if REPLY_IN_THREAD=0 / --reply-in-thread omitted.
+    # Keeps app_mention+message dual delivery consistent regardless of order.
+    ts = (m.get("ts") or "").strip()
+    thread_ts = (m.get("thread_ts") or "").strip()
+    in_thread = bool(thread_ts and ts and thread_ts != ts)
+    force_thread = (
+        reply_in_thread
+        or (m.get("kind") == "thread_reply")
+        or in_thread
+    )
     tt = None
     if force_thread:
-        tt = (m.get("thread_ts") or m.get("ts") or "").strip() or None
+        tt = (thread_ts or ts or "").strip() or None
     r = process_one(
         inbox, m, reply,
         reply_in_thread=force_thread,

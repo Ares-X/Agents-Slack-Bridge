@@ -24,7 +24,7 @@ Grok Bot 多 agent 频道协作默认：
     （Grok Bot 与其他 agent 常在同一频道互相 @）
   - 若 .env 设置了 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔），
     则改为白名单模式：仅这些 bot 放行，其他 bot 丢弃（可选收紧）
-  - DM / channel 的 edit/delete/bot_message 等 subtype 显式过滤
+  - DM / channel 的 edit/delete 等 subtype 显式过滤；bot_message 走自拍/白名单（不提前 ACK 丢弃）
   - 消费层：REPLY_IN_THREAD=0 时 mention/dm 仍顶层；kind=thread_reply
     强制跟帖（同 thread_ts），见 AGENT_WAKE.md / .env.example
 
@@ -55,7 +55,8 @@ DROP_SUBTYPES = frozenset({
     "message_deleted",
     "message_replied",
     "tombstone",
-    "bot_message",  # avoid bot echo / loop via subtype path
+    # bot_message is NOT dropped here: evaluate via self-filter + Bot whitelist
+    # (anti-loop for our user_id; allow peer bots when whitelist permits).
     "channel_join",
     "channel_leave",
     "channel_topic",
@@ -209,9 +210,23 @@ def is_our_thread_parent(web, channel, thread_ts, me, *, cache_path=None):
     return False, None
 
 
+def is_in_thread(message):
+    """True if payload is a real thread reply (thread_ts present and != ts)."""
+    ts = ((message or {}).get("ts") or "").strip()
+    thread_ts = ((message or {}).get("thread_ts") or "").strip()
+    return bool(thread_ts and ts and thread_ts != ts)
+
+
 def should_reply_in_thread(message, reply_in_thread_env=False):
-    """Env REPLY_IN_THREAD for mentions/dms; always True for thread_reply."""
+    """Env REPLY_IN_THREAD for mentions/dms; always True for in-thread msgs.
+
+    kind=thread_reply forces thread. Also: app_mention that landed in a
+    thread (thread_ts != ts) must reply in-thread so dual delivery
+    (app_mention + message) is consistent regardless of arrival order.
+    """
     if (message or {}).get("kind") == "thread_reply":
+        return True
+    if is_in_thread(message):
         return True
     return bool(reply_in_thread_env)
 

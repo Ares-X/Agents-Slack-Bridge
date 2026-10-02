@@ -24,6 +24,8 @@ Modes:
   - sent → 只重试 ack
   - 启动时 escalate stale sending → uncertain
 """
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -206,11 +208,25 @@ def thread_target(message):
     return (message.get("thread_ts") or message.get("ts") or "").strip()
 
 
+def is_in_thread(message):
+    """True if payload is a real thread reply (thread_ts present and != ts)."""
+    ts = ((message or {}).get("ts") or "").strip()
+    thread_ts = ((message or {}).get("thread_ts") or "").strip()
+    return bool(thread_ts and ts and thread_ts != ts)
+
+
 def should_reply_in_thread(message, reply_in_thread_env=None):
-    """Force thread for kind=thread_reply; else honor REPLY_IN_THREAD env."""
+    """Force thread for kind=thread_reply / in-thread msgs; else REPLY_IN_THREAD.
+
+    app_mention + message dual delivery for the same (channel,ts) must pick
+    the same reply locus regardless of which event arrived first: if the
+    stored row has thread_ts != ts, always reply in that thread.
+    """
     if reply_in_thread_env is None:
         reply_in_thread_env = REPLY_IN_THREAD
     if (message or {}).get("kind") == "thread_reply":
+        return True
+    if is_in_thread(message):
         return True
     return bool(reply_in_thread_env)
 
@@ -439,9 +455,16 @@ def _parse_retry_after_sec(stdout: str, stderr: str = "") -> float | None:
 
 
 def _wake_backoff_sec(fail_count: int) -> float:
-    """Bounded exponential backoff: 5, 10, 20, 40, ... cap WAKE_BACKOFF_CAP."""
+    """Bounded exponential backoff: 5, 10, 20, 40, ... cap WAKE_BACKOFF_CAP.
+
+    Cap the exponent BEFORE computing 2**exp so fail_count > 1025 (or any
+    huge n) never OverflowError when converting to float.
+    """
     n = max(1, int(fail_count))
-    return min(WAKE_BACKOFF_CAP, WAKE_BACKOFF_BASE * (2 ** (n - 1)))
+    # 2**10 * base already far above CAP; keep well under float exponent max.
+    _MAX_EXP = 10
+    exp = min(n - 1, _MAX_EXP)
+    return min(WAKE_BACKOFF_CAP, WAKE_BACKOFF_BASE * (2 ** exp))
 
 
 def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
@@ -526,12 +549,13 @@ def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
             f"{(r_notify.stderr or r_notify.stdout or '')[:200]}",
             file=sys.stderr,
         )
-        # notify failure: bounded backoff, not success
+        # Timing starts AFTER the operation returns (not from call start).
+        now_after = float((time_fn or time.time)())
         fails = int(wake_state.get("wake_fail_count") or 0) + 1
         delay = _wake_backoff_sec(fails)
         out = dict(wake_state)
         out["wake_fail_count"] = fails
-        out["wake_backoff_until"] = now + delay
+        out["wake_backoff_until"] = now_after + delay
         print(
             f"agent_wake: failure backoff {delay:.0f}s "
             f"(fail_count={fails}; not success)",
@@ -540,6 +564,9 @@ def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
         return out
 
     r_wake = run(sys.executable, "wake_agent.py")
+    # Re-sample clock after wake HTTP returns so Retry-After / backoff
+    # wait from response time, not from when the request started.
+    now_after = float((time_fn or time.time)())
     rc = getattr(r_wake, "returncode", 1)
     stdout = getattr(r_wake, "stdout", "") or ""
     stderr = getattr(r_wake, "stderr", "") or ""
@@ -555,7 +582,7 @@ def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
         return {
             "last_fp": fp,
             "last_keys": keys,
-            "last_at": now,
+            "last_at": now_after,
             "wake_fail_count": 0,
             "wake_retry_after_until": 0.0,
             "wake_backoff_until": 0.0,
@@ -565,7 +592,7 @@ def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
     ra = _parse_retry_after_sec(stdout, stderr)
     out = dict(wake_state)
     if ra is not None and (rc == 4 or "429" in stderr or "rate limited" in stderr.lower()):
-        out["wake_retry_after_until"] = now + float(ra)
+        out["wake_retry_after_until"] = now_after + float(ra)
         print(
             f"agent_wake: wake_agent 429; honor Retry-After {ra}s "
             f"(not success; n={len(claimable)})",
@@ -579,7 +606,7 @@ def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
     if ra is not None:
         delay = max(delay, float(ra))
     out["wake_fail_count"] = fails
-    out["wake_backoff_until"] = now + delay
+    out["wake_backoff_until"] = now_after + delay
     print(
         f"agent_wake: wake_agent failed rc={rc}: {(stderr or stdout)[:200]}",
         file=sys.stderr,
