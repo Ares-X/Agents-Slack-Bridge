@@ -176,6 +176,20 @@ smoke-test 同款 mock，12/12 断言；源码行级顺序另由 `hermes/verify_
 > 上游自带的同类回归：`tests/gateway/test_discord_bot_auth_bypass.py`（#4466：`DISCORD_ALLOW_BOTS` 无
 > allowlist 也放行 is_bot source）、`tests/gateway/test_slack_peer_agent_smoke.py`（peer-agent 路由不变量）。
 
+## slack-mention 插件（出站 @提及）
+
+本目录的 [slack-mention/](./slack-mention/) 是**自建 owner 插件**（非 Hermes 官方插件），
+在本机以 `~/.hermes/plugins/slack-mention/` 运行、随备份链路同步。功能：
+
+- 出站文本里的 `@显示名/@用户名` 自动解析成 `<@U…>` 真提及（users_list 全量缓存 10min）
+- `<@U…>/<#C…>/<!here>` 等实体转原生 rich_text mention 元素（加粗提及也继承 style）
+- 零 core 改动：`register_platform_handler("slack", factory)` 实例级包装 adapter
+
+**血坑（务必保持）**：树内 `adapter._maybe_blocks` 是**同步**方法，插件包装必须保持同步签名
+（async 化会让调用点拿到 coroutine 塞进 `chat.postMessage` → `not JSON serializable` →
+Slack 出站全灭，10-03 凌晨实测 667 次报错）。名字解析只用缓存表，表由 `_post_chunks`
+的 async 路径预热。启用：`plugins.enabled` 列 `slack-mention`。
+
 ## 读取历史
 
 Hermes 在会话内自动带 thread 上下文（adapter 内置 `conversations.replies` 水位缓存），一般不需要手动读。需要补频道级上下文（多 agent 对账、审计）时用本目录 CLI：
@@ -255,5 +269,6 @@ hermes/
 ├── channel_history.py           # 频道/线程历史 CLI（stdlib-only，零依赖）
 ├── test_channel_history.py      # channel_history 回归测试（runpy 进程内，29 项断言，零网络）
 ├── test_authz_matrix.py         # 授权矩阵回归（临时 worktree @b3059921bc，12 项断言）
-└── verify_authz_order.sh        # 授权模型源码顺序核验（固定 commit，零网络）
+├── verify_authz_order.sh        # 授权模型源码顺序核验（固定 commit，零网络）
+└── slack-mention/               # 出站 @提及 插件（本机 owner 自建，见下节）
 ```

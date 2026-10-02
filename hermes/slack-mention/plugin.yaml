@@ -1,0 +1,5 @@
+name: slack-mention
+version: 1.0.0
+description: Slack outbound name->ID mention resolution + native rich_text mention elements (owner plugin, replaces 2026-10-02 tree patch)
+author: Hermes (owner install)
+kind: backend
