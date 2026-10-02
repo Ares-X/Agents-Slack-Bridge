@@ -123,5 +123,46 @@ class RecordTest(unittest.TestCase):
         self.assertIn("thread_ts", payload)
 
 
+class ThreadReplyTest(unittest.TestCase):
+    """人类在 bot 消息 thread 下的回复 -> check_thread_parent（再查父消息作者）。"""
+
+    def thread_event(self, **kw):
+        e = {"type": "message", "channel_type": "channel", "channel": "C1",
+             "user": "U_HUMAN", "text": "hi", "ts": "222.333",
+             "thread_ts": "111.222"}
+        e.update(kw)
+        return e
+
+    def test_human_thread_reply_goes_to_parent_check(self):
+        e = self.thread_event()
+        action, payload = bridge.process_event(e, ME)
+        self.assertEqual(action, "check_thread_parent")
+        self.assertIs(payload, e)  # 原 event 透传，handle 里再查父消息
+        self.assertEqual(payload["thread_ts"], "111.222")
+
+    def test_bot_thread_reply_ignored(self):
+        e = self.thread_event(bot_id="B_OTHER", subtype="bot_message")
+        self.assertEqual(bridge.process_event(e, ME)[0], "ack_only")
+
+    def test_plain_channel_message_still_ignored(self):
+        e = self.thread_event()
+        del e["thread_ts"]
+        self.assertEqual(bridge.process_event(e, ME)[0], "ack_only")
+
+    def test_thread_reply_edit_ignored(self):
+        e = self.thread_event(subtype="message_changed")
+        self.assertEqual(bridge.process_event(e, ME)[0], "ack_only")
+
+    def test_own_thread_reply_ignored(self):
+        e = self.thread_event(user=ME)
+        self.assertEqual(bridge.process_event(e, ME)[0], "ack_only")
+
+    def test_dm_thread_reply_still_dm(self):
+        e = self.thread_event(channel_type="im", channel="D1")
+        action, payload = bridge.process_event(e, ME)
+        self.assertEqual(action, "queue")
+        self.assertEqual(payload["kind"], "dm")
+
+
 if __name__ == "__main__":
     unittest.main()

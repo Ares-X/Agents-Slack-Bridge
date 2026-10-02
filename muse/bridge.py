@@ -1,6 +1,8 @@
 """Slack Socket Mode -> local inbox queue. 只收不发。
 
-监听 bot 的私信（message.im）与频道 @mention（app_mention），
+监听 bot 的私信（message.im）、频道 @mention（app_mention），
+以及人类用户在 bot 自己消息的 thread 下的回复（thread_reply，
+bot 的 thread 回复不入队，防回环），
 把每条消息追加到 inbox.jsonl（见 inbox_store.py：append-only + tombstone ack），
 供消费层读取处理。发送请用 send.py。
 
@@ -100,6 +102,28 @@ def is_bot_message(event):
     return bool(event.get("bot_id")) or event.get("subtype") == "bot_message"
 
 
+def is_human_thread_reply_candidate(event, me):
+    """频道里人类用户的 thread 回复（非私信、非自己、非 bot）。
+
+    是否入队还要看 thread 的父消息是不是我们自己发的，
+    那个判断需要一次 Slack API 查询，不能放在纯函数里，
+    由 handle() 先 ACK 再做 best-effort 检查。
+    """
+    if event.get("type") != "message":
+        return False
+    if event.get("channel_type") == "im":
+        return False  # 私信里的人类消息本来就会入队
+    if not event.get("thread_ts"):
+        return False
+    if event.get("subtype") not in (None, "me_message"):
+        return False
+    if is_own_message(event, me):
+        return False
+    if is_bot_message(event):
+        return False  # bot 的 thread 回复不唤醒，防回环
+    return True
+
+
 def bot_allowed(event):
     """Other bots: default-allow (collab), or allowlist-only in whitelist mode."""
     if not WHITELIST_MODE:
@@ -118,7 +142,7 @@ def build_record(event, kind):
         "channel": channel,
         "user": event.get("user", ""),
         "text": event.get("text", ""),
-        "kind": kind,                            # dm | mention
+        "kind": kind,                            # dm | mention | thread_reply
         "ts": ts,
         "thread_ts": event.get("thread_ts", ""),  # 原帖回复用
         "received_at": time.time(),
@@ -128,10 +152,15 @@ def build_record(event, kind):
 def process_event(event, me):
     """Pure decision step (testable without Slack).
 
-    Returns ("queue", record) or ("ack_only", reason).
+    Returns ("queue", record) | ("check_thread_parent", event)
+    | ("ack_only", reason).
     """
     kind = classify_event(event)
     if kind is None:
+        if is_human_thread_reply_candidate(event, me):
+            # 人类在频道 thread 里的回复：要不要入队取决于父消息
+            # 是不是我们自己发的，handle() 里先 ACK 再查。
+            return ("check_thread_parent", event)
         return ("ack_only", "not-subscribed-or-unsupported-subtype")
     if is_own_message(event, me):
         return ("ack_only", "own-message")
@@ -154,8 +183,26 @@ def main():
 
     web = WebClient(token=bot_token, **_proxy_kw(), ssl=_ssl_ctx())
     me = _ENV.get("SLACK_BOT_USER_ID") or web.auth_test().get("user_id")
+    my_bot_id = _ENV.get("SLACK_BOT_ID") or None  # B 开头，thread 父消息作者比对用
     logging.info("bridge starting, bot user %s (whitelist_mode=%s)",
                  me, WHITELIST_MODE)
+
+    def thread_parent_is_mine(channel, thread_ts):
+        """查 thread 父消息的作者是不是我们自己。best-effort：查不到就当不是。"""
+        try:
+            resp = web.conversations_replies(channel=channel, ts=thread_ts,
+                                             limit=1, inclusive=True)
+            msgs = resp.get("messages") or []
+            if not msgs:
+                return False
+            parent = msgs[0]
+            if me and parent.get("user") == me:
+                return True
+            return bool(my_bot_id and parent.get("bot_id") == my_bot_id)
+        except Exception:
+            logging.exception("thread parent check failed for %s:%s",
+                              channel, thread_ts)
+            return False
 
     def handle(client: SocketModeClient, req: SocketModeRequest):
         try:
@@ -167,6 +214,24 @@ def main():
                 saved = inbox_store.append_record(payload)
                 logging.info("queued %s %s (duplicate=%s)",
                              payload["kind"], payload["msg_id"], not saved)
+            elif action == "check_thread_parent":
+                # 人类在频道 thread 里的回复：先 ACK（父消息查询是慢操作，
+                # 不能占着 Slack 的 ACK 时限），再查父消息作者决定是否入队。
+                try:
+                    client.send_socket_mode_response(
+                        SocketModeResponse(envelope_id=req.envelope_id))
+                except Exception:
+                    logging.exception("ack send failed")
+                if thread_parent_is_mine(event.get("channel", ""),
+                                         event.get("thread_ts", "")):
+                    rec = build_record(event, "thread_reply")
+                    saved = inbox_store.append_record(rec)
+                    logging.info("queued thread_reply %s (duplicate=%s)",
+                                 rec["msg_id"], not saved)
+                else:
+                    logging.info("thread reply not under own message, drop %s:%s",
+                                 event.get("channel"), event.get("ts"))
+                return  # 已 ACK，直接返回
             else:
                 logging.debug("ack_only: %s", payload)
         except Exception:
