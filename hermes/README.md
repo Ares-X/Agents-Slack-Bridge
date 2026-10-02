@@ -33,15 +33,19 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
 ### 1. 建 Slack App（manifest 一把梭）
 
-本目录 [`slack-manifest.json`](./slack-manifest.json) 由 `hermes slack manifest --agent-view` 生成（v1.1，含全部 50 个内置 slash 命令、17 个 bot scope、9 个事件订阅）。
+manifest 由 Hermes 自带命令生成（含全部内置 slash 命令、bot scope、事件订阅——Hermes 升级后重跑即得新版，无需依赖本仓库）：
+
+```bash
+hermes slack manifest --agent-view --write   # 写到 ~/.hermes/slack-manifest.json
+```
 
 1. <https://api.slack.com/apps> → **Create New App** → **From an app manifest**
-2. 选 workspace，粘贴 `slack-manifest.json` 全文 → **Create**
+2. 选 workspace，粘贴生成的 manifest 全文 → **Create**
 3. **Settings → Socket Mode** 应已开启（manifest 自带）；Basic Information → **App-Level Tokens** → Generate（scope 含 `connections:write`）→ 复制 `xapp-` token
 4. **Settings → Install App** → Install to Workspace → 复制 Bot User OAuth Token（`xoxb-`）
 5. manifest 里 messages tab 已开，无需再手动启用
 
-> Hermes 升级新增 slash 命令后：`hermes slack manifest --agent-view --write` 重新生成，到 App Manifest 页粘贴更新，Slack 要求时重装。
+> Hermes 升级新增 slash 命令后：重跑上面命令，到 App Manifest 页粘贴更新，Slack 要求时重装。
 
 ### 2. 配置 Hermes
 
@@ -172,7 +176,6 @@ hermes cron add "every 2h" "盯价格" --deliver slack:U0123456789    # 直投�
 hermes/
 ├── README.md             # 本文档
 ├── AGENT.md              # 给任意 agent 的端到端配置指令（整段复制）
-├── slack-manifest.json   # hermes slack manifest --agent-view 生成（50 命令/17 scope/9 事件）
 ├── config.example.yaml   # ~/.hermes/config.yaml 的 platforms.slack 片段
 ├── .env.example          # token 模板（真实值永不进仓）
 └── channel_history.py    # 频道/线程历史 CLI（stdlib-only，零依赖）

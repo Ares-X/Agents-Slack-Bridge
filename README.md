@@ -31,7 +31,6 @@ Agents-Slack-Bridge/
 │   └── consumer/poll_consumer.py
 └── hermes/                   # Hermes Agent 原生插件接入包
     ├── README.md, AGENT.md
-    ├── slack-manifest.json   # hermes slack manifest --agent-view 生成
     ├── config.example.yaml, .env.example
     └── channel_history.py    # 频道/线程历史 CLI（零依赖）
 ```
@@ -76,8 +75,8 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
      「Create New App → From a manifest」创建 App；改 display_name；
      Install；复制 Bot User OAuth Token (xoxb-) 与带 connections:write 的
      App-Level Token (xapp-)；App Home → Messages Tab 允许用户发消息。
-   - hermes：manifest 是 slack-manifest.json（或本机 `hermes slack manifest
-     --agent-view --write` 重新生成）；其余步骤见 hermes/AGENT.md（token 写
+   - hermes：装好 Hermes 后跑 `hermes slack manifest --agent-view --write`
+     生成 manifest（本仓库不重复携带）；其余步骤见 hermes/AGENT.md（token 写
      ~/.hermes/.env，不用 venv/consumer）。
 4. cp .env.example .env && chmod 600 .env
    填入两个 token（及可选 PROXY_URL / CA_BUNDLE / SLACK_BOT_USER_ID）。

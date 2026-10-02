@@ -33,8 +33,7 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
 ### 1. 取 manifest
 
-优先用本仓库的 [`slack-manifest.json`](./slack-manifest.json)（`hermes slack manifest --agent-view` 生成，含全部 slash 命令与 scope）。
-若本机 Hermes 更新过，重新生成更新版：
+manifest 不进仓库——由本机 Hermes 直接生成（装完即有，升级后重跑即最新版）：
 
 ```bash
 hermes slack manifest --agent-view --write   # 写到 ~/.hermes/slack-manifest.json
