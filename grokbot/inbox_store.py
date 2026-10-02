@@ -163,11 +163,32 @@ def read_records_repair_tail(path: str) -> Tuple[List[dict], bool]:
         else:
             good, corrupt = data[: last_nl + 1], data[last_nl + 1 :]
         _quarantine_bytes(path, corrupt)
-        with open(path, "wb") as f:
-            f.write(good)
-            f.flush()
-            os.fsync(f.fileno())
-        _fsync_dir(path)
+        # Atomic repair: write good bytes to temp + fsync + replace.
+        # Original queue file stays intact until replace succeeds.
+        tmp = (
+            path
+            + ".repair."
+            + str(os.getpid())
+            + "."
+            + uuid.uuid4().hex[:8]
+        )
+        try:
+            with open(tmp, "wb") as out:
+                out.write(good)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, path)
+            _fsync_dir(path)
+        except OSError as e:
+            raise DurabilityError(
+                f"corrupt-tail repair failed (original preserved): {e}"
+            ) from e
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         data = good
         repaired = True
     rows: List[dict] = []
@@ -291,6 +312,19 @@ def peek_claimable(path: str) -> List[dict]:
     return out
 
 
+def peek_actionable(path: str) -> List[dict]:
+    """Undelivered rows for fallback: claimable OR sent (ack-only recovery).
+
+    Excludes sending/uncertain (no auto-resend).
+    """
+    out = []
+    for r in peek_undelivered(path):
+        st = r.get("reply_status")
+        if is_claimable(st) or st == "sent":
+            out.append(r)
+    return out
+
+
 def update_records(
     path: str,
     keys: Iterable[AckKey],
@@ -342,6 +376,11 @@ def update_records(
                         dirty = True
         if dirty:
             _atomic_rewrite(path, rows)
+        elif found:
+            # Matched but already in desired state (e.g. re-ack after rename
+            # where dir fsync previously failed). Still must confirm durability;
+            # persistent fsync failure must NOT report success.
+            fsync_file_and_dir(path)
         # missing = requested keys not successfully matched (absent or gated)
         return len(found), want - found
     finally:

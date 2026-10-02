@@ -6,15 +6,47 @@ Usage:
 
 Outcome lines (stdout/stderr) for consumer classification:
   sent ok: True …     — Slack accepted (ok)
-  sent ok: False …    — Slack rejected (proven not sent → retryable)
+  sent ok: False …    — Slack rejected with proven-not-sent error (retryable)
   not_sent: <reason>  — failed before/without accepting post (retryable)
-  send_error: <…>     — ambiguous (timeout/crash path) → uncertain; no not_sent
+  send_error: <…>     — ambiguous / possible partial success → uncertain
+
+WebClient is constructed with retry_handlers=[] so a post that is accepted
+then disconnects is NOT retried inside one claim (would double-post).
 """
 import os
 import ssl
 import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+# Slack API errors that PROVE the message was not posted (safe to auto-retry).
+# internal_error / fatal_error / unknown codes → uncertain (may be after accept).
+PROVEN_NOT_SENT_SLACK_ERRORS = frozenset({
+    "channel_not_found",
+    "not_in_channel",
+    "is_archived",
+    "channel_is_archived",
+    "msg_too_long",
+    "no_text",
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_expired",
+    "token_revoked",
+    "missing_scope",
+    "cannot_reply_to_message",
+    "thread_not_found",
+    "ekm_access_denied",
+    "invalid_arguments",
+    "invalid_charset",
+    "as_user_not_supported",
+    "restricted_action",
+    "access_denied",
+    "missing_post_type",
+    "is_inactive",
+    "user_not_found",
+    "cant_update_message",
+})
 
 
 def load_env(path):
@@ -26,6 +58,27 @@ def load_env(path):
                 k, v = line.split("=", 1)
                 d[k.strip()] = v.strip()
     return d
+
+
+def build_web_client(token, *, proxy=None, ssl_context=None):
+    """Build WebClient with retries disabled (one POST attempt per claim)."""
+    from slack_sdk.web import WebClient
+    kw = {
+        "token": token,
+        "ssl": ssl_context,
+        "retry_handlers": [],  # no SDK connection/rate retries → no double POST
+    }
+    if proxy:
+        kw["proxy"] = proxy
+    return WebClient(**kw)
+
+
+def classify_slack_api_error(err_code: str) -> str:
+    """Return 'not_sent' or 'uncertain' for a Slack API error string."""
+    code = (err_code or "").strip()
+    if code in PROVEN_NOT_SENT_SLACK_ERRORS or code == "ok_false":
+        return "not_sent"
+    return "uncertain"
 
 
 def main():
@@ -56,7 +109,6 @@ def main():
         sys.exit(1)
 
     try:
-        from slack_sdk.web import WebClient
         from slack_sdk.errors import SlackApiError
     except ImportError as e:
         print(f"not_sent: slack_sdk import: {e}", file=sys.stderr)
@@ -64,20 +116,23 @@ def main():
 
     ctx = ssl.create_default_context(
         cafile=ca if ca and os.path.exists(ca) else None)
-    c = WebClient(token=env["SLACK_BOT_TOKEN"],
-                  **({"proxy": proxy} if proxy else {}), ssl=ctx)
+    c = build_web_client(env["SLACK_BOT_TOKEN"], proxy=proxy, ssl_context=ctx)
     try:
         r = c.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
     except SlackApiError as e:
-        # API responded with an error → message was not posted (proven).
         err = ""
         try:
             err = e.response.get("error") if e.response is not None else str(e)
         except Exception:
             err = str(e)
-        print(f"not_sent: slack_api {err}", file=sys.stderr)
-        print("sent ok: False")
-        sys.exit(1)
+        kind = classify_slack_api_error(str(err))
+        if kind == "not_sent":
+            print(f"not_sent: slack_api {err}", file=sys.stderr)
+            print("sent ok: False")
+            sys.exit(1)
+        # internal_error / fatal_error / unknown — may be after partial success
+        print(f"send_error: slack_api {err}", file=sys.stderr)
+        sys.exit(2)
     except Exception as e:
         # Timeout / connection reset / etc. — may have been accepted. Uncertain.
         print(f"send_error: {e}", file=sys.stderr)
@@ -86,7 +141,11 @@ def main():
     ok = bool(r.get("ok"))
     print("sent ok:", ok, "ts:", r.get("ts"))
     if not ok:
-        print("not_sent: ok_false", file=sys.stderr)
+        err = str(r.get("error") or "ok_false")
+        if classify_slack_api_error(err) == "uncertain":
+            print(f"send_error: slack_api {err}", file=sys.stderr)
+            sys.exit(2)
+        print(f"not_sent: {err}", file=sys.stderr)
         sys.exit(1)
 
 

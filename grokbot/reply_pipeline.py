@@ -29,22 +29,31 @@ from inbox_store import (
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+# Slack API codes that must NEVER auto-retry even if mis-tagged not_sent.
+_AMBIGUOUS_SLACK_API = frozenset({"internal_error", "fatal_error"})
+
+
 def classify_send_result(proc) -> str:
     """Return 'ok' | 'fail' | 'uncertain'.
 
     fail = proven NOT sent (safe to release claim → retryable).
     uncertain = anything that does not prove absence of a successful post
-                (incl. nonzero exit without not_sent / success text).
+                (incl. nonzero exit without not_sent / success text,
+                 and Slack internal_error/fatal_error).
     """
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
     out = stdout + stderr
     if proc.returncode == 0 and "sent ok: True" in stdout:
         return "ok"
+    # Ambiguous Slack server errors → uncertain (may be after partial success).
+    for code in _AMBIGUOUS_SLACK_API:
+        if f"slack_api {code}" in out:
+            return "uncertain"
     # Proven not sent — safe to retry after releasing claim.
     if "not_sent:" in out:
         return "fail"
-    if "sent ok: False" in stdout:
+    if "sent ok: False" in stdout and "send_error:" not in out:
         return "fail"
     # Nonzero exit with no proof → UNCERTAIN (Slack may have accepted then
     # client timed out). Never treat as fail.

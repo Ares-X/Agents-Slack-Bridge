@@ -283,3 +283,69 @@ class TestReplyStatusSplit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCorruptTailAtomicRepair(unittest.TestCase):
+    def test_repair_write_failure_preserves_original_queue(self):
+        """Mid-repair failure must not truncate away prior good records."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            # Two good lines + truncated tail (no final newline)
+            good1 = json.dumps(_rec("C", "1.0", text="keep-a"), ensure_ascii=False)
+            good2 = json.dumps(_rec("C", "2.0", text="keep-b"), ensure_ascii=False)
+            partial = '{"channel":"C","ts":"3.0","text":"TRUNC'
+            with open(path, "wb") as f:
+                f.write((good1 + "\n" + good2 + "\n" + partial).encode())
+            with open(path, "rb") as rf:
+                original = rf.read()
+
+            real_replace = os.replace
+
+            def boom_replace(src, dst):
+                raise OSError(5, "EIO replace injected")
+
+            with mock.patch("os.replace", side_effect=boom_replace):
+                with self.assertRaises(store.DurabilityError):
+                    store.read_records_repair_tail(path)
+            # Original bytes still present (not truncated by wb open)
+            with open(path, "rb") as rf:
+                after = rf.read()
+            self.assertEqual(after, original)
+            self.assertIn(b"keep-a", after)
+            self.assertIn(b"keep-b", after)
+            # Corrupt evidence still written
+            self.assertTrue(os.path.exists(path + ".corrupt"))
+            with open(path + ".corrupt", "rb") as cf:
+                self.assertIn(b"TRUNC", cf.read())
+
+    def test_repair_uses_temp_then_replace_success(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            good = json.dumps(_rec("C", "1.0", text="keep"), ensure_ascii=False)
+            with open(path, "wb") as f:
+                f.write((good + "\n" + '{"trunc').encode())
+            rows, repaired = store.read_records_repair_tail(path)
+            self.assertTrue(repaired)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["text"], "keep")
+            with open(path, "rb") as rf:
+                data = rf.read()
+            self.assertTrue(data.endswith(b"\n"))
+            self.assertNotIn(b'{"trunc', data)
+            with open(path + ".corrupt", "rb") as cf:
+                self.assertIn(b"trunc", cf.read())
+
+
+class TestAckDurabilityConfirm(unittest.TestCase):
+    def test_idempotent_ack_still_fsyncs(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            append_record(path, _rec("C", "1.0"))
+            ack_keys(path, {("C", "1.0")})  # dirty rewrite
+            # Second ack: dirty=False but must still confirm durability
+            with mock.patch.object(
+                store, "fsync_file_and_dir",
+                side_effect=store.DurabilityError("dir EIO again"),
+            ):
+                with self.assertRaises(store.DurabilityError):
+                    ack_keys(path, {("C", "1.0")})
