@@ -2,11 +2,33 @@
 
 给**另一个 agent** 的逐步指令。按顺序做；**永不**把 token 写进聊天、日志、git。
 
+**默认目标：多 agent 频道协作**——同频道其他 bot 可以 @ 你；你每次回复前读上下文；默认在频道顶层回复，让同伴看得见。
+
 ## 前置
 
 - 有 Slack workspace 管理员权限（或能创建 App）
 - 本机可出站访问 `https://slack.com` / `wss://wss-primary.slack.com`（Socket Mode）
 - Python 3.9+
+
+## 多 agent 协作默认（必读）
+
+配置与回复行为按下列默认执行（除非用户明确要求收紧）：
+
+1. **允许其他 bot @ 本 bot**  
+   `bridge.py` **不要**默认丢弃全部 bot 消息。默认放行其他 bot，仅丢弃自己的 `user_id`（防自循环）。  
+   需要收紧时再设 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（逗号分隔）；任一非空 = 白名单模式。
+
+2. **每次回复前拉频道历史**  
+   处理 inbox 前先跑 `channel_history.py <channel> [N]`（或 consumer 内同等调用），把近况当上下文再生成回复。本地 `poll_consumer.py` 已内置此步。
+
+3. **默认频道顶层回复**  
+   `REPLY_IN_THREAD=0`（`.env.example` 默认）。同伴 agent 才能在频道里看到你的回复；不要默认跟帖藏起来。仅当用户要 thread 时再设 `1`。
+
+4. **协作礼仪**  
+   - 被其他 agent `@` 你时：结合上下文给出有用回答，不要空转或只 echo。  
+   - **不要 @ 自己**；点名 → 单回 → 停，避免互相 @ 造成的 echo / 回环风暴。  
+   - 引用对方旧消息时，把 `@` 转成纯文本名字，降低二手触发。  
+   - 需要收紧对端时用 `ALLOWED_BOT_*`，不要关掉「读历史」或改回「丢弃全部 bot」。
 
 ## 步骤
 
@@ -28,6 +50,7 @@
    cp .env.example .env && chmod 600 .env
    # 编辑 .env：填 SLACK_BOT_TOKEN / SLACK_APP_TOKEN
    # 可选：SLACK_BOT_USER_ID（留空则 auth_test 自动取）
+   # 保持 REPLY_IN_THREAD=0（多 agent 可见）
    # 多 agent 默认可不设 ALLOWED_BOT_*；要白名单再填逗号分隔 ID
    ```
 
@@ -43,7 +66,8 @@
    ./venv/bin/python bridge.py
    # 或 systemd：改 slack-bridge.service 路径后 enable --now
    ```
-   日志 `bridge.log` 应出现 `socket mode connected, listening`。
+   日志 `bridge.log` 应出现 `socket mode connected, listening`。  
+   确认未改成「丢弃全部 bot」：默认应允许其他 bot 的 mention 入队。
 
 6. **Run consumer（~5s local poll）**
    ```bash
@@ -51,18 +75,21 @@
    # 或 systemd：slack-consumer.service
    ```
    - 默认 `REPLY_IN_THREAD=0`（频道顶层回复）
-   - 把 `generate_reply()` 换成 LLM / wake Grok Bot agent
+   - 每条消息回复前会调 `channel_history` 作上下文
+   - 把 `generate_reply()` 换成 LLM / wake Grok Bot agent（仍须使用传入的 `history`）
 
-7. **Invite & verify**
+7. **Invite & verify（含多 agent）**
    - `/invite @Grok Bot` 进测试频道
    - 私信 bot 或 `@Grok Bot hello`
+   - 让另一个 agent `@Grok Bot`：应入队、读历史、在**频道顶层**有用回复
    - `./venv/bin/python inbox_peek.py` 应看到未处理行
    - `echo 'ping' | ./venv/bin/python send.py <channel_id>` 应在 Slack 出现
+   - `./venv/bin/python channel_history.py <channel_id> 10` 能列出近况
 
 8. **Optional slower fallback（无本地 LLM）**
    - 不跑 consumer；用 cron/`@every 5m` 调 `python pending_notify.py`
-   - Agent 读 `pending.json` → 生成回复 → `send.py` → `inbox_ack.py <ts>`
-   - 比 5s consumer 慢，适合纯 agent 例程
+   - Agent 读 `pending.json` → **先** `channel_history.py` → 生成回复 → `send.py`（勿带 `--thread-ts`，除非用户要跟帖）→ `inbox_ack.py <ts>`
+   - 比 5s consumer 慢，适合纯 agent 例程；协作规则同上
 
 ## 安全红线
 
@@ -75,10 +102,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `bridge.py` | Socket Mode → `inbox.jsonl`（只收） |
+| `bridge.py` | Socket Mode → `inbox.jsonl`（默认允许多 agent bot，仅丢弃自己） |
 | `send.py` | stdin 正文 → `chat.postMessage` |
 | `inbox_peek.py` / `inbox_ack.py` | 读未处理 / 按 ts 标记 |
-| `channel_history.py` | 拉频道近 N 条（带重试、显示名） |
-| `consumer/poll_consumer.py` | ~5s 轮询 + 模板/LLM 回复 |
+| `channel_history.py` | 拉频道近 N 条（带重试、显示名）——**每次回复前用** |
+| `consumer/poll_consumer.py` | ~5s 轮询 + 拉历史 + 模板/LLM 回复（默认顶层） |
 | `pending_notify.py` | 未处理 → `pending.json`（5min agent fallback） |
 | `manifest.yaml` | 建 App 用 |

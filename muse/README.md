@@ -2,7 +2,16 @@
 
 本目录是 **Muse / 任意带 `generate_reply()` LLM 钩子的 agent** 用的 Slack 桥接包。Socket Mode 出站长连接，无需公网入口。
 
-> 仓库根目录还有 `grokbot/`（Grok Bot / Cursor Grok Bot 专用）。请先 `git clone` 根仓库，再 `cd muse`。
+> 仓库根目录还有 `grokbot/`（默认允许多 agent）、`hermes/`（原生插件）。请先 `git clone` 根仓库，再 `cd muse`。
+
+### 多 agent 频道协作（muse 注意）
+
+muse **默认丢弃全部 bot 消息**（比 grokbot 更保守）。要在同频道互相 @、读上下文、协作：
+
+1. **白名单放行对端**：在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（对方 U…/B…，逗号分隔）；自己的消息永远过滤。
+2. **每次回复前读上下文**：`channel_history.py <channel> [N]`（`poll_consumer.py` 已调用）；把 `history` 交给 LLM。
+3. **尽量顶层回复**：跟帖会藏住回复，其他 agent 不易看到。consumer 默认在有 `thread_ts` 时跟帖——多 agent 协作时可改成不传 `--thread-ts`（与 grokbot 的 `REPLY_IN_THREAD=0` 对齐）。
+4. **礼仪**：被 @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，避免回环。
 
 ---
 
@@ -36,6 +45,7 @@ cd /opt/Agents-Slack-Bridge/muse
 
 cp .env.example .env && chmod 600 .env
 # 编辑 .env，填入 xoxb- / xapp-（以及代理配置，如果有）
+# 多 agent 协作：填 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（对端 U…/B…）
 
 python3 -m venv venv
 ./venv/bin/pip install slack_sdk
@@ -63,7 +73,7 @@ tail -f bridge.log                          # → "socket mode connected, listen
 | **A. `consumer/poll_consumer.py`**（开箱即用） | 轮询 inbox → 按 channel 维护 `channel_sessions.json` 会话 → 调你的 LLM → `send.py` 发回 | ~1 分钟 | 按 channel 隔离，文件持久化 |
 | **B. 平台 side chat**（如 Muse） | 定时任务把消息转给各 channel 的独立子对话，子对话里的 agent 回复 | 1~3 分钟 | 子对话天然隔离 |
 
-用 A：把 `generate_reply()` 换成你家 agent 的调用，`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。
+用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；需要同伴看见回复时不要默认跟帖。
 
 ## 3. 文件清单与路径
 
@@ -103,10 +113,11 @@ Agents-Slack-Bridge/
 2. **`/etc` 文件消失** → 见 §2.3 警告，正本放本目录 + 健康检查自愈。
 3. **出站代理/TLS 拦截** → `.env` 配 `PROXY_URL` / `CA_BUNDLE`，三个脚本都会读。
 4. **频道必须先邀请 bot**，否则收不到 `app_mention`。
-5. **防自循环**：`bridge.py` 默认丢弃所有 bot 消息；要让指定 agent 能 @ 你，把它的 user ID / bot ID 填进 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（自己的消息永远过滤）。
-6. **Socket Mode 先 ack 再处理**，否则 Slack 重发。
-7. **中断期消息会丢**（Slack 不补发），健康检查把中断窗口压到分钟级。
-8. **原帖回复**：`event.thread_ts` 有值时，`send.py` 带 `--thread-ts`。
+5. **多 agent / 防自循环**：`bridge.py` 默认丢弃所有 bot 消息。协作时在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS` 放行对端（自己的消息永远过滤）。不要为了省事改成放行全部 bot（易回环）。
+6. **回复前读上下文**：消费层应先 `channel_history.py` 再生成回复（参考 `poll_consumer.py`）。
+7. **Socket Mode 先 ack 再处理**，否则 Slack 重发。
+8. **中断期消息会丢**（Slack 不补发），健康检查把中断窗口压到分钟级。
+9. **回复位置**：默认有 `thread_ts` 则跟帖；多 agent 想让同伴看见时，改成频道顶层（不传 `--thread-ts`）。
 
 ## 6. 最小验证
 

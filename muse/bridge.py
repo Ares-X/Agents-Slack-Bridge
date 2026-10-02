@@ -36,16 +36,19 @@ _ENV = load_env(ENV_PATH) if os.path.exists(ENV_PATH) else {}
 PROXY_URL = _ENV.get("PROXY_URL") or None      # 出站代理，直连留空
 CA_BUNDLE = _ENV.get("CA_BUNDLE") or None      # 自签 CA 路径，默认系统 CA 留空
 
-# 白名单：允许这些 bot 的 @/发言被当作人类消息处理（agent 协作场景）。
-# 默认关闭（空集合 = 所有 bot 消息丢弃，只防自循环）。
-# 要启用，填入 bot 的 user ID（U 开头）与 bot ID（B 开头），二者满足其一即放行。
-# 注意：自己的消息永远被过滤，不会自循环。
-ALLOWED_BOT_USERS = {
-    # "U0000000000",  # 示例：协作 agent 的 user ID
-}
-ALLOWED_BOT_IDS = {
-    # "B0000000000",  # 示例：协作 agent 的 bot ID
-}
+def _parse_csv_set(raw):
+    """Comma-separated IDs → set of non-empty stripped strings."""
+    if not raw:
+        return set()
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+# 白名单：多 agent 协作时放行对端 bot 的 @/发言。
+# 默认空 = 丢弃全部 bot 消息（muse 安全默认；只防自循环不够，还防陌生 bot）。
+# 协作时在 .env 填 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔 U…/B…），二者满足其一即放行。
+# 自己的消息永远被过滤，不会自循环。
+ALLOWED_BOT_USERS = _parse_csv_set(_ENV.get("ALLOWED_BOT_USERS", ""))
+ALLOWED_BOT_IDS = _parse_csv_set(_ENV.get("ALLOWED_BOT_IDS", ""))
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -133,7 +136,7 @@ def main():
             if not kind:
                 return
 
-            # 自己的消息永远丢弃；白名单 bot 视为人类；其他 bot 丢弃（防互循环）
+            # 自己的消息永远丢弃；.env 白名单 bot 放行（协作）；其余 bot 丢弃（muse 默认）
             if event.get("user") == me:
                 return
             is_bot_msg = bool(event.get("bot_id")) or \

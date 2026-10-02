@@ -4,12 +4,13 @@
 把每条消息以 JSON 行追加到 inbox.jsonl，供消费层（cron/轮询脚本/agent）
 读取处理。发送请用 send.py。
 
-Grok Bot 多 agent 友好默认：
+Grok Bot 多 agent 频道协作默认：
   - 永远丢弃自己的 user_id（auth_test），防止自循环
-  - 默认允许其他 bot 的 app_mention / 发言进入队列
+  - 默认允许其他 bot 的 app_mention / 发言进入队列（不要改成丢弃全部 bot）
     （Grok Bot 与其他 agent 常在同一频道互相 @）
   - 若 .env 设置了 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔），
-    则改为白名单模式：仅这些 bot 放行，其他 bot 丢弃
+    则改为白名单模式：仅这些 bot 放行，其他 bot 丢弃（可选收紧）
+  - 消费层配合：回复前 channel_history；REPLY_IN_THREAD=0 顶层可见
 
 配置：同目录 .env（0600），见 .env.example。
 依赖：pip install slack_sdk

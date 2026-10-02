@@ -53,7 +53,7 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
 
 ## Agent 指令
 
-把下面整段复制给任意 agent，即可端到端搭桥：
+把下面整段复制给任意 agent，即可端到端搭桥。**默认按多 agent 频道协作配置**（互相 @、读上下文、顶层可见回复）。
 
 ```
 你要为用户配置 Agents Slack Bridge（https://github.com/Ares-X/Agents-Slack-Bridge）。
@@ -62,13 +62,19 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
 - 永不提交 .env；永不把 xoxb-/xapp- token 贴进聊天；用 0600 文件或 secret store。
 - 只在 /workspace 或用户指定的持久目录操作。
 
+多 agent 频道协作默认（配置与回复行为都按此执行）：
+- 允许其他 bot @ 本 bot：grokbot 默认放行其他 bot（仅丢弃自己）；muse 默认丢弃全部 bot，协作时把对端写入 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（或 bridge.py 白名单）；hermes 用 allow_bots: mentions。
+- 每次回复前：先跑 channel_history.py <channel> [N]（或 consumer 内同等调用），把近况当上下文再用。
+- 默认频道顶层回复（REPLY_IN_THREAD=0 / reply_in_thread: false），让同频道其他 agent 能看到；不要默认跟帖藏起来。
+- 协作：被其他 agent @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，避免 echo/回环风暴；需要收紧时再用 ALLOWED_BOT_* 白名单。
+
 步骤：
 1. git clone https://github.com/Ares-X/Agents-Slack-Bridge.git
    进入仓库根目录。
 2. 让用户选择 flavor：
-   - muse/     → Muse / 通用 LLM（~30s consumer）
-   - grokbot/  → Grok Bot / Cursor Grok Bot（5s consumer 或 pending.json 5min fallback）
-   - hermes/   → Hermes Agent 本体（原生插件，无 consumer；读 hermes/AGENT.md 走它自己的步骤）
+   - muse/     → Muse / 通用 LLM（~30s consumer；协作需配 bot 白名单）
+   - grokbot/  → Grok Bot / Cursor Grok Bot（5s consumer 或 pending.json 5min fallback；默认允许多 agent）
+   - hermes/   → Hermes Agent 本体（原生插件，无 consumer；读 hermes/AGENT.md）
    cd 进所选目录。若选 grokbot 或 hermes，同时阅读该目录的 AGENT.md。
 3. 按 flavor 建 App：
    - muse/grokbot：用该目录的 manifest.yaml 在 https://api.slack.com/apps
@@ -80,22 +86,26 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
      ~/.hermes/.env，不用 venv/consumer）。
 4. cp .env.example .env && chmod 600 .env
    填入两个 token（及可选 PROXY_URL / CA_BUNDLE / SLACK_BOT_USER_ID）。
+   grokbot：保持 REPLY_IN_THREAD=0；ALLOWED_BOT_* 默认可不设（允许多 agent）。
+   muse：多 agent 协作时填 ALLOWED_BOT_* 或编辑 bridge.py 白名单。
    不要把填好的 .env 内容回显到聊天。
 5. python3 -m venv venv && ./venv/bin/pip install slack_sdk
-   （grokbot 可用 pip install -r requirements.txt）
+   （grokbot 可用 pip install -r requirements.txt；hermes 跳过本步）
 6. 启动 bridge：./venv/bin/python bridge.py
    （或按该目录 *.service 配 systemd，WorkingDirectory 指向该 flavor 目录）
-   确认 bridge.log 出现 "socket mode connected"。
-7. 启动消费层：
+   确认 bridge.log 出现 "socket mode connected"。hermes 用 hermes gateway。
+7. 启动消费层（并确认「回复前拉 channel_history」）：
    - muse:    ./venv/bin/python consumer/poll_consumer.py
-              （把 generate_reply 换成 LLM）
+              （把 generate_reply 换成 LLM；协作前配好 bot 白名单）
    - grokbot: ./venv/bin/python consumer/poll_consumer.py
-              （默认 5s、顶层回复；或改用 pending_notify.py + agent 例程）
+              （默认 5s、顶层回复、每次先拉历史；或改用 pending_notify.py + agent 例程）
+   - hermes:  无 consumer；会话内自带上下文，补频道历史用 channel_history.py
 8. /invite @bot 进测试频道；私信或 @bot hello；
+   再让另一个 agent @ 本 bot，确认能读上下文并在频道顶层回复。
    ./venv/bin/python inbox_peek.py 应看到消息；
    echo 'hi' | ./venv/bin/python send.py <channel_id> 验证回发。
 9. 完成后向用户报告：选用的 flavor、App 名、bridge/consumer 是否在跑、
-   验证结果。不要输出任何 token。
+   多 agent 协作默认是否已生效、验证结果。不要输出任何 token。
 ```
 
 更细的 Grok 专用步骤见 [`grokbot/AGENT.md`](./grokbot/AGENT.md)；Hermes 原生接入见 [`hermes/AGENT.md`](./hermes/AGENT.md)；Muse 细节见 [`muse/README.md`](./muse/README.md)。

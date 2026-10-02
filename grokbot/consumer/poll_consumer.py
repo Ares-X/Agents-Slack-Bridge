@@ -1,15 +1,16 @@
 """Grok Bot 消费层：~5s 轮询，拉频道历史，上下文感知模板回复，ack。
 
-默认行为（可用 .env 覆盖）：
+多 agent 协作默认（可用 .env 覆盖）：
   - SLACK_BRIDGE_POLL_SEC=5
-  - REPLY_IN_THREAD=0 → 频道顶层回复（不传 --thread-ts）
-  - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test
+  - REPLY_IN_THREAD=0 → 频道顶层回复（不传 --thread-ts；同伴看得见）
+  - 每条消息回复前先 channel_history（上下文）
+  - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test；勿 @ 自己、防回环
 
 会话历史落在 consumer/channel_sessions.json。
 脚本在 consumer/ 下，inbox_peek / send / channel_history 在上一层 grokbot/，
 因此 ROOT = dirname(BASE)，所有子进程 cwd=ROOT。
 
-把 generate_reply() 换成 LLM API 或 wake your Grok Bot agent。
+把 generate_reply() 换成 LLM API 或 wake your Grok Bot agent（须使用 history）。
 """
 import json
 import os
