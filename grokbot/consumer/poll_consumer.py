@@ -1,10 +1,20 @@
-"""Grok Bot 消费层：~5s 轮询，拉频道历史，上下文感知模板回复，ack。
+"""Grok Bot 消费层：~5s 轮询。
+
+Modes:
+  - agent_wake (default when webhook.env present, or REPLY_MODE=agent_wake):
+    escalate stale sending; ack-only for reply_status=sent; respect rate_limited;
+    for NEW claimable messages do NOT template-send — run pending_notify.py then
+    wake_agent.py (debounced by claimable fingerprint).
+  - template (ONLY when REPLY_MODE=template explicitly):
+    context-aware template stub via generate_reply + process_one.
+  - error (missing webhook.env and REPLY_MODE not set/invalid):
+    refuse to start; keep inbox messages (no silent template).
 
 多 agent 协作默认（可用 .env 覆盖）：
   - SLACK_BRIDGE_POLL_SEC=5
-  - REPLY_IN_THREAD=0 → 频道顶层回复
+  - REPLY_IN_THREAD=0 → mention/dm 频道顶层回复
   - REPLY_IN_THREAD=1 → 跟帖：thread_ts 优先，否则消息 ts
-  - 每条消息回复前先 channel_history；失败可见降级
+  - kind=thread_reply → 无视 REPLY_IN_THREAD，强制同线程回复（thread_ts）
   - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test
 
 发送状态机（reply_pipeline，与 pending fallback 共用）：
@@ -13,9 +23,9 @@
   - 其余失败 → uncertain；sending/uncertain 永不盲发
   - sent → 只重试 ack
   - 启动时 escalate stale sending → uncertain
-
-★ generate_reply() 是模板 stub，不是已接线的 Grok 模型。
 """
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -29,6 +39,8 @@ ROOT = os.path.dirname(BASE)  # grokbot/
 SESSIONS_PATH = os.path.join(BASE, "channel_sessions.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 INBOX_PATH = os.path.join(ROOT, "inbox.jsonl")
+WEBHOOK_ENV_PATH = os.path.join(ROOT, "webhook.env")
+WAKE_DEBOUNCE_SEC = 45.0
 
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -36,6 +48,7 @@ if ROOT not in sys.path:
 from inbox_store import (  # noqa: E402
     ack_keys,
     escalate_stale_sending,
+    is_send_ready,
     msg_key,
 )
 from reply_pipeline import (  # noqa: E402
@@ -70,6 +83,38 @@ _raw_thread = (
     or "0"
 ).strip().lower()
 REPLY_IN_THREAD = _raw_thread in ("1", "true", "yes", "on")
+
+
+def resolve_reply_mode(env=None, webhook_env_path=None):
+    """Resolve reply mode. Template ONLY if REPLY_MODE=template explicitly.
+
+    - REPLY_MODE=template → "template"
+    - REPLY_MODE=agent_wake → "agent_wake"
+    - REPLY_MODE unset/empty + webhook.env present → "agent_wake"
+    - otherwise (missing webhook.env, or invalid REPLY_MODE) → "error"
+      (caller must keep messages; never silent-fall-back to template)
+    """
+    env = _ENV if env is None else env
+    wh = WEBHOOK_ENV_PATH if webhook_env_path is None else webhook_env_path
+    raw = (
+        os.environ.get("REPLY_MODE")
+        or (env or {}).get("REPLY_MODE")
+        or ""
+    ).strip().lower()
+    if raw == "template":
+        return "template"
+    if raw == "agent_wake":
+        return "agent_wake"
+    if raw in ("",) and os.path.exists(wh):
+        return "agent_wake"
+    return "error"
+
+
+REPLY_MODE = resolve_reply_mode()
+
+# Bounded wake-failure backoff (seconds): 5, 10, 20, 40, cap 60
+WAKE_BACKOFF_BASE = 5.0
+WAKE_BACKOFF_CAP = 60.0
 
 
 def resolve_me():
@@ -163,8 +208,31 @@ def thread_target(message):
     return (message.get("thread_ts") or message.get("ts") or "").strip()
 
 
+def is_in_thread(message):
+    """True if payload is a real thread reply (thread_ts present and != ts)."""
+    ts = ((message or {}).get("ts") or "").strip()
+    thread_ts = ((message or {}).get("thread_ts") or "").strip()
+    return bool(thread_ts and ts and thread_ts != ts)
+
+
+def should_reply_in_thread(message, reply_in_thread_env=None):
+    """Force thread for kind=thread_reply / in-thread msgs; else REPLY_IN_THREAD.
+
+    app_mention + message dual delivery for the same (channel,ts) must pick
+    the same reply locus regardless of which event arrived first: if the
+    stored row has thread_ts != ts, always reply in that thread.
+    """
+    if reply_in_thread_env is None:
+        reply_in_thread_env = REPLY_IN_THREAD
+    if (message or {}).get("kind") == "thread_reply":
+        return True
+    if is_in_thread(message):
+        return True
+    return bool(reply_in_thread_env)
+
+
 def generate_reply(channel, message, session, history, history_error=None):
-    """短上下文感知模板回复（stub，非 Grok 模型接线）。"""
+    """短上下文感知模板回复（stub，非 Grok 模型接线）。仅 REPLY_MODE=template。"""
     text = strip_mentions(message.get("text") or "")
     user = message.get("user_name") or message.get("user") or "someone"
 
@@ -213,18 +281,31 @@ def generate_reply(channel, message, session, history, history_error=None):
     return f"收到。你要我针对「{text[:120]}」做什么？"
 
 
-def handle_one(m, sessions, *, runner=None):
-    """Process one undelivered message via shared reply_pipeline."""
+def claimable_fingerprint(msgs):
+    """Stable fingerprint of claimable (channel,ts) set."""
+    keys = sorted(
+        f"{m.get('channel') or ''}:{m.get('ts') or ''}"
+        for m in msgs
+    )
+    return "|".join(keys), frozenset(keys)
+
+
+def handle_ack_and_skips(m, *, runner=None):
+    """Handle self-ack, sent ack-only, uncertain/sending skip, rate_limited wait.
+
+    Returns:
+      ("done", False) — handled / skip, no further action
+      ("claimable", False) — ready for agent wake (or template send)
+    """
     if ME and m.get("user") == ME:
         ack_keys(INBOX_PATH, {msg_key(m)})
-        return False
+        return "done", False
 
     ch = m.get("channel") or ""
     ts = m.get("ts") or ""
     label = m.get("channel_name") or ch
     status = m.get("reply_status")
 
-    # Fast paths that need no reply text
     if status == "sent":
         result = process_one(
             INBOX_PATH, m, "", reply_in_thread=REPLY_IN_THREAD,
@@ -232,30 +313,49 @@ def handle_one(m, sessions, *, runner=None):
         )
         if result.get("outcome") == "acked":
             print(f"acked prior send in {label} ({ch}:{ts})", flush=True)
-        return False
+        return "done", False
 
     if status in ("uncertain", "sending"):
         print(
             f"skip {status} for {ch}:{ts} (will not resend; verify manually)",
             file=sys.stderr,
         )
-        return False
+        return "done", False
 
     if status == "rate_limited":
-        import time as _time
         try:
             until = float(m.get("retry_after_until") or 0)
         except (TypeError, ValueError):
             until = 0.0
-        now = _time.time()
+        now = time.time()
         if now < until:
             print(
                 f"rate-limited wait for {ch}:{ts}: "
                 f"{until - now:.1f}s remaining; not sending",
                 file=sys.stderr,
             )
-            return False
-        # Wait expired → fall through to normal history + claim + send.
+            return "done", False
+        # Wait expired → claimable again
+
+    if not is_send_ready(m):
+        print(
+            f"skip not-send-ready for {ch}:{ts} status={status!r}",
+            file=sys.stderr,
+        )
+        return "done", False
+
+    return "claimable", False
+
+
+def handle_one_template(m, sessions, *, runner=None):
+    """Process one undelivered message via template + reply_pipeline."""
+    kind, _ = handle_ack_and_skips(m, runner=runner)
+    if kind != "claimable":
+        return False
+
+    ch = m.get("channel") or ""
+    ts = m.get("ts") or ""
+    label = m.get("channel_name") or ch
 
     sess = sessions.setdefault(ch, [])
     hist, hist_err = channel_history(ch)
@@ -263,7 +363,8 @@ def handle_one(m, sessions, *, runner=None):
         print(f"history degrade for {ch}: {hist_err}", file=sys.stderr)
 
     reply = generate_reply(ch, m, sess, hist, history_error=hist_err)
-    tt = thread_target(m) if REPLY_IN_THREAD else None
+    in_thread = should_reply_in_thread(m)
+    tt = thread_target(m) if in_thread else None
 
     def _runner(*args, input_text=None):
         if runner is not None:
@@ -274,7 +375,7 @@ def handle_one(m, sessions, *, runner=None):
         INBOX_PATH,
         m,
         reply,
-        reply_in_thread=REPLY_IN_THREAD,
+        reply_in_thread=in_thread,
         thread_ts=tt,
         root=ROOT,
         runner=_runner,
@@ -335,27 +436,270 @@ def handle_one(m, sessions, *, runner=None):
     return False
 
 
+# Back-compat alias for tests that call handle_one
+def handle_one(m, sessions, *, runner=None):
+    return handle_one_template(m, sessions, runner=runner)
+
+
+def _parse_retry_after_sec(stdout: str, stderr: str = "") -> float | None:
+    """Parse wake_agent machine line retry_after_sec=N from stdout/stderr."""
+    import re as _re
+    blob = (stdout or "") + "\n" + (stderr or "")
+    m = _re.search(r"retry_after_sec=([0-9]+(?:\.[0-9]+)?)", blob)
+    if not m:
+        return None
+    try:
+        return max(0.0, float(m.group(1)))
+    except ValueError:
+        return None
+
+
+def _wake_backoff_sec(fail_count: int) -> float:
+    """Bounded exponential backoff: 5, 10, 20, 40, ... cap WAKE_BACKOFF_CAP.
+
+    Cap the exponent BEFORE computing 2**exp so fail_count > 1025 (or any
+    huge n) never OverflowError when converting to float.
+    """
+    n = max(1, int(fail_count))
+    # 2**10 * base already far above CAP; keep well under float exponent max.
+    _MAX_EXP = 10
+    exp = min(n - 1, _MAX_EXP)
+    return min(WAKE_BACKOFF_CAP, WAKE_BACKOFF_BASE * (2 ** exp))
+
+
+def maybe_wake_agent(claimable, wake_state, *, time_fn=None, runner=None):
+    """Run pending_notify + wake_agent with fingerprint debounce + failure waits.
+
+    wake_state keys:
+      last_fp, last_keys, last_at — success fingerprint debounce
+      wake_retry_after_until — absolute epoch from webhook 429 Retry-After
+      wake_backoff_until — absolute epoch for other wake failures
+      wake_fail_count — consecutive non-success wakes (reset on success)
+
+    Debounce rules:
+      - DO post when claimable set gains new (channel,ts) keys
+      - do NOT re-POST the same set within WAKE_DEBOUNCE_SEC
+      - after debounce window, same set may re-POST (agent may have missed)
+      - shrink-only changes within debounce are skipped
+    Failure rules:
+      - 429 → honor Retry-After (do not count as success; no 5s hammer)
+      - other failures → bounded backoff; not success
+    """
+    if not claimable:
+        return wake_state
+
+    now = float((time_fn or time.time)())
+    ra_until = float(wake_state.get("wake_retry_after_until") or 0)
+    if now < ra_until:
+        print(
+            f"agent_wake: skip webhook waiting Retry-After "
+            f"{ra_until - now:.1f}s remaining (n={len(claimable)})",
+            flush=True,
+        )
+        return wake_state
+    bo_until = float(wake_state.get("wake_backoff_until") or 0)
+    if now < bo_until:
+        print(
+            f"agent_wake: skip webhook waiting failure backoff "
+            f"{bo_until - now:.1f}s remaining (n={len(claimable)})",
+            flush=True,
+        )
+        return wake_state
+
+    fp, keys = claimable_fingerprint(claimable)
+    last_fp = wake_state.get("last_fp") or ""
+    last_keys = wake_state.get("last_keys") or frozenset()
+    last_at = float(wake_state.get("last_at") or 0)
+    gained_keys = keys - last_keys
+    gained = bool(gained_keys)
+    age = now - last_at if last_at else None
+
+    if not gained and fp == last_fp and age is not None and age < WAKE_DEBOUNCE_SEC:
+        print(
+            f"agent_wake: skip webhook same fingerprint within "
+            f"{WAKE_DEBOUNCE_SEC:.0f}s (n={len(claimable)})",
+            flush=True,
+        )
+        return wake_state
+
+    if (
+        not gained
+        and fp != last_fp
+        and last_keys
+        and age is not None
+        and age < WAKE_DEBOUNCE_SEC
+    ):
+        print(
+            f"agent_wake: skip webhook shrink-only fingerprint within "
+            f"{WAKE_DEBOUNCE_SEC:.0f}s (n={len(claimable)})",
+            flush=True,
+        )
+        out = dict(wake_state)
+        out["last_fp"] = fp
+        out["last_keys"] = keys
+        # keep original last_at / failure clocks
+        return out
+
+    run = runner if runner is not None else sh
+
+    r_notify = run(sys.executable, "pending_notify.py")
+    if getattr(r_notify, "returncode", 1) != 0:
+        print(
+            f"agent_wake: pending_notify failed rc={r_notify.returncode}: "
+            f"{(r_notify.stderr or r_notify.stdout or '')[:200]}",
+            file=sys.stderr,
+        )
+        # Timing starts AFTER the operation returns (not from call start).
+        now_after = float((time_fn or time.time)())
+        fails = int(wake_state.get("wake_fail_count") or 0) + 1
+        delay = _wake_backoff_sec(fails)
+        out = dict(wake_state)
+        out["wake_fail_count"] = fails
+        out["wake_backoff_until"] = now_after + delay
+        print(
+            f"agent_wake: failure backoff {delay:.0f}s "
+            f"(fail_count={fails}; not success)",
+            file=sys.stderr,
+        )
+        return out
+
+    r_wake = run(sys.executable, "wake_agent.py")
+    # Re-sample clock after wake HTTP returns so Retry-After / backoff
+    # wait from response time, not from when the request started.
+    now_after = float((time_fn or time.time)())
+    rc = getattr(r_wake, "returncode", 1)
+    stdout = getattr(r_wake, "stdout", "") or ""
+    stderr = getattr(r_wake, "stderr", "") or ""
+    if rc == 0:
+        reason = "gained keys" if gained else (
+            "debounce expired" if fp == last_fp else "fingerprint changed"
+        )
+        print(
+            f"agent_wake: posted webhook for {len(claimable)} claimable "
+            f"({reason})",
+            flush=True,
+        )
+        return {
+            "last_fp": fp,
+            "last_keys": keys,
+            "last_at": now_after,
+            "wake_fail_count": 0,
+            "wake_retry_after_until": 0.0,
+            "wake_backoff_until": 0.0,
+        }
+
+    # Failure — must NOT count as success (do not set last_at/fp as posted)
+    ra = _parse_retry_after_sec(stdout, stderr)
+    out = dict(wake_state)
+    if ra is not None and (rc == 4 or "429" in stderr or "rate limited" in stderr.lower()):
+        out["wake_retry_after_until"] = now_after + float(ra)
+        print(
+            f"agent_wake: wake_agent 429; honor Retry-After {ra}s "
+            f"(not success; n={len(claimable)})",
+            file=sys.stderr,
+        )
+        return out
+
+    fails = int(wake_state.get("wake_fail_count") or 0) + 1
+    delay = _wake_backoff_sec(fails)
+    # Prefer explicit retry_after from body if present even on non-429
+    if ra is not None:
+        delay = max(delay, float(ra))
+    out["wake_fail_count"] = fails
+    out["wake_backoff_until"] = now_after + delay
+    print(
+        f"agent_wake: wake_agent failed rc={rc}: {(stderr or stdout)[:200]}",
+        file=sys.stderr,
+    )
+    print(
+        f"agent_wake: failure backoff {delay:.0f}s "
+        f"(fail_count={fails}; not success)",
+        file=sys.stderr,
+    )
+    return out
+
+
+def poll_agent_wake_once(wake_state, *, runner=None):
+    """One poll cycle in agent_wake mode. Returns updated wake_state."""
+    msgs = peek()
+    if not msgs:
+        return wake_state
+    claimable = []
+    for m in msgs:
+        kind, _ = handle_ack_and_skips(m, runner=runner)
+        if kind == "claimable":
+            claimable.append(m)
+    if claimable:
+        wake_state = maybe_wake_agent(claimable, wake_state)
+    else:
+        print("agent_wake: no claimable this round (acks/skips only)", flush=True)
+    return wake_state
+
+
 def main():
     n = escalate_stale_sending(INBOX_PATH)
     if n:
         print(f"escalated {n} stale sending → uncertain", flush=True)
+
+    mode = resolve_reply_mode()
+    global REPLY_MODE
+    REPLY_MODE = mode
+
+    if mode == "error":
+        raw = (
+            os.environ.get("REPLY_MODE")
+            or _ENV.get("REPLY_MODE")
+            or ""
+        ).strip()
+        print(
+            "ERROR: reply mode unresolved — set REPLY_MODE=template or "
+            "REPLY_MODE=agent_wake, or provide webhook.env for agent_wake. "
+            f"Got REPLY_MODE={raw!r}, webhook.env="
+            f"{'present' if os.path.exists(WEBHOOK_ENV_PATH) else 'missing'}. "
+            "Refusing silent template fallback; inbox messages kept. Exiting.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     print(
         f"grokbot consumer polling every {POLL_INTERVAL}s "
+        f"mode={mode} "
         f"(REPLY_IN_THREAD={REPLY_IN_THREAD}, me={ME or 'auto-pending'}, ROOT={ROOT})",
         flush=True,
     )
-    print(
-        "NOTE: generate_reply() is a template stub — not auto-wired to Grok models.",
-        flush=True,
-    )
+    if mode == "template":
+        print(
+            "NOTE: generate_reply() is a template stub — not auto-wired to Grok models.",
+            flush=True,
+        )
+    else:
+        print(
+            "agent_wake: claimable messages wake Grok Bot via webhook "
+            "(no template send); see AGENT_WAKE.md",
+            flush=True,
+        )
+
+    wake_state = {
+        "last_fp": "",
+        "last_keys": frozenset(),
+        "last_at": 0.0,
+        "wake_fail_count": 0,
+        "wake_retry_after_until": 0.0,
+        "wake_backoff_until": 0.0,
+    }
     while True:
         try:
-            msgs = peek()
-            if msgs:
-                sessions = load_sessions()
-                for m in msgs:
-                    handle_one(m, sessions)
-                save_sessions(sessions)
+            if mode == "agent_wake":
+                wake_state = poll_agent_wake_once(wake_state)
+            elif mode == "template":
+                msgs = peek()
+                if msgs:
+                    sessions = load_sessions()
+                    for m in msgs:
+                        handle_one_template(m, sessions)
+                    save_sessions(sessions)
+            else:
+                print(f"poll skip: unknown mode={mode!r}", file=sys.stderr)
         except Exception as e:
             print(f"poll error: {e}", file=sys.stderr)
         time.sleep(POLL_INTERVAL)

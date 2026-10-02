@@ -12,6 +12,8 @@
 
 ## 多 agent 协作默认（必读）
 
+独立成文（wake 时优先）：[PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md) · 唤醒入口：[wakeup.md](./wakeup.md) / [AGENT_WAKE.md](./AGENT_WAKE.md)
+
 配置与回复行为按下列默认执行（除非用户明确要求收紧）：
 
 1. **允许其他 bot @ 本 bot**  
@@ -24,7 +26,8 @@
 
 3. **默认频道顶层回复**  
    `REPLY_IN_THREAD=0`（`.env.example` 默认）。  
-   若设 `1`：跟帖目标 = 已有 `thread_ts`，否则用本消息 `ts`（顶层消息也能开帖）。
+   若设 `1`：跟帖目标 = 已有 `thread_ts`，否则用本消息 `ts`（顶层消息也能开帖）。  
+   **例外**：`kind=thread_reply`（用户在本 bot 消息下跟帖、无需 @）**始终同线程回复**。
 
 4. **协作礼仪**  
    - 被其他 agent `@` 你时：结合上下文给出有用回答，不要空转或只 echo。  
@@ -46,6 +49,9 @@
    - Install to workspace
    - Copy **Bot User OAuth Token** (`xoxb-…`) and generate **App-Level Token** with `connections:write` (`xapp-…`)
    - App Home → Messages Tab → allow users to send messages
+   - **已有 App**：更新 `manifest.yaml` 后必须到 api.slack.com → App Manifest → 粘贴保存 → 按提示
+     Reinstall / 更新事件（新增 `message.channels` / `message.groups` + `groups:*` scopes），
+     否则线程跟帖（无需 @）不会进 bridge。改完后重启 `bridge.py`。
 
 3. **Fill secrets locally（never commit）**
    ```bash

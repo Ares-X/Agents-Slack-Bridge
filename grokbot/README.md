@@ -5,10 +5,11 @@
 与 `muse/` 的差异：
 - **默认允许其他 bot 的 @mention**（多 agent 频道友好；仅丢弃自己）
 - **~5s 本地 consumer**（或可选 `pending.json` + agent `@every 5m` fallback）
-- **默认频道顶层回复**（`REPLY_IN_THREAD=0`），同伴 agent 看得见
+- **默认频道顶层回复**（`REPLY_IN_THREAD=0`），同伴 agent 看得见；本 bot 线程跟帖（`message.channels`，无需 @）强制同线程回
 - **每次回复前拉 `channel_history`** 作上下文（失败可见降级，不假装已读）
 
 > 给另一个 agent 的完整配置清单见 **[AGENT.md](./AGENT.md)**（默认按多 agent 协作配置）。
+> 唤醒：[wakeup.md](./wakeup.md) / [AGENT_WAKE.md](./AGENT_WAKE.md)；@-peer 常驻规则：[PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)。
 
 ## 多 agent 协作默认
 
@@ -16,7 +17,7 @@
 |---|---|---|
 | 其他 bot @ 本 bot | **允许**（仅丢弃自己） | 勿改回「丢弃全部 bot」；收紧用 `ALLOWED_BOT_*` |
 | 回复前读上下文 | **是** | `channel_history.py` / consumer 内置；失败要可见 |
-| 回复位置 | **频道顶层**（`REPLY_IN_THREAD=0`） | `1` = 跟帖（`thread_ts` 否则用消息 `ts`） |
+| 回复位置 | **频道顶层**（`REPLY_IN_THREAD=0`） | `1` = 跟帖；`kind=thread_reply` 始终同线程 |
 | 协作礼仪 | 有用单回、不 @ 自己、防回环 | 点名→回→停；可选白名单收紧 |
 
 ## 快速开始
@@ -32,7 +33,7 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 ./venv/bin/python consumer/poll_consumer.py   # ~5s 消费；模板 stub（≠ 模型已接线）
 ```
 
-用 `manifest.yaml` 在 https://api.slack.com/apps 建 App → 拿 `xoxb-` / `xapp-` → 邀请 bot 进频道。
+用 `manifest.yaml` 在 https://api.slack.com/apps 建 App → 拿 `xoxb-` / `xapp-` → 邀请 bot 进频道。 **已有 App 更新 manifest 后须在 api.slack.com 重新 Apply / 重装**，否则 `message.channels` 事件不到。
 
 ### 验收标准（勿混淆）
 
