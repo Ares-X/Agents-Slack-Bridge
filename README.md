@@ -2,16 +2,17 @@
 
 Slack ↔ Agent 双向桥接：**Socket Mode** 出站长连接，机器只需出站联网，**不需要公网入口**。用户私信 bot 或在频道 `@bot`，本地队列承接，消费层生成回复后发回 Slack。
 
-仓库提供两个独立可部署的 flavor，选一个目录按它自己的 README 配置即可。
+仓库提供三个独立可部署的 flavor，选一个目录按它自己的 README 配置即可。
 
 ---
 
-## 两个 flavor
+## 三个 flavor
 
 | 目录 | 面向 | 消费 | 其它 bot @ | 默认回复位置 |
 |---|---|---|---|---|
 | **[`muse/`](./muse/README.md)** | Muse / 任意带 `generate_reply()` 的通用 LLM agent | ~30s 轮询 consumer（或平台 side chat） | 默认丢弃；白名单 `ALLOWED_BOT_*` 放行 | 有 `thread_ts` 则跟帖 |
 | **[`grokbot/`](./grokbot/README.md)** | Grok Bot / Cursor Grok Bot | **5s** 本地 consumer，或可选 **5min** agent 例程（`pending.json`） | **默认允许**其他 bot（仅丢弃自己）；可选白名单收紧 | 默认**频道顶层**（`REPLY_IN_THREAD=0`） |
+| **[`hermes/`](./hermes/README.md)** | **Hermes Agent 本体**（原生 Slack 平台插件，非自建桥） | 无需 consumer——事件直达 agent 回合 | `allow_bots: mentions`（对方消息明确 @ 才受理） | `reply_in_thread` 可配 |
 
 ```
 Agents-Slack-Bridge/
@@ -22,12 +23,17 @@ Agents-Slack-Bridge/
 │   ├── bridge.py, send.py, inbox_*, channel_history.py
 │   ├── manifest.yaml, .env.example, slack-bridge.service
 │   └── consumer/poll_consumer.py
-└── grokbot/                  # Grok Bot 桥
+├── grokbot/                  # Grok Bot 桥
+│   ├── README.md, AGENT.md
+│   ├── bridge.py, send.py, inbox_*, channel_history.py, pending_notify.py
+│   ├── manifest.yaml, .env.example, requirements.txt
+│   ├── slack-bridge.service, slack-consumer.service
+│   └── consumer/poll_consumer.py
+└── hermes/                   # Hermes Agent 原生插件接入包
     ├── README.md, AGENT.md
-    ├── bridge.py, send.py, inbox_*, channel_history.py, pending_notify.py
-    ├── manifest.yaml, .env.example, requirements.txt
-    ├── slack-bridge.service, slack-consumer.service
-    └── consumer/poll_consumer.py
+    ├── slack-manifest.json   # hermes slack manifest --agent-view 生成
+    ├── config.example.yaml, .env.example
+    └── channel_history.py    # 频道/线程历史 CLI（零依赖）
 ```
 
 ## 架构（共性）
@@ -63,11 +69,16 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
 2. 让用户选择 flavor：
    - muse/     → Muse / 通用 LLM（~30s consumer）
    - grokbot/  → Grok Bot / Cursor Grok Bot（5s consumer 或 pending.json 5min fallback）
-   cd 进所选目录。若选 grokbot，同时阅读 grokbot/AGENT.md。
-3. 用该目录的 manifest.yaml 在 https://api.slack.com/apps
-   「Create New App → From a manifest」创建 App；改 display_name；
-   Install；复制 Bot User OAuth Token (xoxb-) 与带 connections:write 的
-   App-Level Token (xapp-)；App Home → Messages Tab 允许用户发消息。
+   - hermes/   → Hermes Agent 本体（原生插件，无 consumer；读 hermes/AGENT.md 走它自己的步骤）
+   cd 进所选目录。若选 grokbot 或 hermes，同时阅读该目录的 AGENT.md。
+3. 按 flavor 建 App：
+   - muse/grokbot：用该目录的 manifest.yaml 在 https://api.slack.com/apps
+     「Create New App → From a manifest」创建 App；改 display_name；
+     Install；复制 Bot User OAuth Token (xoxb-) 与带 connections:write 的
+     App-Level Token (xapp-)；App Home → Messages Tab 允许用户发消息。
+   - hermes：manifest 是 slack-manifest.json（或本机 `hermes slack manifest
+     --agent-view --write` 重新生成）；其余步骤见 hermes/AGENT.md（token 写
+     ~/.hermes/.env，不用 venv/consumer）。
 4. cp .env.example .env && chmod 600 .env
    填入两个 token（及可选 PROXY_URL / CA_BUNDLE / SLACK_BOT_USER_ID）。
    不要把填好的 .env 内容回显到聊天。
@@ -88,7 +99,7 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
    验证结果。不要输出任何 token。
 ```
 
-更细的 Grok 专用步骤见 [`grokbot/AGENT.md`](./grokbot/AGENT.md)；Muse 细节见 [`muse/README.md`](./muse/README.md)。
+更细的 Grok 专用步骤见 [`grokbot/AGENT.md`](./grokbot/AGENT.md)；Hermes 原生接入见 [`hermes/AGENT.md`](./hermes/AGENT.md)；Muse 细节见 [`muse/README.md`](./muse/README.md)。
 
 ---
 

@@ -1,0 +1,29 @@
+# 合并进 ~/.hermes/config.yaml 的 Slack 片段（与顶层键同级，不是 gateway: 下面的）
+platforms:
+  slack:
+    enabled: true
+    # cron / 定时消息 / 主动通知的默认落脚频道（channel ID，C 开头）
+    home_channel:
+      platform: slack
+      chat_id: C01234567890        # 改成你的频道
+      name: general
+      # user_id / scope_id 由网关自动回填，可不填
+    extra:
+      # 频道里顶层直接回复（false）；true = 开 thread 回复
+      reply_in_thread: false
+      # 多 agent 协作：只有对方 bot 的消息里明确 @了本 bot 才受理（防回环推荐值）
+      allow_bots: mentions
+      # Block Kit 富渲染（表格/嵌套列表/分割线），纯发送侧开关，无需重装 App
+      rich_blocks: true
+
+# 顶层（与 platforms: 同级）可选的 Slack 行为键，按需添加：
+# slack:
+#   require_mention: true          # 频道消息需 @mention 才触发（默认 true）
+#   strict_mention: false          # true = 每条消息（含 thread 内）都要重新 @，禁自动跟随
+#   thread_require_mention: false  # thread 回复是否强制 @
+#   mention_patterns: ["hey hermes"]  # 额外触发词
+#   free_response_channels: []     # 免 @ 白名单频道（C/G 开头 ID）
+#   allowed_channels: []           # 只在这些频道响应（1:1 DM 豁免）
+#   channel_prompts: {}            # 按频道注入一次性 system prompt
+#   channel_skill_bindings: []     # 按频道在会话启动时自动加载 skill
+#   typing_status_text: "is thinking..."  # 工作状态行（需 assistant:write scope）
