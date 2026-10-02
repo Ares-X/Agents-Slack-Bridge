@@ -20,6 +20,7 @@
     "on_missing_required_context": "report_gap_without_guessing"
   },
   "reply_location": "channel_top_level",
+  "deduplication_capability_check": "use_only_exposed_ids_and_supported_private_state; report_gaps; concurrency_not_verified_by_single_message_test",
   "deduplication_keys": ["event_id", "channel_id+source_message_ts", "one_time_test_marker"],
   "on_uncertain_send": "reconcile_destination_before_retry",
   "active_test_marker": "<UNIQUE_TEST_MARKER>",
