@@ -1,0 +1,45 @@
+# Slack App manifest（Socket Mode 版）— Grok Bot
+# 用法：https://api.slack.com/apps → Create New App → From a manifest
+#      → 选择你的 workspace → 粘贴本文件全文 → Create
+# 建好后：
+#   1. 左侧 OAuth & Permissions → 把页面顶部的 Bot User OAuth Token（xoxb-）记下来
+#   2. Basic Information → App-Level Tokens → Generate Token（加 connections:write，
+#      会得到 xapp- 开头的 token；已有就直接复制）
+#   3. 把两个 token 填进 .env（见 .env.example）
+
+display_information:
+  name: Agent Slack Bridge Grok
+  description: Grok Bot / Cursor Grok Bot 的 Slack 桥接（DM 与 @mention 转发）
+  background_color: "#1A1A2E"
+
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true            # ★ 必须：允许用户给应用发私信
+    messages_tab_read_only_enabled: false #    否则用户会看到"向此应用发送消息的功能已关闭"
+  bot_user:
+    display_name: Grok Bot                # ★ 可改成你的 bot 显示名
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - channels:read
+      - chat:write
+      - im:history
+      - im:read
+      - im:write
+      - users:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention      # 频道里被 @
+      - message.im       # 收到私信
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true                # ★ 必须：Socket Mode，无需公网入口
+  token_rotation_enabled: false

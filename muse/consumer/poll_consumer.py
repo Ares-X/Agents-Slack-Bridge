@@ -5,6 +5,9 @@
 
 把 generate_reply() 换成你家 agent 的调用即可。
 会话历史落在 channel_sessions.json，重启不丢。
+
+脚本 cwd：本文件在 consumer/ 下，inbox_peek / send / channel_history
+都在上一层（muse/），因此 ROOT = dirname(BASE)，所有子进程在 ROOT 跑。
 """
 import json
 import os
@@ -13,13 +16,14 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(BASE)  # muse/
 SESSIONS_PATH = os.path.join(BASE, "channel_sessions.json")
 POLL_INTERVAL = 30  # 秒
 
 
 def sh(*args, input_text=None):
     return subprocess.run(args, input=input_text, capture_output=True,
-                          text=True, cwd=BASE)
+                          text=True, cwd=ROOT)
 
 
 def peek():
@@ -68,7 +72,7 @@ def generate_reply(channel, message, session, history):
 
 
 def main():
-    print(f"consumer polling every {POLL_INTERVAL}s ...")
+    print(f"consumer polling every {POLL_INTERVAL}s (ROOT={ROOT}) ...")
     while True:
         try:
             msgs = peek()
@@ -80,9 +84,6 @@ def main():
                     hist = channel_history(ch)
                     try:
                         reply = generate_reply(ch, m, sess, hist)
-                        kwargs = {}
-                        if m.get("thread_ts"):
-                            kwargs = {}
                         cmd = [sys.executable, "send.py", ch]
                         if m.get("thread_ts"):
                             cmd += ["--thread-ts", m["thread_ts"]]

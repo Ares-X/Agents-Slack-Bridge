@@ -1,7 +1,14 @@
-# 凭据与本地状态（绝不提交）
 .env
+**/.env
 venv/
+**/venv/
 *.log
 inbox.jsonl
+**/inbox.jsonl
+pending.json
+**/pending.json
+channel_sessions.json
+**/channel_sessions.json
 channel_chats.json
 __pycache__/
+**/.DS_Store

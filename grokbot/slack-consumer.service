@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent Slack Bridge GrokBot Consumer (~5s poll)
+After=network-online.target slack-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ★ 把路径换成实际部署目录；WorkingDirectory 必须是 grokbot/（脚本在上一层被 cwd=ROOT 调用）
+ExecStart=/path/to/venv/bin/python /path/to/Agents-Slack-Bridge/grokbot/consumer/poll_consumer.py
+WorkingDirectory=/path/to/Agents-Slack-Bridge/grokbot
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# EnvironmentFile=/path/to/Agents-Slack-Bridge/grokbot/.env
+# 也可在此覆盖：Environment=SLACK_BRIDGE_POLL_SEC=5 REPLY_IN_THREAD=0
+
+[Install]
+WantedBy=multi-user.target
