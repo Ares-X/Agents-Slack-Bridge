@@ -10,7 +10,7 @@ Covers:
   P1-3  verify_sent requires per-attempt client_msg_id evidence
   P2-4  migration recovery / first create / duplicate append confirm
         directory durability; persistent dir-sync failure keeps refusing
-  P2-5  HTTP 429 honored with Retry-After and bounded in-process retry;
+  P2-5  HTTP 429 reports a retry deadline without retrying in-process;
         other errors stay uncertain; SDK auto-retry stays off
 """
 import glob
@@ -37,6 +37,8 @@ def make_state(tmpdir, with_inbox=False):
     if with_inbox:
         ibx = os.path.join(tmpdir, "inbox.jsonl")
         ibx_lock = os.path.join(tmpdir, "inbox.lock")
+        with open(ibx, "a"):
+            pass
         return SendState(path, inbox_path=ibx, inbox_lock_path=ibx_lock), ibx
     return SendState(path), None
 
@@ -405,39 +407,41 @@ def run_send(argv, stdin_text, behaviors):
 
 
 class P2RateLimitTest(unittest.TestCase):
-    def test_ratelimit_retries_with_retry_after_then_succeeds(self):
-        code, out, err, inst, msleep = run_send(
-            ["C1", "--client-msg-id", "att-1"], "hello",
-            [FakeSlackApiError(429, retry_after="2"),
-             {"ok": True, "ts": "123.456"}])
-        self.assertEqual(code, 0)
-        self.assertIn("sent ok: True", out)
-        self.assertEqual(len(inst.calls), 2)
-        # Retry-After 被遵守
-        msleep.assert_called_once_with(2.0)
+    def test_ratelimit_reports_deadline_without_resending(self):
+        with patch("time.time", return_value=1000):
+            code, out, err, inst, msleep = run_send(
+                ["C1", "--client-msg-id", "att-1"], "hello",
+                [FakeSlackApiError(429, retry_after="2"),
+                 {"ok": True, "ts": "123.456"}])
+        self.assertEqual(code, 75)
+        self.assertEqual(json.loads(out)["retry_at"], 1002)
+        self.assertEqual(len(inst.calls), 1)
+        msleep.assert_not_called()
         # client_msg_id 随 POST 提交
         self.assertEqual(inst.calls[0]["client_msg_id"], "att-1")
         # SDK 自动重试保持关闭
         self.assertEqual(inst.kw.get("retry_handlers"), [])
 
-    def test_ratelimit_zero_retry_after_retries_immediately(self):
-        code, out, err, inst, msleep = run_send(
-            ["C1"], "hello",
-            [FakeSlackApiError(429, retry_after="0"),
-             {"ok": True, "ts": "1.0"}])
-        self.assertIn("sent ok: True", out)
-        self.assertEqual(len(inst.calls), 2)
+    def test_ratelimit_zero_deadline_is_returned_to_consumer(self):
+        with patch("time.time", return_value=1000):
+            code, out, err, inst, msleep = run_send(
+                ["C1"], "hello",
+                [FakeSlackApiError(429, retry_after="0"),
+                 {"ok": True, "ts": "1.0"}])
+        self.assertEqual(code, 75)
+        self.assertEqual(json.loads(out)["retry_at"], 1000)
+        self.assertEqual(len(inst.calls), 1)
         msleep.assert_not_called()
 
-    def test_ratelimit_budget_exhausted_is_not_sent(self):
-        code, out, err, inst, msleep = run_send(
-            ["C1"], "hello",
-            [FakeSlackApiError(429, retry_after="60")] * 10)
-        self.assertEqual(code, 1)
-        self.assertIn("RESULT not-sent", err)
-        self.assertIn("ratelimited", err)
-        # 有界：不会无限重试
-        self.assertLessEqual(len(inst.calls), 5)
+    def test_long_ratelimit_deadline_is_not_truncated(self):
+        with patch("time.time", return_value=1000):
+            code, out, err, inst, msleep = run_send(
+                ["C1"], "hello",
+                [FakeSlackApiError(429, retry_after="120")] * 10)
+        self.assertEqual(code, 75)
+        self.assertEqual(json.loads(out)["retry_at"], 1120)
+        self.assertEqual(len(inst.calls), 1)
+        msleep.assert_not_called()
 
     def test_non_ratelimit_api_error_stays_uncertain(self):
         code, out, err, inst, msleep = run_send(

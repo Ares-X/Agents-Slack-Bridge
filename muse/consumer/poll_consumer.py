@@ -7,6 +7,7 @@
   claim(发送前持久化领取) --发送--> ok --ack--> done（条目删除）
                                      |--ack 失败--> unacked（只重试 ack，
                                      |                        绝不重发正文）
+                                     |--限流--> retry_wait（持久延期，到期原子重领）
                                      |--明确失败--> claim 释放，下轮干净重试
                                      └--结果不确定--> uncertain（经 history
                                         严格核验；核验无结论则延迟，绝不盲目
@@ -32,6 +33,7 @@
 """
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -223,10 +225,10 @@ def normalize_reply(ret):
 
 def send_reply(channel, text, thread_ts=None, mentions=(),
                client_msg_id=None):
-    """返回 "ok" | "fail" | "uncertain"。
+    """返回 "ok" | "fail" | "uncertain" | ("retry_wait", retry_at)。
 
     只有"明确证明未发送"才返回 "fail"（API 明确拒绝 / 死在 API 调用
-    之前 / 限流重试预算耗尽——429 本身就是 Slack 证明未接受）；
+    之前）；限流单独返回 retry_wait，必须持久保存服务器的等待期限；
     其余一律 "uncertain"——请求可能已被 Slack 接受但响应丢失，
     调用方绝不能自动重发，必须走 history 核验。
     """
@@ -246,6 +248,18 @@ def send_reply(channel, text, thread_ts=None, mentions=(),
         return "uncertain"
     out = r.stdout or ""
     err = r.stderr or ""
+    if r.returncode == 75:
+        # 只接受完整、明确的延期结果；损坏输出不能当成可重试证明。
+        try:
+            result = json.loads(out)
+            retry_at = result.get("retry_at")
+            if (result.get("result") == "retry_wait"
+                    and type(retry_at) in (int, float)
+                    and math.isfinite(retry_at) and retry_at >= 0):
+                return ("retry_wait", retry_at)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
+        return "uncertain"
     if "sent ok: True" in out:
         return "ok"
     if "sent ok: False" in out:
@@ -330,7 +344,8 @@ def _verify_hold(m, entry, state, bot_id, bot_user_id, why):
             return "verified-acked"
         state.set_unacked(mid)
         return "verified-unacked"
-    state.set_uncertain(mid, entry.get("attempts", 0) + 1)
+    state.set_uncertain(mid, entry.get("attempts", 0) + 1,
+                        expected_client_msg_id=entry.get("client_msg_id"))
     print(f"send unverified ({why}; {entry.get('attempts', 0) + 1}/"
           f"{VERIFY_LIMIT}), holding {mid}")
     return "uncertain-held"
@@ -341,8 +356,11 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
     ch = m["channel"]
     thread_ts = m.get("thread_ts") or ""
 
-    # --- unacked：只重试 ack，绝不重发正文 ---
+    # --- retry_wait：到期前不发送；unacked：只重试 ack ---
     entry = state.get(mid)
+    if (entry and entry.get("status") == "retry_wait"
+            and time.time() < entry["retry_at"]):
+        return "retry-deferred"
     if entry and entry.get("status") == "unacked":
         if _ack_safe([mid]):
             state.resolve(mid)
@@ -404,11 +422,16 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
         # TOCTOU：get 与 claim 之间被另一个存活 consumer 抢先领取。
         # 对方可能正在发送：本轮只核验，绝不并行发送。
         fresh = state.get(mid) or claim_entry
+        if fresh.get("status") == "retry_wait":
+            return "retry-deferred"
         return _verify_hold(m, fresh, state, bot_id, bot_user_id,
                             why="claim lost to concurrent consumer")
     result = send_reply(ch, text, thread_ts=thread_ts or None,
                         mentions=mentions, client_msg_id=attempt_id)
 
+    if isinstance(result, tuple) and result[0] == "retry_wait":
+        state.defer_retry(mid, result[1], client_msg_id=attempt_id)
+        return "retry-deferred"
     if result == "ok":
         if _ack_safe([mid]):
             state.resolve(mid)
@@ -436,7 +459,8 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
             return "verified-acked"
         state.set_unacked(mid)
         return "verified-unacked"
-    state.set_uncertain(mid, 1)
+    state.set_uncertain(mid, 1,
+                        expected_client_msg_id=claim_entry.get("client_msg_id"))
     print(f"send result uncertain for {mid}, holding for verification")
     return "uncertain-held"
 

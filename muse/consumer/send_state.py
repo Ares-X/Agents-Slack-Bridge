@@ -10,6 +10,7 @@ durable, mutually-excluded state transition:
   claim (status="sending", fsynced BEFORE the subprocess is spawned)
     -> "unacked"    (sent ok, inbox ack failed: retry ack only, never resend)
     -> "uncertain"  (ambiguous: verify via history, never blind-resend)
+    -> "retry_wait" (explicit rate-limit rejection: retry only after retry_at)
     -> resolved     (entry removed; the inbox tombstone is the done marker)
 
 Crash/restart rule: on load, any "sending" entry becomes "uncertain" --
@@ -61,6 +62,7 @@ positively verified -- they stay uncertain until manual review (safe side).
 """
 import fcntl
 import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -70,6 +72,7 @@ SCHEMA_VERSION = 2
 STATUS_SENDING = "sending"
 STATUS_UNACKED = "unacked"
 STATUS_UNCERTAIN = "uncertain"
+STATUS_RETRY_WAIT = "retry_wait"
 
 # claim() outcomes
 CLAIM_CLAIMED = "claimed"      # this caller now owns the send right
@@ -155,8 +158,13 @@ class SendState:
             if not isinstance(e, dict):
                 return False
             if e.get("status") not in (STATUS_SENDING, STATUS_UNACKED,
-                                       STATUS_UNCERTAIN):
+                                       STATUS_UNCERTAIN, STATUS_RETRY_WAIT):
                 return False
+            if e.get("status") == STATUS_RETRY_WAIT:
+                retry_at = e.get("retry_at")
+                if (type(retry_at) not in (int, float)
+                        or not math.isfinite(retry_at) or retry_at < 0):
+                    return False
         if not isinstance(data.get("hist_deferred", {}), dict):
             return False
         return True
@@ -291,20 +299,18 @@ class SendState:
     def _inbox_tombstone_locked(self, msg_id):
         """True if the inbox already holds an ack tombstone for msg_id.
 
-        Takes the inbox SH lock; inbox_store.ack() takes the inbox EX
-        lock, so no ack can slip between this check and the claim write.
+        Takes the inbox SH lock for a consistent read. The enclosing
+        send-state lock prevents a concurrent completion from deleting
+        its claim while this caller decides whether it may send.
         """
         if not self.inbox_path:
             return False
         lock_path = self.inbox_lock_path or (self.inbox_path + ".lock")
         with _locked(lock_path, False):
-            try:
-                f = open(self.inbox_path, "r")
-            except FileNotFoundError:
-                return False
-            except OSError:
-                return False
-            with f:
+            # A configured queue must be readable before claiming from
+            # a possibly stale snapshot. Missing/unreadable is unknown,
+            # not evidence that this message has never been completed.
+            with open(self.inbox_path, "r") as f:
                 for line in f:
                     try:
                         r = json.loads(line)
@@ -360,7 +366,9 @@ class SendState:
                 return (None, CLAIM_COMPLETED)
             sends = data["sends"]
             e = sends.get(msg_id)
-            if isinstance(e, dict):
+            if isinstance(e, dict) and not (
+                    e.get("status") == STATUS_RETRY_WAIT
+                    and now >= e["retry_at"]):
                 return (dict(e), CLAIM_HELD)
             e = {"status": STATUS_SENDING, "channel": channel,
                  "thread_ts": thread_ts or "", "text_hash": text_hash,
@@ -387,12 +395,16 @@ class SendState:
 
         self._mutate(_do)
 
-    def set_uncertain(self, msg_id, attempts, text_hash=None):
+    def set_uncertain(self, msg_id, attempts, text_hash=None,
+                      expected_client_msg_id=None):
         """Ambiguous result: hold for history verification, never resend."""
 
         def _do(sends):
             e = sends.get(msg_id)
-            if isinstance(e, dict):
+            if (isinstance(e, dict)
+                    and e.get("status") in (STATUS_SENDING, STATUS_UNCERTAIN)
+                    and (expected_client_msg_id is None
+                         or e.get("client_msg_id") == expected_client_msg_id)):
                 e["status"] = STATUS_UNCERTAIN
                 e["attempts"] = attempts
                 if text_hash is not None:
@@ -400,6 +412,34 @@ class SendState:
                 e["updated_at"] = time.time()
 
         self._mutate(_do)
+
+    def defer_retry(self, msg_id, retry_at, client_msg_id=None):
+        """Persist an explicit rejection without losing its retry deadline.
+
+        Match the attempt when supplied: a delayed result must not release
+        a newer claim. A concurrent verifier may have marked this same
+        attempt uncertain, but an explicit rejection still proves it was
+        not sent. Storage errors propagate; the existing claim then holds.
+        """
+        if (type(retry_at) not in (int, float)
+                or not math.isfinite(retry_at) or retry_at < 0):
+            raise ValueError("retry_at must be a finite nonnegative timestamp")
+
+        def _do(sends):
+            e = sends.get(msg_id)
+            if not isinstance(e, dict):
+                return False
+            if client_msg_id is not None and e.get("client_msg_id") != client_msg_id:
+                return False
+            if e.get("status") not in (STATUS_SENDING, STATUS_UNCERTAIN,
+                                       STATUS_RETRY_WAIT):
+                return False
+            e["retry_at"] = max(retry_at, e.get("retry_at", 0))
+            e["status"] = STATUS_RETRY_WAIT
+            e["updated_at"] = time.time()
+            return True
+
+        return self._mutate(_do)
 
     def resolve(self, msg_id):
         """Send fully processed (acked): drop the entry."""

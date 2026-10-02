@@ -7,7 +7,7 @@ ALL operations coordinate through ``fcntl.flock`` on a dedicated lock file
 unsafe across atomic replace: a writer that opened the path before the
 replace would keep appending to the stale inode and lose data.
 
-- append : EX lock -> single ``write()`` + ``flush()`` + ``os.fsync()`` -> unlock
+- append : EX lock -> write + flush + file fsync + dir fsync -> unlock
 - ack    : EX lock -> append tombstone lines (no in-place rewrite in hot path)
 - peek   : SH lock -> read all, filter out tombstoned msg_ids
 - compact: EX lock -> temp file + fsync + ``os.replace`` + dir fsync
@@ -368,7 +368,7 @@ def append_record(record):
     BEFORE returning False, so the caller may safely treat the record as
     stored.  An fsync failure raises instead of returning success.
     Directory durability is confirmed on every success boundary
-    (migration recovery, first creation, duplicate append): a persistent
+    (migration recovery, new records, duplicate append): a persistent
     directory-sync failure keeps raising, so the bridge keeps refusing
     to ACK instead of confirming messages that a crash could lose.
     """
@@ -389,15 +389,14 @@ def append_record(record):
             # now; a failure raises and the caller must NOT ack to Slack.
             _fsync_data_file()
             return False
-        created = not os.path.exists(INBOX_PATH)
         with open(INBOX_PATH, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             f.flush()                       # user-space buffer -> kernel
             os.fsync(f.fileno())            # kernel -> durable storage
-        if created:
-            # 新文件：目录项本身也必须落盘，否则崩溃后文件可能消失，
-            # 而调用方已经按 True 去 ACK。
-            _fsync_dir()
+        # An existing file may come from a creation or compaction whose
+        # directory fsync failed. Confirm the entry before every successful
+        # append, including later messages with different identities.
+        _fsync_dir()
         return True
 
 

@@ -13,20 +13,20 @@ Usage:
 退出语义（调用方判定"是否已发出"的唯一依据）：
   - stdout 含 "sent ok: True"   -> 已发出（exit 0）
   - stdout 含 "sent ok: False"  -> API 明确拒绝，证明未发送
-  - stderr 含 "RESULT not-sent" -> 死在 API 调用之前，或限流重试预算
-    耗尽（429 本身就是 Slack 证明未接受），证明未发送
+  - stdout JSON 的 result=retry_wait（exit 75）-> 限流拒绝，未发送；
+    调用方必须持久保存 retry_at，到期前不得重试
+  - stderr 含 "RESULT not-sent" -> 死在 API 调用之前，证明未发送
   - stderr 含 "RESULT uncertain"（exit 2）、超时、无特征输出 ->
     不确定：请求可能已被接受但响应丢失，调用方绝不能自动重发，
     必须走 history 核验。
 
-限流（HTTP 429 / ratelimited）：Slack 明确拒绝了本次请求，证明未发
-送，因此按响应头的 Retry-After 在本进程内有界等待后直接重试（最多
-RATE_LIMIT_MAX_ATTEMPTS 次、累计等待不超过
-RATE_LIMIT_MAX_WAIT_SECONDS 秒）。预算耗尽仍被限流 -> "RESULT
-not-sent"，调用方下轮干净重试。连接断开和其他未知结果仍走
-uncertain，绝不盲目重发；SDK 的自动重试保持关闭，只有这里的 429
-是显式、安全、可审计的重试。
+限流（HTTP 429 / ratelimited / rate_limited）：按 Retry-After 返回
+绝对重试时间 retry_at；缺失或无效时默认等待 60 秒。本进程不等待或
+重发，由 consumer 持久延期，避免重启或较短的轮询周期提前重试。
+连接断开和其他未知结果仍走 uncertain，SDK 的自动重试保持关闭。
 """
+import json
+import math
 import os
 import ssl
 import sys
@@ -34,12 +34,9 @@ import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-RATE_LIMIT_MAX_ATTEMPTS = 5
-RATE_LIMIT_MAX_WAIT_SECONDS = 45.0  # 必须小于 consumer 的 SEND_TIMEOUT=60
-
 
 def _is_ratelimited(exc):
-    """是否为 Slack 的限流拒绝（HTTP 429 / ratelimited）。
+    """是否为 Slack 的限流拒绝（HTTP 429 或两种限流错误码）。
 
     鸭子类型判定：只有 SlackApiError 带有 .response；其他异常一律
     不是限流，走 uncertain。
@@ -50,51 +47,25 @@ def _is_ratelimited(exc):
     if getattr(resp, "status_code", None) == 429:
         return True
     try:
-        return resp.get("error") == "ratelimited"
+        return resp.get("error") in {"ratelimited", "rate_limited"}
     except Exception:
         return False
 
 
-def _retry_after_seconds(exc, default=1.0):
+def _retry_after_seconds(exc, default=60.0):
     resp = getattr(exc, "response", None)
     headers = getattr(resp, "headers", None) or {}
     try:
-        return max(0.0, float(headers.get("Retry-After", default)))
-    except (TypeError, ValueError):
+        value = next((v for k, v in headers.items()
+                      if k.lower() == "retry-after"), None)
+        if value is None and resp is not None:
+            value = resp.get("retry_after", default)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else default
+        delay = float(value)
+        return delay if math.isfinite(delay) and delay >= 0 else default
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return default
-
-
-def _post_with_ratelimit_retry(c, post_kwargs):
-    """chat.postMessage，显式处理 429。
-
-    429 是 Slack 证明"没有接受这条消息"，按 Retry-After 等待后重试
-    是"已证明未发送"的重试，不是盲目重发。等待有界；预算耗尽后把
-    最后一次 429 抛给调用方按 not-sent 处理。
-    """
-    waited = 0.0
-    last = None
-    for attempt in range(RATE_LIMIT_MAX_ATTEMPTS):
-        try:
-            return c.chat_postMessage(**post_kwargs)
-        except Exception as e:
-            if not _is_ratelimited(e):
-                raise
-            last = e
-            if attempt + 1 >= RATE_LIMIT_MAX_ATTEMPTS:
-                break
-            delay = _retry_after_seconds(e)
-            if delay > 0:
-                # 有界等待：累计不超过预算，超了就停（抛给调用方）。
-                delay = min(delay, RATE_LIMIT_MAX_WAIT_SECONDS - waited)
-                if delay <= 0:
-                    break
-                print("ratelimited, waiting %.1fs (attempt %d/%d)"
-                      % (delay, attempt + 1, RATE_LIMIT_MAX_ATTEMPTS),
-                      file=sys.stderr)
-                time.sleep(delay)
-                waited += delay
-            # delay == 0：立即重试，不消耗等待预算（次数仍有界）。
-    raise last
 
 
 def load_env(path):
@@ -161,14 +132,13 @@ def main():
             # 本次发送尝试的唯一关联证据；Slack 存进消息并在 history
             # 回显，供调用方核验"这次发送"是否成功。
             post_kwargs["client_msg_id"] = client_msg_id
-        r = _post_with_ratelimit_retry(c, post_kwargs)
+        r = c.chat_postMessage(**post_kwargs)
     except Exception as e:
         if _is_ratelimited(e):
-            # 预算耗尽仍被限流：Slack 从未接受这条消息，证明未发送。
-            # 调用方释放 claim，下轮干净重试。
-            print("RESULT not-sent: ratelimited, retry budget exhausted: "
-                  "%s: %s" % (type(e).__name__, e), file=sys.stderr)
-            sys.exit(1)
+            # 保留服务器给出的完整等待期，由 consumer 持久保存。
+            print(json.dumps({"result": "retry_wait",
+                              "retry_at": time.time() + _retry_after_seconds(e)}))
+            sys.exit(75)
         # 请求可能已被 Slack 接受、只是响应丢失：调用方必须视为不确定，
         # 绝不能当成"未发送"去自动重发。
         print("RESULT uncertain: %s: %s" % (type(e).__name__, e),
