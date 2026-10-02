@@ -2,23 +2,19 @@
 
 多 agent 协作默认（可用 .env 覆盖）：
   - SLACK_BRIDGE_POLL_SEC=5
-  - REPLY_IN_THREAD=0 → 频道顶层回复（不传 --thread-ts；同伴看得见）
-  - REPLY_IN_THREAD=1 → 跟帖：thread_ts 优先，否则用消息自身 ts（顶层开帖）
-  - 每条消息回复前先 channel_history（上下文）；失败时可见降级，不假装读过
-  - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test；勿 @ 自己、防回环
+  - REPLY_IN_THREAD=0 → 频道顶层回复
+  - REPLY_IN_THREAD=1 → 跟帖：thread_ts 优先，否则消息 ts
+  - 每条消息回复前先 channel_history；失败可见降级
+  - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test
 
-发送 / ack 状态机（避免 ack 失败导致双发）：
-  - reply_status 空 → 尝试 send；成功则 durable 标 reply_status=sent 再 ack
-  - reply_status=sent 且未 delivered → 只重试 ack，不再 send
-  - reply_status=uncertain → 不盲发、不 ack；需人工/上层处理
-  - inbox_ack 用 (channel, ts)，与去重一致
-
-会话历史落在 consumer/channel_sessions.json。
-脚本在 consumer/ 下，inbox_* / send / channel_history 在上一层 grokbot/，
-因此 ROOT = dirname(BASE)，所有子进程 cwd=ROOT。
+发送状态机（reply_pipeline，与 pending fallback 共用）：
+  - 先 durable claim (sending)，失败则不 send
+  - 仅当输出证明未发送 (not_sent: / sent ok: False) 才 retryable
+  - 其余失败 → uncertain；sending/uncertain 永不盲发
+  - sent → 只重试 ack
+  - 启动时 escalate stale sending → uncertain
 
 ★ generate_reply() 是模板 stub，不是已接线的 Grok 模型。
-  「模板回过一次」≠ Agent / LLM 集成完成；换成真实 LLM 后仍须使用 history。
 """
 import json
 import os
@@ -34,11 +30,19 @@ SESSIONS_PATH = os.path.join(BASE, "channel_sessions.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 INBOX_PATH = os.path.join(ROOT, "inbox.jsonl")
 
-# Allow `from inbox_store import ...` when run as script from consumer/
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from inbox_store import ack_keys, msg_key, set_reply_status  # noqa: E402
+from inbox_store import (  # noqa: E402
+    ack_keys,
+    escalate_stale_sending,
+    msg_key,
+)
+from reply_pipeline import (  # noqa: E402
+    classify_send_result,
+    process_one,
+    run_send,
+)
 
 
 def load_env(path):
@@ -69,7 +73,6 @@ REPLY_IN_THREAD = _raw_thread in ("1", "true", "yes", "on")
 
 
 def resolve_me():
-    """Bot user ID from env, else auth_test. Never hardcode production IDs."""
     me = (_ENV.get("SLACK_BOT_USER_ID") or os.environ.get("SLACK_BOT_USER_ID") or "").strip()
     if me:
         return me
@@ -128,11 +131,6 @@ def save_sessions(s):
 
 
 def channel_history(channel, limit=15):
-    """回复前拉历史做上下文。
-
-    Returns (messages, error_or_None).
-    Preserves real errors from subprocess / error JSON; never pretends success.
-    """
     r = sh(sys.executable, "channel_history.py", channel, str(limit))
     out = []
     err = None
@@ -153,7 +151,6 @@ def channel_history(channel, limit=15):
     if err and not out:
         return [], err
     if err and out:
-        # Partial: keep messages but surface the error too.
         return out, err
     return out, None
 
@@ -163,17 +160,11 @@ def strip_mentions(text):
 
 
 def thread_target(message):
-    """For REPLY_IN_THREAD=1: existing thread_ts else message ts (start thread)."""
     return (message.get("thread_ts") or message.get("ts") or "").strip()
 
 
 def generate_reply(channel, message, session, history, history_error=None):
-    """短上下文感知模板回复（stub，非 Grok 模型接线）。
-
-    ★ replace with LLM API or wake your Grok Bot agent.
-    不要硬编码真实 bot user ID；需要 @ 其他 agent 时用占位符，例如 <@U_PEER_BOT_ID>。
-    若 history_error：不得声称「已读上下文」。
-    """
+    """短上下文感知模板回复（stub，非 Grok 模型接线）。"""
     text = strip_mentions(message.get("text") or "")
     user = message.get("user_name") or message.get("user") or "someone"
 
@@ -181,7 +172,6 @@ def generate_reply(channel, message, session, history, history_error=None):
     if history_error:
         degrade = f"（注意：频道历史读取失败，本次无上下文：{history_error[:120]}）"
 
-    # 最近非自己的历史作上下文提示
     ctx = []
     for h in history[-10:]:
         uname = h.get("user_name") or h.get("user") or ""
@@ -223,79 +213,30 @@ def generate_reply(channel, message, session, history, history_error=None):
     return f"收到。你要我针对「{text[:120]}」做什么？"
 
 
-def _ack_message(m):
-    """Ack by (channel, ts). Returns True on success (exit 0)."""
-    ch, ts = msg_key(m)
-    if not ch or not ts:
-        print(f"ack skipped: missing channel/ts in {m!r}", file=sys.stderr)
-        return False
-    n, missing = ack_keys(INBOX_PATH, {(ch, ts)})
-    if n > 0 and not missing:
-        return True
-    # Also try CLI for visibility in logs when library path differs
-    r = sh(sys.executable, "inbox_ack.py", ch, ts)
-    ok = r.returncode == 0
-    if not ok:
-        print(
-            f"ack failed for {ch}:{ts} rc={r.returncode} "
-            f"stdout={r.stdout!r} stderr={r.stderr!r}",
-            file=sys.stderr,
-        )
-    return ok
-
-
-def _mark_reply_status(m, status):
-    ch, ts = msg_key(m)
-    n, missing = set_reply_status(INBOX_PATH, {(ch, ts)}, status)
-    if n == 0 or missing:
-        print(
-            f"mark reply_status={status} failed for {ch}:{ts} "
-            f"(matched={n}, missing={missing})",
-            file=sys.stderr,
-        )
-        return False
-    return True
-
-
-def classify_send_result(proc):
-    """Return 'ok' | 'fail' | 'uncertain' from send.py subprocess result."""
-    out = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode == 0 and "sent ok: True" in (proc.stdout or ""):
-        return "ok"
-    if proc.returncode != 0 and "sent ok: True" not in out:
-        return "fail"
-    # Nonzero with success text, or zero without clear success → uncertain
-    if "sent ok: True" in out and proc.returncode != 0:
-        return "uncertain"
-    if proc.returncode == 0 and "sent ok:" in (proc.stdout or ""):
-        # e.g. sent ok: False
-        if "sent ok: True" not in (proc.stdout or ""):
-            return "fail"
-    return "uncertain"
-
-
-def handle_one(m, sessions):
-    """Process one undelivered message. Returns True if newly replied this round."""
+def handle_one(m, sessions, *, runner=None):
+    """Process one undelivered message via shared reply_pipeline."""
     if ME and m.get("user") == ME:
-        _ack_message(m)
+        ack_keys(INBOX_PATH, {msg_key(m)})
         return False
 
-    status = m.get("reply_status")
     ch = m.get("channel") or ""
     ts = m.get("ts") or ""
     label = m.get("channel_name") or ch
+    status = m.get("reply_status")
 
-    # Already sent: only retry ack (do not resend).
+    # Fast paths that need no reply text
     if status == "sent":
-        if _ack_message(m):
+        result = process_one(
+            INBOX_PATH, m, "", reply_in_thread=REPLY_IN_THREAD,
+            root=ROOT, runner=runner,
+        )
+        if result.get("outcome") == "acked":
             print(f"acked prior send in {label} ({ch}:{ts})", flush=True)
         return False
 
-    # Uncertain prior send: do not blindly resend.
-    if status == "uncertain":
+    if status in ("uncertain", "sending"):
         print(
-            f"skip uncertain send outcome for {ch}:{ts} "
-            f"(manual check; will not resend)",
+            f"skip {status} for {ch}:{ts} (will not resend; verify manually)",
             file=sys.stderr,
         )
         return False
@@ -305,60 +246,67 @@ def handle_one(m, sessions):
     if hist_err:
         print(f"history degrade for {ch}: {hist_err}", file=sys.stderr)
 
-    try:
-        reply = generate_reply(ch, m, sess, hist, history_error=hist_err)
-        cmd = [sys.executable, "send.py", ch]
-        if REPLY_IN_THREAD:
-            tt = thread_target(m)
-            if tt:
-                cmd += ["--thread-ts", tt]
-        r = sh(*cmd, input_text=reply)
-        outcome = classify_send_result(r)
-        if outcome == "ok":
-            if not _mark_reply_status(m, "sent"):
-                # Send succeeded but could not persist status → treat as uncertain
-                # to avoid double-send on next loop if ack also fails.
-                print(
-                    f"send ok but status mark failed for {ch}:{ts}; "
-                    f"will not blind-resend",
-                    file=sys.stderr,
-                )
-                return False
-            sess.append({"role": "user", "text": m.get("text")})
-            sess.append({"role": "assistant", "text": reply})
-            sessions[ch] = sess[-40:]
-            if _ack_message(m):
-                print(f"replied in {label}", flush=True)
-            else:
-                print(
-                    f"replied in {label} but ack failed "
-                    f"(will retry ack only next round)",
-                    flush=True,
-                )
-            return True
-        if outcome == "fail":
+    reply = generate_reply(ch, m, sess, hist, history_error=hist_err)
+    tt = thread_target(m) if REPLY_IN_THREAD else None
+
+    def _runner(*args, input_text=None):
+        if runner is not None:
+            return runner(*args, input_text=input_text)
+        return sh(*args, input_text=input_text)
+
+    result = process_one(
+        INBOX_PATH,
+        m,
+        reply,
+        reply_in_thread=REPLY_IN_THREAD,
+        thread_ts=tt,
+        root=ROOT,
+        runner=_runner,
+    )
+    outcome = result.get("outcome")
+    if outcome in ("sent_acked", "sent_ack_pending"):
+        sess.append({"role": "user", "text": m.get("text")})
+        sess.append({"role": "assistant", "text": reply})
+        sessions[ch] = sess[-40:]
+        if outcome == "sent_acked":
+            print(f"replied in {label}", flush=True)
+        else:
             print(
-                f"send failed for {ch}:{ts}: {r.stdout} {r.stderr}",
-                file=sys.stderr,
+                f"replied in {label} but ack pending "
+                f"(will retry ack only next round)",
+                flush=True,
             )
-            return False
-        # uncertain
-        _mark_reply_status(m, "uncertain")
+        return True
+    if outcome == "fail_retryable":
         print(
-            f"send outcome uncertain for {ch}:{ts}: "
-            f"rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}; "
-            f"will NOT resend",
+            f"send proven-not-sent for {ch}:{ts}: "
+            f"{result.get('stderr') or result.get('stdout')}",
             file=sys.stderr,
         )
         return False
-    except Exception as e:
-        # Exception after possible partial send → mark uncertain, do not resend.
-        _mark_reply_status(m, "uncertain")
-        print(f"error handling {ch}:{ts}: {e}", file=sys.stderr)
+    if outcome == "uncertain":
+        print(
+            f"send outcome uncertain for {ch}:{ts}: {result}; will NOT resend",
+            file=sys.stderr,
+        )
         return False
+    if outcome == "claim_persist_failed":
+        print(
+            f"claim persist failed for {ch}:{ts}: {result.get('detail')}; "
+            f"did NOT send",
+            file=sys.stderr,
+        )
+        return False
+    if outcome == "claim_lost":
+        print(f"claim lost for {ch}:{ts} (another worker?)", file=sys.stderr)
+        return False
+    return False
 
 
 def main():
+    n = escalate_stale_sending(INBOX_PATH)
+    if n:
+        print(f"escalated {n} stale sending → uncertain", flush=True)
     print(
         f"grokbot consumer polling every {POLL_INTERVAL}s "
         f"(REPLY_IN_THREAD={REPLY_IN_THREAD}, me={ME or 'auto-pending'}, ROOT={ROOT})",

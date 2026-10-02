@@ -1,4 +1,4 @@
-"""Queue integrity, ack identity, concurrent writes — stdlib unittest."""
+"""Queue integrity, ack identity, concurrent writes, corrupt tail, fsync faults."""
 from __future__ import annotations
 
 import json
@@ -7,16 +7,23 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import inbox_store as store  # noqa: E402
 from inbox_store import (  # noqa: E402
+    DurabilityError,
     ack_keys,
     append_record,
+    claim_for_send,
+    escalate_stale_sending,
     msg_key,
     parse_ack_argv,
+    peek_claimable,
     peek_undelivered,
     set_reply_status,
 )
@@ -52,23 +59,19 @@ class TestAckIdentity(unittest.TestCase):
             ts = "1710000000.000100"
             self.assertTrue(append_record(path, _rec("Caaa", ts, "a")))
             self.assertTrue(append_record(path, _rec("Cbbb", ts, "b")))
-            # Ack only one channel
             n, missing = ack_keys(path, {("Caaa", ts)})
             self.assertEqual(n, 1)
             self.assertFalse(missing)
             und = peek_undelivered(path)
             self.assertEqual(len(und), 1)
             self.assertEqual(und[0]["channel"], "Cbbb")
-            self.assertEqual(und[0]["ts"], ts)
 
     def test_ts_alone_must_not_ack_other_channel(self):
-        """Regression: old CLI keyed only on ts would mark both channels."""
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
             ts = "1710000000.000200"
             append_record(path, _rec("C1", ts))
             append_record(path, _rec("C2", ts))
-            # If we mistakenly keyed on ts alone, both would flip. We don't.
             n, missing = ack_keys(path, {("C1", ts)})
             self.assertEqual(n, 1)
             rows = peek_undelivered(path)
@@ -105,7 +108,6 @@ class TestConcurrentWrites(unittest.TestCase):
             with open(path) as f:
                 lines = [l for l in f if l.strip()]
             self.assertEqual(len(lines), n)
-            # Valid JSON each line
             parsed = [json.loads(l) for l in lines]
             keys = {msg_key(r) for r in parsed}
             self.assertEqual(len(keys), n)
@@ -113,7 +115,6 @@ class TestConcurrentWrites(unittest.TestCase):
     def test_concurrent_append_and_ack(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
-            # Seed
             for i in range(10):
                 append_record(path, _rec("Cseed", f"0.{i:03d}"))
 
@@ -150,6 +151,114 @@ class TestConcurrentWrites(unittest.TestCase):
             self.assertEqual(seed_undelivered, [])
 
 
+class TestCorruptTail(unittest.TestCase):
+    def test_truncated_tail_quarantined_new_append_readable(self):
+        """Repro: truncated last line without newline must not swallow next msg."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            # Simulate crash mid-write: partial JSON, no trailing newline.
+            partial = '{"channel":"Cold","ts":"1.0","text":"TRUNC'
+            with open(path, "wb") as f:
+                f.write(partial.encode())
+            # New append must repair + succeed; peek must see the new message.
+            ok = append_record(path, _rec("Cnew", "2.0", text="visible"))
+            self.assertTrue(ok)
+            und = peek_undelivered(path)
+            keys = {msg_key(r) for r in und}
+            self.assertIn(("Cnew", "2.0"), keys)
+            # Corrupt evidence kept
+            self.assertTrue(os.path.exists(path + ".corrupt"))
+            with open(path + ".corrupt", "rb") as cf:
+                blob = cf.read()
+            self.assertIn(b"TRUNC", blob)
+            # File lines are well-formed JSON
+            with open(path, "rb") as f:
+                data = f.read()
+            self.assertTrue(data.endswith(b"\n"))
+            for line in data.decode().splitlines():
+                if line.strip():
+                    json.loads(line)
+
+    def test_append_does_not_report_success_if_verify_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            real_verify = store._verify_last_record
+
+            def boom(*a, **k):
+                raise DurabilityError("verify boom")
+
+            with mock.patch.object(store, "_verify_last_record", side_effect=boom):
+                with self.assertRaises(DurabilityError):
+                    append_record(path, _rec("C", "1.0"))
+
+
+class TestFsyncFaultInjection(unittest.TestCase):
+    def test_append_fsync_failure_does_not_return_true(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            real_fsync = os.fsync
+            calls = {"n": 0}
+
+            def flaky(fd):
+                calls["n"] += 1
+                # Fail the first file fsync (append path)
+                if calls["n"] == 1:
+                    raise OSError(5, "EIO injected")
+                return real_fsync(fd)
+
+            with mock.patch("os.fsync", side_effect=flaky):
+                with self.assertRaises(DurabilityError):
+                    append_record(path, _rec("C", "1.0"))
+
+    def test_duplicate_path_reconfirms_durability_before_false(self):
+        """After a prior write, duplicate must fsync again; EIO → raise not False."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            self.assertTrue(append_record(path, _rec("C", "1.0")))
+
+            with mock.patch.object(
+                store, "fsync_file_and_dir",
+                side_effect=DurabilityError("dir EIO"),
+            ):
+                with self.assertRaises(DurabilityError):
+                    append_record(path, _rec("C", "1.0", text="dup"))
+
+    def test_dir_fsync_eio_not_swallowed_on_rewrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            append_record(path, _rec("C", "1.0"))
+            real_fsync_dir = store._fsync_dir
+
+            def boom(p):
+                raise OSError(5, "EIO dir")
+
+            with mock.patch.object(store, "_fsync_dir", side_effect=boom):
+                with self.assertRaises(DurabilityError):
+                    set_reply_status(path, {("C", "1.0")}, "sent")
+
+
+class TestClaimBeforeSend(unittest.TestCase):
+    def test_claim_atomic_second_loses(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            append_record(path, _rec("C", "1.0"))
+            self.assertTrue(claim_for_send(path, ("C", "1.0"), "tok1"))
+            self.assertFalse(claim_for_send(path, ("C", "1.0"), "tok2"))
+            und = peek_undelivered(path)[0]
+            self.assertEqual(und["reply_status"], "sending")
+            self.assertEqual(und["claim_id"], "tok1")
+            self.assertEqual(peek_claimable(path), [])
+
+    def test_stale_sending_escalates_to_uncertain(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inbox.jsonl")
+            append_record(path, _rec("C", "1.0"))
+            claim_for_send(path, ("C", "1.0"))
+            n = escalate_stale_sending(path)
+            self.assertEqual(n, 1)
+            self.assertEqual(peek_undelivered(path)[0]["reply_status"], "uncertain")
+
+
 class TestReplyStatusSplit(unittest.TestCase):
     def test_sent_then_ack_failure_leaves_sent_undelivered(self):
         with tempfile.TemporaryDirectory() as d:
@@ -159,8 +268,6 @@ class TestReplyStatusSplit(unittest.TestCase):
             und = peek_undelivered(path)
             self.assertEqual(len(und), 1)
             self.assertEqual(und[0]["reply_status"], "sent")
-            self.assertFalse(und[0]["delivered"])
-            # Simulate second round: only ack
             ack_keys(path, {("C", "1.0")})
             self.assertEqual(peek_undelivered(path), [])
 

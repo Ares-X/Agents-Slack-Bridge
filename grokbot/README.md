@@ -52,7 +52,9 @@ grokbot/
 ├── manifest.yaml
 ├── .env.example
 ├── requirements.txt          # slack_sdk only
-├── inbox_store.py            # durable append/ack（flock+fsync；temp+rename）
+├── inbox_store.py            # durable append/claim/ack；corrupt-tail 隔离；fsync 严格
+├── reply_pipeline.py         # claim→send→ack（consumer 与 pending 共用）
+├── pending_consume_once.py   # fallback 必须走 pipeline，禁止 raw send→ack
 ├── bridge.py                 # 先入队再 ACK；DM edit/delete 过滤；多 agent 默认
 ├── send.py / inbox_peek.py / inbox_ack.py / channel_history.py
 ├── pending_notify.py         # 未处理 → pending.json（ack 用 channel+ts）
@@ -80,7 +82,7 @@ grokbot/
    - `reply_status=sent` 且未 ack → **只重试 ack，不重发**
    - `reply_status=uncertain` → **不盲发**
    - ack：`python inbox_ack.py <channel> <ts>`（与去重同一身份）
-2. **Agent 例程 fallback**：`pending_notify.py` → 读 `pending.json` → **先** `channel_history.py` → `send.py` → `inbox_ack.py <channel> <ts>`
+2. **Agent 例程 fallback**：`pending_notify.py`（只导出 claimable）→ `pending_consume_once.py` / `reply_pipeline.process_one`（**禁止** raw `send.py`→`inbox_ack.py`）
 
 ## 测试
 

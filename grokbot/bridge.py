@@ -5,6 +5,7 @@
 读取处理。发送请用 send.py。
 
 可靠性顺序：先 durable 入队（flock + fsync），再 Socket Mode ACK。
+入队路径不做网络查名（channel_name/user_name 先留空或用 id）；
 若入队失败则不 ACK，让 Slack 重试；重复入队由 (channel, ts) 去重消化。
 
 Grok Bot 多 agent 频道协作默认：
@@ -139,25 +140,8 @@ def main():
         "bridge starting, bot user %s (whitelist_mode=%s)", me, WHITELIST_MODE
     )
 
-    names = {}
-
-    def disp_name(kind, id_):
-        if not id_:
-            return ""
-        if id_ in names:
-            return names[id_]
-        try:
-            if kind == "channel":
-                r = web.conversations_info(channel=id_)
-                n = r["channel"].get("name") or r["channel"].get("user") or id_
-            else:
-                r = web.users_info(user=id_)
-                p = r["user"].get("profile", {})
-                n = p.get("display_name") or p.get("real_name") or id_
-            names[id_] = n
-            return n
-        except Exception:
-            return id_
+    # Name lookup is intentionally NOT on the receive→ack path (network I/O
+    # would delay durable enqueue + Socket Mode ACK). Enrich offline if needed.
 
     def ack(client: SocketModeClient, req: SocketModeRequest):
         client.send_socket_mode_response(
@@ -204,25 +188,28 @@ def main():
                         return
                 # else: allow any other bot (multi-agent channels)
 
+            ch = event.get("channel", "") or ""
+            uid = event.get("user", "") or ""
             record = {
-                "channel": event.get("channel", ""),
-                "channel_name": disp_name("channel", event.get("channel", "")),
-                "user": event.get("user", ""),
-                "user_name": disp_name("user", event.get("user", "")),
+                "channel": ch,
+                # ids first; names left empty for fast ACK (enrich later offline)
+                "channel_name": "",
+                "user": uid,
+                "user_name": "",
                 "text": event.get("text", ""),
                 "kind": kind,                            # dm | mention
                 "ts": event.get("ts", ""),
                 "thread_ts": event.get("thread_ts", ""),  # 原帖回复用
                 "received_at": time.time(),
                 "delivered": False,
-                "reply_status": None,  # None | sent | uncertain (consumer)
+                "reply_status": None,  # None|retryable|sending|sent|uncertain
             }
             # Durable write under lock+fsync; duplicate → still ACK.
             appended = append_inbox(record)
             ack(client, req)
             if appended:
                 logging.info("queued %s from %s in %s",
-                             kind, record["user_name"], record["channel_name"])
+                             kind, uid or "?", ch or "?")
             else:
                 logging.info("duplicate skip %s %s",
                              record.get("channel"), record.get("ts"))

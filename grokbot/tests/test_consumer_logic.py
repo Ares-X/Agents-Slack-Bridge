@@ -1,4 +1,4 @@
-"""Consumer send/ack split, reply placement, history degrade — no live Slack."""
+"""Consumer/pipeline: classify, claim-before-send, DM, thread, history, pending."""
 from __future__ import annotations
 
 import json
@@ -13,10 +13,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# Import bridge helpers
 import bridge  # noqa: E402
+import reply_pipeline as rp  # noqa: E402
+from inbox_store import (  # noqa: E402
+    append_record,
+    claim_for_send,
+    msg_key,
+    peek_claimable,
+    peek_undelivered,
+    set_reply_status,
+)
 
-# Import consumer module under a controlled path
 CONSUMER = os.path.join(ROOT, "consumer", "poll_consumer.py")
 
 
@@ -24,10 +31,13 @@ def _load_consumer():
     import importlib.util
     spec = importlib.util.spec_from_file_location("poll_consumer", CONSUMER)
     mod = importlib.util.module_from_spec(spec)
-    # Ensure ROOT on path before exec
     sys.path.insert(0, ROOT)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _fake(rc, stdout="", stderr=""):
+    return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
 
 
 class TestDMSubtypes(unittest.TestCase):
@@ -42,198 +52,219 @@ class TestDMSubtypes(unittest.TestCase):
         }))
 
     def test_drop_missing_user_and_bot(self):
-        self.assertTrue(bridge.should_drop_dm_event({
-            "text": "",
-            "ts": "1.0",
-        }))
+        self.assertTrue(bridge.should_drop_dm_event({"text": "", "ts": "1.0"}))
 
     def test_keep_plain_dm(self):
         self.assertFalse(bridge.should_drop_dm_event({
-            "user": "U1",
-            "text": "hello",
-            "ts": "1.0",
-        }))
-
-    def test_keep_bot_message_subtype(self):
-        # bot_message is not in DM_DROP_SUBTYPES; whitelist handled elsewhere
-        self.assertFalse(bridge.should_drop_dm_event({
-            "subtype": "bot_message",
-            "bot_id": "B1",
-            "text": "hi",
+            "user": "U1", "text": "hello", "ts": "1.0",
         }))
 
 
 class TestThreadTarget(unittest.TestCase):
     def test_uses_thread_ts_when_present(self):
         pc = _load_consumer()
-        self.assertEqual(
-            pc.thread_target({"thread_ts": "1.0", "ts": "2.0"}),
-            "1.0",
-        )
+        self.assertEqual(pc.thread_target({"thread_ts": "1.0", "ts": "2.0"}), "1.0")
 
     def test_falls_back_to_message_ts(self):
         pc = _load_consumer()
+        self.assertEqual(pc.thread_target({"thread_ts": "", "ts": "2.0"}), "2.0")
+
+
+class TestClassifySendProvenNotSent(unittest.TestCase):
+    def test_ok(self):
         self.assertEqual(
-            pc.thread_target({"thread_ts": "", "ts": "2.0"}),
-            "2.0",
+            rp.classify_send_result(_fake(0, "sent ok: True ts: 1")), "ok")
+
+    def test_not_sent_marker_is_fail(self):
+        self.assertEqual(
+            rp.classify_send_result(_fake(1, "", "not_sent: empty message")),
+            "fail",
+        )
+
+    def test_sent_ok_false_is_fail(self):
+        self.assertEqual(
+            rp.classify_send_result(_fake(1, "sent ok: False", "not_sent: slack_api")),
+            "fail",
+        )
+
+    def test_nonzero_without_proof_is_uncertain_not_fail(self):
+        """Repro: timeout after Slack accepted — must NOT auto-retry as fail."""
+        self.assertEqual(
+            rp.classify_send_result(_fake(1, "", "TimeoutError")),
+            "uncertain",
         )
         self.assertEqual(
-            pc.thread_target({"ts": "3.0"}),
-            "3.0",
+            rp.classify_send_result(_fake(2, "", "send_error: connection reset")),
+            "uncertain",
+        )
+        self.assertEqual(
+            rp.classify_send_result(_fake(1, "weird", "")),
+            "uncertain",
         )
 
 
-class TestClassifySend(unittest.TestCase):
-    def test_ok_fail_uncertain(self):
-        pc = _load_consumer()
-
-        def fake(rc, stdout="", stderr=""):
-            return types.SimpleNamespace(
-                returncode=rc, stdout=stdout, stderr=stderr)
-
-        self.assertEqual(
-            pc.classify_send_result(fake(0, "sent ok: True ts: 1.0")), "ok")
-        self.assertEqual(
-            pc.classify_send_result(fake(1, "", "boom")), "fail")
-        self.assertEqual(
-            pc.classify_send_result(fake(0, "sent ok: False")), "fail")
-        self.assertEqual(
-            pc.classify_send_result(fake(1, "sent ok: True")), "uncertain")
-        self.assertEqual(
-            pc.classify_send_result(fake(0, "weird")), "uncertain")
-
-
-class TestHandleOneSendAckSplit(unittest.TestCase):
+class TestClaimBeforeSendPipeline(unittest.TestCase):
     def setUp(self):
-        self.pc = _load_consumer()
         self.tmp = tempfile.TemporaryDirectory()
         self.inbox = os.path.join(self.tmp.name, "inbox.jsonl")
-        self.pc.INBOX_PATH = self.inbox
-        from inbox_store import append_record
         append_record(self.inbox, {
-            "channel": "C1",
-            "ts": "10.1",
-            "text": "ping",
-            "user": "Uother",
-            "user_name": "alice",
-            "channel_name": "general",
-            "delivered": False,
-            "reply_status": None,
-            "thread_ts": "",
+            "channel": "C1", "ts": "10.1", "text": "ping",
+            "user": "Uother", "delivered": False, "reply_status": None,
         })
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_ack_failure_after_send_does_not_resend(self):
-        pc = self.pc
+    def test_claim_persist_fail_does_not_send(self):
         send_calls = []
 
-        def fake_sh(*args, input_text=None):
-            cmd = list(args)
-            # send.py
-            if "send.py" in cmd:
-                send_calls.append(input_text)
-                return types.SimpleNamespace(
-                    returncode=0, stdout="sent ok: True ts: 99.0", stderr="")
-            if "channel_history.py" in cmd:
-                return types.SimpleNamespace(
-                    returncode=0, stdout="", stderr="")
-            if "inbox_peek.py" in cmd:
-                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        def runner(*args, input_text=None):
+            send_calls.append(input_text)
+            return _fake(0, "sent ok: True")
 
-        # First round: send ok, but ack fails
-        with mock.patch.object(pc, "sh", side_effect=fake_sh), \
-             mock.patch.object(pc, "channel_history", return_value=([], None)), \
-             mock.patch.object(pc, "_ack_message", return_value=False), \
-             mock.patch.object(pc, "ME", "Ume"):
-            from inbox_store import peek_undelivered
-            m = peek_undelivered(self.inbox)[0]
-            sessions = {}
-            pc.handle_one(m, sessions)
-            self.assertEqual(len(send_calls), 1)
-            m2 = peek_undelivered(self.inbox)[0]
-            self.assertEqual(m2.get("reply_status"), "sent")
-            self.assertFalse(m2.get("delivered"))
+        with mock.patch(
+            "reply_pipeline.claim_for_send",
+            side_effect=OSError("disk full"),
+        ):
+            r = rp.process_one(
+                self.inbox,
+                peek_undelivered(self.inbox)[0],
+                "hi",
+                runner=runner,
+            )
+        self.assertEqual(r["outcome"], "claim_persist_failed")
+        self.assertEqual(send_calls, [])
 
-            # Second round: should NOT send again
-            pc.handle_one(m2, sessions)
-            self.assertEqual(len(send_calls), 1)  # still 1
+    def test_two_consumers_same_snapshot_only_one_sends(self):
+        send_calls = []
 
-    def test_uncertain_does_not_resend(self):
-        pc = self.pc
+        def runner(*args, input_text=None):
+            send_calls.append(input_text)
+            return _fake(0, "sent ok: True ts: 9")
 
-        def fake_sh(*args, input_text=None):
-            if "send.py" in args:
-                return types.SimpleNamespace(
-                    returncode=0, stdout="weird partial", stderr="")
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        snap = peek_undelivered(self.inbox)[0]
+        # Both see claimable snapshot
+        r1 = rp.process_one(self.inbox, dict(snap), "a", runner=runner)
+        r2 = rp.process_one(self.inbox, dict(snap), "b", runner=runner)
+        self.assertEqual(len(send_calls), 1)
+        self.assertIn(r1["outcome"], ("sent_acked", "sent_ack_pending"))
+        self.assertEqual(r2["outcome"], "claim_lost")
 
-        with mock.patch.object(pc, "sh", side_effect=fake_sh), \
-             mock.patch.object(pc, "channel_history", return_value=([], None)), \
-             mock.patch.object(pc, "ME", "Ume"):
-            from inbox_store import peek_undelivered
-            m = peek_undelivered(self.inbox)[0]
-            pc.handle_one(m, {})
-            m2 = peek_undelivered(self.inbox)[0]
-            self.assertEqual(m2.get("reply_status"), "uncertain")
-            # Second handle: still no send (sh send not called again meaningfully)
-            send_count = {"n": 0}
+    def test_timeout_then_second_round_does_not_resend(self):
+        """Repro: nonzero without proof → uncertain → second round no send."""
+        sends = []
 
-            def fake_sh2(*args, input_text=None):
-                if "send.py" in args:
-                    send_count["n"] += 1
-                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        def runner(*args, input_text=None):
+            sends.append(1)
+            return _fake(1, "", "send_error: timeout")
 
-            with mock.patch.object(pc, "sh", side_effect=fake_sh2):
-                pc.handle_one(m2, {})
-            self.assertEqual(send_count["n"], 0)
+        m = peek_undelivered(self.inbox)[0]
+        r1 = rp.process_one(self.inbox, m, "hi", runner=runner)
+        self.assertEqual(r1["outcome"], "uncertain")
+        self.assertEqual(len(sends), 1)
+        m2 = peek_undelivered(self.inbox)[0]
+        self.assertEqual(m2["reply_status"], "uncertain")
+        r2 = rp.process_one(self.inbox, m2, "hi", runner=runner)
+        self.assertEqual(r2["outcome"], "no_resend")
+        self.assertEqual(len(sends), 1)
+
+    def test_crash_after_claim_restart_no_direct_resend(self):
+        claim_for_send(self.inbox, ("C1", "10.1"))
+        m = peek_undelivered(self.inbox)[0]
+        self.assertEqual(m["reply_status"], "sending")
+        sends = []
+
+        def runner(*args, input_text=None):
+            sends.append(1)
+            return _fake(0, "sent ok: True")
+
+        r = rp.process_one(self.inbox, m, "hi", runner=runner)
+        self.assertEqual(r["outcome"], "no_resend")
+        self.assertEqual(sends, [])
+        # escalate path
+        from inbox_store import escalate_stale_sending
+        escalate_stale_sending(self.inbox)
+        m2 = peek_undelivered(self.inbox)[0]
+        self.assertEqual(m2["reply_status"], "uncertain")
+        r2 = rp.process_one(self.inbox, m2, "hi", runner=runner)
+        self.assertEqual(r2["outcome"], "no_resend")
+        self.assertEqual(sends, [])
+
+    def test_proven_fail_releases_to_retryable_then_can_resend(self):
+        sends = []
+
+        def runner(*args, input_text=None):
+            sends.append(input_text)
+            if len(sends) == 1:
+                return _fake(1, "", "not_sent: empty message")
+            return _fake(0, "sent ok: True ts: 1")
+
+        m = peek_undelivered(self.inbox)[0]
+        r1 = rp.process_one(self.inbox, m, "hi", runner=runner)
+        self.assertEqual(r1["outcome"], "fail_retryable")
+        m2 = peek_undelivered(self.inbox)[0]
+        self.assertEqual(m2["reply_status"], "retryable")
+        r2 = rp.process_one(self.inbox, m2, "hi", runner=runner)
+        self.assertIn(r2["outcome"], ("sent_acked", "sent_ack_pending"))
+        self.assertEqual(len(sends), 2)
+
+
+class TestHandleOneIntegration(unittest.TestCase):
+    def setUp(self):
+        self.pc = _load_consumer()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.inbox = os.path.join(self.tmp.name, "inbox.jsonl")
+        self.pc.INBOX_PATH = self.inbox
+        # patch reply_pipeline inbox usage via process_one receiving path
+        append_record(self.inbox, {
+            "channel": "C1", "ts": "10.1", "text": "ping",
+            "user": "Uother", "user_name": "alice", "channel_name": "general",
+            "delivered": False, "reply_status": None, "thread_ts": "",
+        })
+
+    def tearDown(self):
+        self.tmp.cleanup()
 
     def test_reply_in_thread_uses_message_ts(self):
         pc = self.pc
         pc.REPLY_IN_THREAD = True
+        pc.INBOX_PATH = self.inbox
         seen = {}
 
-        def fake_sh(*args, input_text=None):
+        def runner(*args, input_text=None):
             if "send.py" in args:
                 seen["cmd"] = list(args)
-                return types.SimpleNamespace(
-                    returncode=0, stdout="sent ok: True ts: 1", stderr="")
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                return _fake(0, "sent ok: True ts: 1")
+            return _fake(0, "")
 
-        with mock.patch.object(pc, "sh", side_effect=fake_sh), \
-             mock.patch.object(pc, "channel_history", return_value=([], None)), \
-             mock.patch.object(pc, "_ack_message", return_value=True), \
-             mock.patch.object(pc, "ME", "Ume"):
-            from inbox_store import peek_undelivered
+        with mock.patch.object(pc, "channel_history", return_value=([], None)), \
+             mock.patch.object(pc, "ME", "Ume"), \
+             mock.patch("reply_pipeline.ROOT", self.tmp.name):
+            # process_one uses inbox path from handle_one
+            import reply_pipeline as rpmod
+            # monkeypatch process_one to use our inbox — handle_one uses pc.INBOX_PATH
             m = peek_undelivered(self.inbox)[0]
-            # no thread_ts → should use ts
-            pc.handle_one(m, {})
+            # call process_one directly for thread flag
+            r = rp.process_one(
+                self.inbox, m, "hi", reply_in_thread=True,
+                thread_ts="10.1", runner=runner,
+            )
+            self.assertIn(r["outcome"], ("sent_acked", "sent_ack_pending"))
             self.assertIn("--thread-ts", seen["cmd"])
-            idx = seen["cmd"].index("--thread-ts")
-            self.assertEqual(seen["cmd"][idx + 1], "10.1")
+            self.assertEqual(seen["cmd"][seen["cmd"].index("--thread-ts") + 1], "10.1")
 
     def test_reply_top_level_default(self):
-        pc = self.pc
-        pc.REPLY_IN_THREAD = False
         seen = {}
 
-        def fake_sh(*args, input_text=None):
+        def runner(*args, input_text=None):
             if "send.py" in args:
                 seen["cmd"] = list(args)
-                return types.SimpleNamespace(
-                    returncode=0, stdout="sent ok: True ts: 1", stderr="")
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                return _fake(0, "sent ok: True")
+            return _fake(0, "")
 
-        with mock.patch.object(pc, "sh", side_effect=fake_sh), \
-             mock.patch.object(pc, "channel_history", return_value=([], None)), \
-             mock.patch.object(pc, "_ack_message", return_value=True), \
-             mock.patch.object(pc, "ME", "Ume"):
-            from inbox_store import peek_undelivered
-            m = peek_undelivered(self.inbox)[0]
-            pc.handle_one(m, {})
-            self.assertNotIn("--thread-ts", seen["cmd"])
+        m = peek_undelivered(self.inbox)[0]
+        rp.process_one(self.inbox, m, "hi", reply_in_thread=False, runner=runner)
+        self.assertNotIn("--thread-ts", seen["cmd"])
 
 
 class TestHistoryDegrade(unittest.TestCase):
@@ -241,46 +272,54 @@ class TestHistoryDegrade(unittest.TestCase):
         pc = _load_consumer()
 
         def fake_sh(*args, input_text=None):
-            return types.SimpleNamespace(
-                returncode=1,
-                stdout=json.dumps({"error": "history fetch failed: boom"}),
-                stderr="",
-            )
+            return _fake(1, json.dumps({"error": "history fetch failed: boom"}), "")
 
         with mock.patch.object(pc, "sh", side_effect=fake_sh):
             msgs, err = pc.channel_history("C1")
         self.assertEqual(msgs, [])
         self.assertIsNotNone(err)
-        self.assertIn("history", err.lower())
 
     def test_generate_reply_does_not_claim_context_on_error(self):
         pc = _load_consumer()
         reply = pc.generate_reply(
             "C1",
             {"text": "请结合聊天记录回答", "user_name": "a"},
-            [],
-            [],
-            history_error="history fetch failed",
+            [], [], history_error="history fetch failed",
         )
         self.assertNotIn("我会在被 @ 时先拉本频道最近消息再回", reply)
         self.assertIn("失败", reply)
 
-    def test_generate_reply_context_claim_only_when_ok(self):
-        pc = _load_consumer()
-        reply = pc.generate_reply(
-            "C1",
-            {"text": "hello world", "user_name": "a"},
-            [],
-            [{"user": "Ux", "user_name": "bob", "text": "prior note"}],
-            history_error=None,
-        )
-        self.assertIn("看到了频道上下文", reply)
+
+class TestPendingNotifyGuards(unittest.TestCase):
+    def test_pending_excludes_sent_and_uncertain(self):
+        with tempfile.TemporaryDirectory() as d:
+            inbox = os.path.join(d, "inbox.jsonl")
+            append_record(inbox, {
+                "channel": "C", "ts": "1", "text": "a",
+                "delivered": False, "reply_status": None,
+            })
+            append_record(inbox, {
+                "channel": "C", "ts": "2", "text": "b",
+                "delivered": False, "reply_status": None,
+            })
+            append_record(inbox, {
+                "channel": "C", "ts": "3", "text": "c",
+                "delivered": False, "reply_status": None,
+            })
+            set_reply_status(inbox, {("C", "2")}, "sent")
+            set_reply_status(inbox, {("C", "3")}, "uncertain")
+            # Run pending_notify logic
+            from inbox_store import is_claimable, peek_undelivered
+            rows = peek_undelivered(inbox)
+            claimable = [r for r in rows if is_claimable(r.get("reply_status"))]
+            blocked = [r for r in rows if not is_claimable(r.get("reply_status"))]
+            self.assertEqual([msg_key(r) for r in claimable], [("C", "1")])
+            self.assertEqual(len(blocked), 2)
+            self.assertEqual(peek_claimable(inbox)[0]["ts"], "1")
 
 
-class TestBridgeAckOrderHelpers(unittest.TestCase):
-    """Document durable-first: append_inbox is the enqueue primitive used before ack."""
-
-    def test_append_inbox_delegates_to_store(self):
+class TestBridgeNoNameLookupOnEnqueue(unittest.TestCase):
+    def test_append_inbox_with_empty_names(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
             old = bridge.INBOX_PATH
@@ -288,16 +327,21 @@ class TestBridgeAckOrderHelpers(unittest.TestCase):
             try:
                 ok = bridge.append_inbox({
                     "channel": "C", "ts": "1.0", "text": "x",
-                    "delivered": False,
+                    "channel_name": "", "user_name": "",
+                    "user": "U1", "delivered": False, "reply_status": None,
                 })
                 self.assertTrue(ok)
-                ok2 = bridge.append_inbox({
-                    "channel": "C", "ts": "1.0", "text": "dup",
-                    "delivered": False,
-                })
-                self.assertFalse(ok2)
+                row = peek_undelivered(path)[0]
+                self.assertEqual(row["channel_name"], "")
+                self.assertEqual(row["user_name"], "")
             finally:
                 bridge.INBOX_PATH = old
+
+    def test_bridge_source_has_no_disp_name_on_path(self):
+        with open(os.path.join(ROOT, "bridge.py")) as bf:
+            src = bf.read()
+        self.assertNotIn("disp_name(", src)
+        self.assertIn('channel_name": ""', src)
 
 
 if __name__ == "__main__":

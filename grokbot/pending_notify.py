@@ -1,29 +1,57 @@
-"""Write undelivered inbox items to pending.json.
+"""Write undelivered inbox summary to pending.json (agent @every 5m fallback).
 
-给可选的 Grok Bot @every 5m 例程用：没有本地 LLM / 不跑 5s consumer 时，
-agent 定时读 pending.json → 生成回复 → send.py → inbox_ack.py。
-比本地 consumer 慢（分钟级），但是纯 agent 侧 fallback。
+IMPORTANT: do NOT send.py → inbox_ack.py directly for exported items.
+Fallback MUST reuse the same claim → send → ack rules as the 5s consumer:
 
-Ack identity = channel + ts（与去重一致），例如：
-  python inbox_ack.py <channel> <ts>
-  python inbox_ack.py <channel>:<ts>
+  python pending_consume_once.py
+  # or: from reply_pipeline import process_one
 
-Usage (from grokbot/):
-  python pending_notify.py
-→ 写出 pending.json，stdout 打印未处理条数。
+pending.json splits:
+  - claimable: reply_status empty/retryable (safe to run through pipeline)
+  - blocked: sending/sent/uncertain (no blind resend; ack-only if sent)
+
+Ack identity = channel + ts.
 """
 import json
 import os
 import time
 
-from inbox_store import peek_undelivered
+from inbox_store import is_claimable, peek_undelivered
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 INBOX = os.path.join(BASE, "inbox.jsonl")
 PENDING = os.path.join(BASE, "pending.json")
 
 rows = peek_undelivered(INBOX)
+claimable = []
+blocked = []
+for r in rows:
+    st = r.get("reply_status")
+    if is_claimable(st):
+        claimable.append(r)
+    else:
+        blocked.append({
+            "channel": r.get("channel"),
+            "ts": r.get("ts"),
+            "reply_status": st,
+            "note": (
+                "ack_only" if st == "sent"
+                else "no_resend_verify"
+            ),
+        })
+
+payload = {
+    "updated_at": time.time(),
+    "instruction": (
+        "Use reply_pipeline.process_one / pending_consume_once.py. "
+        "Never raw send.py→inbox_ack.py (bypasses claim/uncertain guards)."
+    ),
+    "claimable": claimable,
+    "blocked": blocked,
+    # backward-compatible alias: only claimable (not all undelivered)
+    "items": claimable,
+}
 
 with open(PENDING, "w") as f:
-    json.dump({"updated_at": time.time(), "items": rows}, f, ensure_ascii=False, indent=2)
-print(len(rows))
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+print(len(claimable))

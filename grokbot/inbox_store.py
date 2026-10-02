@@ -1,33 +1,49 @@
-"""Durable inbox.jsonl helpers: append / ack / status under flock.
+"""Durable inbox.jsonl helpers: append / claim / ack under flock.
 
 Ack identity is (channel, ts) — same as dedupe. Rewrites use temp + os.replace
-while holding an exclusive lock on a *sidecar* lock file (`inbox.jsonl.lock`).
-Using a sidecar avoids the classic race where os.replace swaps the data-file
-inode out from under a flock held on an older fd.
+while holding an exclusive lock on sidecar `inbox.jsonl.lock`.
 
-Helpers hold the lock until flush/fsync (+ rename) completes.
+Durability rules:
+  - Hold lock until flush/fsync (+ rename / dir fsync) completes.
+  - Directory fsync errors are NOT swallowed (no false success).
+  - Duplicate path reconfirms durability (fsync file+dir) before returning False.
+  - Truncated last line (no trailing newline) is quarantined under lock; never
+    concatenate a new JSON object into a corrupt tail and report success.
 """
 from __future__ import annotations
 
 import fcntl
 import json
 import os
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+import time
+import uuid
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 AckKey = Tuple[str, str]  # (channel, ts)
+
+# reply_status values
+#   None/""/"retryable" — claimable for send
+#   "sending"           — durable in-flight claim (never blind-resend on restart)
+#   "sent"              — Slack send confirmed; ack only
+#   "uncertain"         — send outcome unknown; never blind-resend
+STATUS_CLAIMABLE = frozenset({None, "", "retryable"})
+STATUS_NO_RESEND = frozenset({"sending", "sent", "uncertain"})
+
+
+class DurabilityError(OSError):
+    """Raised when durability cannot be confirmed (fsync/dir fsync/verify)."""
 
 
 def msg_key(record: dict) -> AckKey:
     return (str(record.get("channel") or ""), str(record.get("ts") or ""))
 
 
-def parse_ack_argv(argv: Sequence[str]) -> Set[AckKey]:
-    """Parse CLI args as channel+ts pairs.
+def is_claimable(status) -> bool:
+    return status in STATUS_CLAIMABLE or status is None
 
-    Accepted forms:
-      channel ts [channel ts ...]
-      channel:ts [channel:ts ...]
-    """
+
+def parse_ack_argv(argv: Sequence[str]) -> Set[AckKey]:
+    """Parse CLI args as channel+ts pairs (channel ts | channel:ts)."""
     keys: Set[AckKey] = set()
     i = 0
     args = list(argv)
@@ -54,8 +70,11 @@ def _lock_path(path: str) -> str:
     return path + ".lock"
 
 
+def _corrupt_path(path: str) -> str:
+    return path + ".corrupt"
+
+
 def _acquire_lock(path: str, exclusive: bool = True):
-    """Open/create sidecar lock file and flock it. Caller must close/unlock."""
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -75,26 +94,115 @@ def _release_lock(lf) -> None:
         lf.close()
 
 
-def _read_all_records(path: str) -> List[dict]:
+def _fsync_dir(path: str) -> None:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def fsync_file_and_dir(path: str) -> None:
+    """Confirm durability of existing path. Raises DurabilityError on failure."""
     if not os.path.exists(path):
+        raise DurabilityError(f"missing file for fsync: {path}")
+    try:
+        with open(path, "r+", encoding="utf-8") as f:
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(path)
+    except OSError as e:
+        raise DurabilityError(f"fsync failed for {path}: {e}") from e
+
+
+def _parse_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+
+def _quarantine_bytes(path: str, blob: bytes) -> None:
+    """Append corrupt evidence to sidecar; fsync. Caller holds exclusive lock."""
+    if not blob:
+        return
+    cpath = _corrupt_path(path)
+    with open(cpath, "ab") as cf:
+        cf.write(b"\n--- corrupt tail ---\n")
+        cf.write(blob)
+        if not blob.endswith(b"\n"):
+            cf.write(b"\n")
+        cf.flush()
+        os.fsync(cf.fileno())
+    try:
+        _fsync_dir(cpath)
+    except OSError as e:
+        raise DurabilityError(f"corrupt sidecar dir fsync failed: {e}") from e
+
+
+def read_records_repair_tail(path: str) -> Tuple[List[dict], bool]:
+    """Read records; if last line lacks trailing newline, quarantine + repair.
+
+    Returns (valid_records, repaired). Caller must hold exclusive lock when
+    repaired may be True (mutates file). For shared/read-only callers, use
+    read_records_readonly instead.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return [], False
+    with open(path, "rb") as f:
+        data = f.read()
+    repaired = False
+    if not data.endswith(b"\n"):
+        last_nl = data.rfind(b"\n")
+        if last_nl == -1:
+            good, corrupt = b"", data
+        else:
+            good, corrupt = data[: last_nl + 1], data[last_nl + 1 :]
+        _quarantine_bytes(path, corrupt)
+        with open(path, "wb") as f:
+            f.write(good)
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(path)
+        data = good
+        repaired = True
+    rows: List[dict] = []
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        rec = _parse_line(line)
+        if rec is not None:
+            rows.append(rec)
+        # Unparseable full lines: leave in file as evidence; skip for logic.
+        # (They still occupy a line and won't concatenate on next append.)
+    return rows, repaired
+
+
+def read_records_readonly(path: str) -> List[dict]:
+    """Parse valid JSON lines; does not repair. Skips corrupt lines."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
         return []
     rows: List[dict] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
+    with open(path, "rb") as f:
+        data = f.read()
+    # If truncated tail, do not treat the partial as a record (and do not
+    # silently merge). Exclude the incomplete last segment from parsing.
+    if data and not data.endswith(b"\n"):
+        last_nl = data.rfind(b"\n")
+        data = data[: last_nl + 1] if last_nl != -1 else b""
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        rec = _parse_line(line)
+        if rec is not None:
+            rows.append(rec)
     return rows
 
 
 def _atomic_rewrite(path: str, records: List[dict]) -> None:
-    """Write records via temp + os.replace (caller holds sidecar exclusive lock)."""
+    """Write records via temp + os.replace. Dir fsync errors propagate."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
-    tmp = path + ".tmp." + str(os.getpid())
+    tmp = path + ".tmp." + str(os.getpid()) + "." + uuid.uuid4().hex[:8]
     try:
         with open(tmp, "w", encoding="utf-8") as out:
             for r in records:
@@ -102,14 +210,9 @@ def _atomic_rewrite(path: str, records: List[dict]) -> None:
             out.flush()
             os.fsync(out.fileno())
         os.replace(tmp, path)
-        try:
-            dir_fd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+        _fsync_dir(path)
+    except OSError as e:
+        raise DurabilityError(f"atomic rewrite failed for {path}: {e}") from e
     finally:
         if os.path.exists(tmp):
             try:
@@ -118,36 +221,74 @@ def _atomic_rewrite(path: str, records: List[dict]) -> None:
                 pass
 
 
-def append_record(path: str, record: dict) -> bool:
-    """Append one record under exclusive sidecar lock. Skip (channel, ts) dups.
+def _verify_last_record(path: str, key: AckKey) -> None:
+    """Ensure last line is valid JSON for key. Raises DurabilityError."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data.endswith(b"\n"):
+        raise DurabilityError("post-append file lacks trailing newline")
+    lines = [ln for ln in data.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+    if not lines:
+        raise DurabilityError("post-append file empty")
+    rec = _parse_line(lines[-1])
+    if rec is None or msg_key(rec) != key:
+        raise DurabilityError(
+            f"post-append verify failed: last={lines[-1][:200]!r} want={key}"
+        )
 
-    Returns True if newly enqueued, False if duplicate. Durably flushed before
-    releasing the lock.
+
+def append_record(path: str, record: dict) -> bool:
+    """Append one record under exclusive lock. Skip dups on (channel, ts).
+
+    Returns True if newly enqueued and durability verified.
+    Returns False only if duplicate AND durability reconfirmed (fsync).
+    Raises DurabilityError on fsync/verify failure (caller must NOT ACK).
     """
     key = msg_key(record)
     lf = _acquire_lock(path, exclusive=True)
     try:
-        for r in _read_all_records(path):
+        rows, _ = read_records_repair_tail(path)
+        for r in rows:
             if msg_key(r) == key:
+                # Reconfirm durability before telling caller "safe to ACK".
+                fsync_file_and_dir(path)
                 return False
+        line = json.dumps(record, ensure_ascii=False) + "\n"
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(line)
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError as e:
+                raise DurabilityError(f"append fsync failed: {e}") from e
+        try:
+            _fsync_dir(path)
+        except OSError as e:
+            raise DurabilityError(f"append dir fsync failed: {e}") from e
+        _verify_last_record(path, key)
         return True
     finally:
         _release_lock(lf)
 
 
 def peek_undelivered(path: str) -> List[dict]:
-    """Return undelivered records (shared sidecar lock)."""
+    """Return undelivered records (shared lock). Excludes truncated tail bytes."""
     if not os.path.exists(path) and not os.path.exists(_lock_path(path)):
         return []
     lf = _acquire_lock(path, exclusive=False)
     try:
-        return [r for r in _read_all_records(path) if not r.get("delivered")]
+        return [r for r in read_records_readonly(path) if not r.get("delivered")]
     finally:
         _release_lock(lf)
+
+
+def peek_claimable(path: str) -> List[dict]:
+    """Undelivered rows whose reply_status is claimable (not sending/sent/uncertain)."""
+    out = []
+    for r in peek_undelivered(path):
+        if is_claimable(r.get("reply_status")):
+            out.append(r)
+    return out
 
 
 def update_records(
@@ -156,10 +297,13 @@ def update_records(
     *,
     delivered: Optional[bool] = None,
     reply_status: Optional[str] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
+    only_if_status_in: Optional[Set] = None,
 ) -> Tuple[int, Set[AckKey]]:
-    """Update matching (channel, ts) rows. Returns (n_matched, missing_keys).
+    """Update matching rows. Returns (n_matched, missing_keys).
 
-    Durable temp+rename under exclusive sidecar lock. Matching is idempotent.
+    If only_if_status_in is set, a row only matches when its reply_status is in
+    that set (used for atomic claim). Durability failures raise.
     """
     want = {(str(c), str(t)) for c, t in keys}
     if not want:
@@ -169,38 +313,109 @@ def update_records(
     try:
         if not os.path.exists(path):
             return 0, want
-        rows = _read_all_records(path)
+        rows, _ = read_records_repair_tail(path)
         found: Set[AckKey] = set()
         dirty = False
         for r in rows:
             k = msg_key(r)
             if k not in want:
                 continue
+            if only_if_status_in is not None:
+                st = r.get("reply_status")
+                if st not in only_if_status_in and not (
+                    st is None and None in only_if_status_in
+                ):
+                    # Also allow "" if "" in set
+                    if st not in only_if_status_in:
+                        continue
             found.add(k)
             if delivered is not None and r.get("delivered") != delivered:
                 r["delivered"] = delivered
                 dirty = True
-            if (
-                reply_status is not None
-                and r.get("reply_status") != reply_status
-            ):
+            if reply_status is not None and r.get("reply_status") != reply_status:
                 r["reply_status"] = reply_status
                 dirty = True
-        missing = want - found
+            if extra_fields:
+                for ek, ev in extra_fields.items():
+                    if r.get(ek) != ev:
+                        r[ek] = ev
+                        dirty = True
         if dirty:
             _atomic_rewrite(path, rows)
-        return len(found), missing
+        # missing = requested keys not successfully matched (absent or gated)
+        return len(found), want - found
     finally:
         _release_lock(lf)
 
 
-def ack_keys(path: str, keys: Iterable[AckKey]) -> Tuple[int, Set[AckKey]]:
-    """Mark delivered=True for (channel, ts) keys. Durable rewrite."""
-    return update_records(path, keys, delivered=True)
+def claim_for_send(
+    path: str, key: AckKey, claim_token: Optional[str] = None
+) -> bool:
+    """Atomically claim a message for sending (reply_status → sending).
+
+    Only succeeds if undelivered and reply_status claimable.
+    If durable persist fails, raises — caller must NOT send.
+    Returns True iff this caller owns the claim.
+    """
+    token = claim_token or uuid.uuid4().hex
+    return _claim_for_send_locked(path, key, token)
+
+
+def _claim_for_send_locked(path: str, key: AckKey, token: str) -> bool:
+    lf = _acquire_lock(path, exclusive=True)
+    try:
+        if not os.path.exists(path):
+            return False
+        rows, _ = read_records_repair_tail(path)
+        hit = None
+        for r in rows:
+            if msg_key(r) == key:
+                hit = r
+                break
+        if hit is None or hit.get("delivered"):
+            return False
+        if not is_claimable(hit.get("reply_status")):
+            return False
+        hit["reply_status"] = "sending"
+        hit["claim_id"] = token
+        hit["claim_at"] = time.time()
+        _atomic_rewrite(path, rows)
+        return True
+    finally:
+        _release_lock(lf)
 
 
 def set_reply_status(
-    path: str, keys: Iterable[AckKey], status: str
+    path: str,
+    keys: Iterable[AckKey],
+    status: str,
+    *,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, Set[AckKey]]:
-    """Set reply_status without delivering (e.g. 'sent', 'uncertain')."""
-    return update_records(path, keys, reply_status=status)
+    return update_records(
+        path, keys, reply_status=status, extra_fields=extra_fields
+    )
+
+
+def ack_keys(path: str, keys: Iterable[AckKey]) -> Tuple[int, Set[AckKey]]:
+    return update_records(path, keys, delivered=True)
+
+
+def escalate_stale_sending(path: str) -> int:
+    """Mark in-flight 'sending' as 'uncertain' (restart/verify path; never resend)."""
+    lf = _acquire_lock(path, exclusive=True)
+    try:
+        if not os.path.exists(path):
+            return 0
+        rows, _ = read_records_repair_tail(path)
+        n = 0
+        for r in rows:
+            if not r.get("delivered") and r.get("reply_status") == "sending":
+                r["reply_status"] = "uncertain"
+                r["uncertain_reason"] = "stale_sending_on_restart"
+                n += 1
+        if n:
+            _atomic_rewrite(path, rows)
+        return n
+    finally:
+        _release_lock(lf)

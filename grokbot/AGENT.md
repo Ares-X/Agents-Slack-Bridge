@@ -94,7 +94,7 @@
 
 8. **Optional slower fallback（无本地 LLM）**
    - 不跑 consumer；用 cron/`@every 5m` 调 `python pending_notify.py`
-   - Agent 读 `pending.json` → **先** `channel_history.py` → 生成回复 → `send.py`（勿带 `--thread-ts`，除非用户要跟帖）→ `inbox_ack.py <channel> <ts>`
+   - Agent 读 `pending.json` → **先** `channel_history.py` → 生成回复 → 经 `reply_pipeline` / `pending_consume_once.py`（禁止 raw send→ack）
    - 比 5s consumer 慢，适合纯 agent 例程；协作规则同上
 
 ## 验收：模板回复 ≠ Agent 集成
@@ -116,7 +116,9 @@
 
 | 文件 | 作用 |
 |---|---|
-| `inbox_store.py` | durable append/ack（`(channel,ts)`；temp+rename；fsync） |
+| `inbox_store.py` | durable append/claim/ack；corrupt-tail；严格 fsync |
+| `reply_pipeline.py` | claim→send→ack 共用状态机 |
+| `pending_consume_once.py` | pending fallback 入口（同 pipeline） |
 | `bridge.py` | Socket Mode → 先入队再 ACK；DM subtype 过滤；多 agent 默认 |
 | `send.py` | stdin 正文 → `chat.postMessage` |
 | `inbox_peek.py` / `inbox_ack.py` | 读未处理 / 按 **channel+ts** 标记 |
