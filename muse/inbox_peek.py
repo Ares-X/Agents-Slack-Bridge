@@ -1,26 +1,16 @@
-"""Print undelivered inbox messages as JSON lines. 只读不标记。"""
-import fcntl
-import json
-import os
+"""Print undelivered inbox messages as JSON lines. 只读不标记。
 
-INBOX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox.jsonl")
+每条记录含 msg_id（"<channel>:<ts>"，入队去重与确认的统一身份）。
+显示名解析请用 resolve.py（热路径不做慢查询）。
+"""
+import json
+
+import inbox_store
 
 
 def main():
-    if not os.path.exists(INBOX_PATH):
-        return
-    with open(INBOX_PATH) as f:
-        fcntl.flock(f, fcntl.LOCK_SH)
-        try:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if not r.get("delivered"):
-                    print(json.dumps(r, ensure_ascii=False))
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    for r in inbox_store.read_undelivered():
+        print(json.dumps(r, ensure_ascii=False))
 
 
 if __name__ == "__main__":

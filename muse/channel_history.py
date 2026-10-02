@@ -1,10 +1,16 @@
 """Print recent messages of a channel as compact JSON lines (chronological).
 
 Usage: python channel_history.py <channel> [limit]
-给回复生成提供上下文用。失败时输出 {"error": ...}，调用方应如实报告失败、不编造。
+给回复生成提供上下文用。
+
+失败语义（调用方必须处理，不可当空历史）：
+  - 打印 {"error": "history fetch failed", "reason": "<异常类型: 信息>"} 到 stdout
+  - 退出码 2
+  调用方应保留 reason，执行可见的降级/延迟策略（见 consumer）。
 """
 import json
 import os
+import hashlib
 import ssl
 import sys
 import time
@@ -42,15 +48,18 @@ def main():
                   **({"proxy": proxy} if proxy else {}), ssl=ctx)
 
     msgs = None
-    for _ in range(5):
+    last_err = None
+    for _ in range(3):
         try:
             msgs = c.conversations_history(channel=channel, limit=limit)["messages"]
             break
-        except Exception:
+        except Exception as e:
+            last_err = "%s: %s" % (type(e).__name__, e)
             time.sleep(3)
     if msgs is None:
-        print(json.dumps({"error": "history fetch failed"}))
-        return
+        print(json.dumps({"error": "history fetch failed",
+                          "reason": last_err or "unknown"}))
+        sys.exit(2)
 
     names = {}
 
@@ -64,11 +73,22 @@ def main():
         return names[uid]
 
     for m in reversed(msgs):  # chronological order
+        full_text = m.get("text") or ""
         print(json.dumps({
             "user_name": nm(m.get("user", "")),
-            "text": (m.get("text") or "")[:500],
+            "user": m.get("user", ""),
+            "bot_id": m.get("bot_id", ""),
+            "text": full_text[:500],
+            # 全文哈希：发送核验用精确匹配，不再用 60 字前缀猜测。
+            "text_sha256": hashlib.sha256(
+                full_text.encode("utf-8")).hexdigest(),
             "ts": m.get("ts", ""),
+            "thread_ts": m.get("thread_ts", ""),
             "is_bot": bool(m.get("bot_id")),
+            # 本次发送尝试的关联证据：发送时随 POST 提交的唯一 id，
+            # Slack 会原样存进消息并在 history 里回显。核验"这次发送"
+            # 是否成功时必须命中它；同身份+同正文+时间窗口不够。
+            "client_msg_id": m.get("client_msg_id", ""),
         }, ensure_ascii=False))
 
 

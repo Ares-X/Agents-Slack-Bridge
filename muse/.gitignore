@@ -1,0 +1,5 @@
+# 运行期状态文件（发送领取/去重状态），绝不进仓库
+send_state.json
+send_state.json.*
+*.lock
+*.corrupt.*
