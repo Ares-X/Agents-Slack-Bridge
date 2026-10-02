@@ -384,7 +384,7 @@ def run_send(argv, stdin_text, behaviors):
          patch.object(sys, "argv", ["send.py"] + argv), \
          patch.object(sys, "stdin", io.StringIO(stdin_text)), \
          patch.object(send_mod, "load_env",
-                      return_value={"SLACK_BOT_TOKEN": "xoxb-fake"}), \
+                      return_value={"SLACK_BOT_TOKEN": "fake-token"}), \
          patch.object(os.path, "exists", side_effect=fake_exists), \
          patch("time.sleep") as msleep:
         orig_init = FakeWebClient.__init__

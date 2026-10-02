@@ -48,7 +48,7 @@ class Flow:
     def __enter__(self):
         self.stack = contextlib.ExitStack()
         self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        (self.base / ".env").write_text("SLACK_BOT_TOKEN=xoxb-fake\n")
+        (self.base / ".env").write_text("SLACK_BOT_TOKEN=fake-token\n")
         self.path = str(self.base / "send_state.json")
         flow = self
 
