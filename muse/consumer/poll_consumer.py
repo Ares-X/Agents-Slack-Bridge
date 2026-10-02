@@ -37,6 +37,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)  # muse/
@@ -108,6 +109,21 @@ def ack(msg_ids):
         print(f"ACK FAILED for {msg_ids}: {r.stdout} {r.stderr}",
               file=sys.stderr)
     return ok
+
+
+def _ack_safe(msg_ids):
+    """ack() 的异常安全版本：子进程崩溃/超时抛异常时返回 False。
+
+    重要：ack 抛异常绝不能让条目卡在 "sending"。发送已经成功（ok
+    路径），只是确认动作本身不确定——调用方必须按"确认失败"处理，
+    把条目记为 unacked（只重试 ack），而不是留在 sending 里等一次
+    primary 损坏后的 stale .bak 恢复把它变回可发送。
+    """
+    try:
+        return bool(ack(msg_ids))
+    except Exception as e:
+        print(f"ack subprocess error: {e}", file=sys.stderr)
+        return False
 
 
 def load_json(path, default):
@@ -205,11 +221,13 @@ def normalize_reply(ret):
     return text, uids
 
 
-def send_reply(channel, text, thread_ts=None, mentions=()):
+def send_reply(channel, text, thread_ts=None, mentions=(),
+               client_msg_id=None):
     """返回 "ok" | "fail" | "uncertain"。
 
     只有"明确证明未发送"才返回 "fail"（API 明确拒绝 / 死在 API 调用
-    之前）；其余一律 "uncertain"——请求可能已被 Slack 接受但响应丢失，
+    之前 / 限流重试预算耗尽——429 本身就是 Slack 证明未接受）；
+    其余一律 "uncertain"——请求可能已被 Slack 接受但响应丢失，
     调用方绝不能自动重发，必须走 history 核验。
     """
     cmd = [sys.executable, "send.py", channel]
@@ -217,6 +235,8 @@ def send_reply(channel, text, thread_ts=None, mentions=()):
         cmd += ["--thread-ts", thread_ts]
     for u in mentions:
         cmd += ["--mention", u]
+    if client_msg_id:
+        cmd += ["--client-msg-id", client_msg_id]
     try:
         r = sh(*cmd, input_text=text, timeout=SEND_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -237,7 +257,7 @@ def send_reply(channel, text, thread_ts=None, mentions=()):
 
 
 def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
-                sent_after=0.0, limit=30):
+                sent_after=0.0, limit=30, client_msg_id=None):
     """经 history 严格核验本次发送是否已出现在频道里。
 
     候选必须同时满足（缺一不可）：
@@ -245,15 +265,24 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
          （bot_id 或 user id 命中其一）；
       2. 频道/线程一致（thread_ts 必须相等；顶层回复双方都为空）；
       3. 消息 ts 不早于本次发送尝试（允许 VERIFY_SKEW_SECONDS 时钟偏差）；
-      4. 全文精确匹配（sha256，不再是 60 字前缀）。
+      4. 全文精确匹配（sha256，不再是 60 字前缀）；
+      5. 携带与本次发送尝试相同的 client_msg_id——这是唯一能把
+         history 里的一条消息关联到"这一次发送尝试"的证据。
+         同身份、同正文和时间窗口不能单独证明成功（例如本 bot 在
+         本次尝试前 30 秒发过相同正文，也会命中 1–4）。
     返回 True（已证实发出）/ False（无证据）/ None（历史不可用）。
     身份未知（bot_id/bot_user_id 都拿不到）时永远返回 False：
     证明不了就保持 uncertain，绝不猜测成功。
+    本次尝试没有 client_msg_id（旧版本条目）时同样无法证明，
+    返回 False。
     """
     msgs, err = channel_history(channel, limit=limit)
     if err:
         return None
     if not thash:
+        return False
+    if not client_msg_id:
+        # 无法关联本次发送尝试：证明不了，保持 uncertain。
         return False
     for m in msgs:
         if not m.get("is_bot"):
@@ -271,6 +300,8 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
         if mts < sent_after - VERIFY_SKEW_SECONDS:
             continue
         if m.get("text_sha256") != thash:
+            continue
+        if m.get("client_msg_id") != client_msg_id:
             continue
         return True
     return False
@@ -291,9 +322,10 @@ def _verify_hold(m, entry, state, bot_id, bot_user_id, why):
               file=sys.stderr)
         return "uncertain-held"
     v = verify_sent(ch, entry.get("text_hash"), thread_ts,
-                    bot_id, bot_user_id, entry.get("claimed_at", 0.0))
+                    bot_id, bot_user_id, entry.get("claimed_at", 0.0),
+                    client_msg_id=entry.get("client_msg_id"))
     if v is True:
-        if ack([mid]):
+        if _ack_safe([mid]):
             state.resolve(mid)
             return "verified-acked"
         state.set_unacked(mid)
@@ -312,7 +344,7 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
     # --- unacked：只重试 ack，绝不重发正文 ---
     entry = state.get(mid)
     if entry and entry.get("status") == "unacked":
-        if ack([mid]):
+        if _ack_safe([mid]):
             state.resolve(mid)
             print(f"ack recovered for {mid}")
         return "acked-later"
@@ -353,21 +385,32 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
     # hash 必须对最终发出的正文计算（含 send.py 追加的显式 mention），
     # 否则核验时全文永远对不上。
     thash = text_hash(wire_text(text, mentions))
+    # 本次发送尝试的唯一关联证据：随 POST 发给 Slack，history 回显后
+    # 用于核验"这次发送"是否成功。同身份+同正文+时间窗口不能单独
+    # 证明成功（30 秒前发过相同正文也会命中）。
+    attempt_id = uuid.uuid4().hex
     # 先持久化领取（fsync），再 spawn 子进程：崩溃后重启走 uncertain，
     # 绝不直接重发。
-    claim_entry, owned = state.claim(mid, channel=ch, thread_ts=thread_ts,
-                                     text_hash=thash)
-    if not owned:
+    claim_entry, outcome = state.claim(mid, channel=ch, thread_ts=thread_ts,
+                                       text_hash=thash,
+                                       client_msg_id=attempt_id)
+    if outcome == "completed":
+        # 持久完成标记已存在：另一个 consumer 已经发送并 ack 了这条
+        # 消息（本快照是旧的）。绝不再次发送。
+        state.resolve(mid)  # 清理可能残留的旧条目
+        print(f"{mid}: already completed by another consumer, skipping")
+        return "already-acked"
+    if outcome == "held":
         # TOCTOU：get 与 claim 之间被另一个存活 consumer 抢先领取。
         # 对方可能正在发送：本轮只核验，绝不并行发送。
         fresh = state.get(mid) or claim_entry
         return _verify_hold(m, fresh, state, bot_id, bot_user_id,
                             why="claim lost to concurrent consumer")
     result = send_reply(ch, text, thread_ts=thread_ts or None,
-                        mentions=mentions)
+                        mentions=mentions, client_msg_id=attempt_id)
 
     if result == "ok":
-        if ack([mid]):
+        if _ack_safe([mid]):
             state.resolve(mid)
             sess.append({"role": "user", "text": m["text"]})
             sess.append({"role": "assistant", "text": text})
@@ -386,9 +429,9 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
         return "send-failed"
     # uncertain：立即严格核验一次，不盲目重发
     v = verify_sent(ch, thash, thread_ts, bot_id, bot_user_id,
-                    claim_entry["claimed_at"])
+                    claim_entry["claimed_at"], client_msg_id=attempt_id)
     if v is True:
-        if ack([mid]):
+        if _ack_safe([mid]):
             state.resolve(mid)
             return "verified-acked"
         state.set_unacked(mid)
@@ -407,7 +450,13 @@ def main():
     while True:
         try:
             if state is None:
-                state = SendState(STATE_PATH)
+                # claim 需要读取 inbox 的持久完成标记（tombstone）：
+                # 锁顺序恒为 send_state -> inbox，见 send_state.py。
+                state = SendState(STATE_PATH,
+                                  inbox_path=os.path.join(ROOT,
+                                                          "inbox.jsonl"),
+                                  inbox_lock_path=os.path.join(ROOT,
+                                                               "inbox.lock"))
             state.ensure_usable()
             msgs = peek()
             if msgs:

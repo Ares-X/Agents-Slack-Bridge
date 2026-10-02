@@ -164,9 +164,9 @@ class CrashRecoveryTest(unittest.TestCase):
 
     def test_crash_after_claim_becomes_uncertain_never_sendable(self):
         st = SendState(self.path)
-        claim, owned = st.claim("C1:1.1", channel="C1", thread_ts="",
-                                text_hash="abc123")
-        self.assertTrue(owned)
+        claim, outcome = st.claim("C1:1.1", channel="C1", thread_ts="",
+                                  text_hash="abc123")
+        self.assertEqual(outcome, "claimed")
         self.assertEqual(claim["status"], "sending")
         # --- 模拟崩溃：丢掉实例，用新实例打开（= 新进程） ---
         del st
@@ -192,12 +192,12 @@ class CrashRecoveryTest(unittest.TestCase):
     def test_concurrent_claim_second_does_not_own(self):
         # 两个 consumer 同时 claim：第二个拿不到发送权，只能核验不能发送
         st = SendState(self.path)
-        entry1, owned1 = st.claim("C1:9", channel="C1", thread_ts="",
-                                  text_hash="h")
-        self.assertTrue(owned1)
-        entry2, owned2 = st.claim("C1:9", channel="C1", thread_ts="",
-                                  text_hash="h")
-        self.assertFalse(owned2)
+        entry1, outcome1 = st.claim("C1:9", channel="C1", thread_ts="",
+                                    text_hash="h")
+        self.assertEqual(outcome1, "claimed")
+        entry2, outcome2 = st.claim("C1:9", channel="C1", thread_ts="",
+                                    text_hash="h")
+        self.assertEqual(outcome2, "held")
         self.assertEqual(entry2["status"], "sending")
 
     def test_sending_entry_goes_to_verify_not_resend(self):
@@ -257,18 +257,26 @@ class StorageFailureTest(unittest.TestCase):
         st2 = SendState(self.path)
         self.assertIsNotNone(st2)
 
-    def test_corrupt_primary_falls_back_to_bak(self):
+    def test_corrupt_primary_with_only_stale_bak_fails_closed(self):
+        # P1-1: primary 损坏后只剩旧 .bak（领取前的版本）时，绝不能静默
+        # 恢复——那会让可能已发送的消息重新变得可直接发送。
         st = SendState(self.path)
         st.claim("C1:1", channel="C1", thread_ts="", text_hash="h")
         st.set_unacked("C1:1")   # 触发 .bak 轮转
         self.assertTrue(os.path.exists(self.path + ".bak"))
         with open(self.path, "w") as f:
             f.write("garbage{{{ not json")
-        st2 = SendState(self.path)   # 从 .bak 恢复，不静默变空
-        entry = st2.get("C1:1")
-        self.assertIsNotNone(entry)
-        # .bak 里是 claim(sending) 版本：重启规则 -> uncertain
-        self.assertEqual(entry["status"], "uncertain")
+        with self.assertRaises(StateCorruptError):
+            SendState(self.path)
+        # 损坏证据按来源分别保留，不互相覆盖
+        corrupt = glob.glob(self.path + ".corrupt.*")
+        tags = {p.rsplit(".", 1)[-1] for p in corrupt}
+        self.assertIn("primary", tags)
+        self.assertIn("bak", tags)
+        # 隔离标记存在：再次构造仍然 raise，绝不静默变空
+        self.assertTrue(os.path.exists(self.path + ".quarantined"))
+        with self.assertRaises(StateCorruptError):
+            SendState(self.path)
 
     def test_total_corruption_quarantines_and_raises(self):
         st = SendState(self.path)
@@ -298,17 +306,19 @@ class VerifySentTest(unittest.TestCase):
     def hist_msg(self, **kw):
         m = {"is_bot": True, "bot_id": "B_OURS", "user": "",
              "text": self.OUR_TEXT, "text_sha256": self.thash,
-             "ts": "1005.0", "thread_ts": ""}
+             "ts": "1005.0", "thread_ts": "", "client_msg_id": "cid-1"}
         m.update(kw)
         return m
 
     def verify(self, msgs, err=None, **kw):
         kw.setdefault("bot_id", "B_OURS")
         kw.setdefault("bot_user_id", "U_OURS")
+        kw.setdefault("client_msg_id", "cid-1")
         with patch.object(pc, "channel_history",
                            return_value=(msgs, err)):
             return pc.verify_sent("C1", self.thash, "", kw["bot_id"],
-                                  kw["bot_user_id"], self.SENT_AFTER)
+                                  kw["bot_user_id"], self.SENT_AFTER,
+                                  client_msg_id=kw["client_msg_id"])
 
     def test_other_bot_same_prefix_not_confirmed(self):
         # 复现：其他 bot 的旧消息只有 60 字前缀相同 -> 不能误确认

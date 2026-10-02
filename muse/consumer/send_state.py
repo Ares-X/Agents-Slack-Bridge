@@ -16,6 +16,16 @@ Crash/restart rule: on load, any "sending" entry becomes "uncertain" --
 NEVER back to sendable.  A restart must not restore a message to
 directly-sendable.
 
+Claim rule (stale snapshots): the claim decision also consults the durable
+inbox ack tombstone, inside the same (send_state EX -> inbox SH) critical
+section as the claim write.  inbox_store.ack() takes the inbox EX lock, so
+the check is atomic with respect to any concurrent ack.  Checking only the
+claim entry is NOT enough: a consumer working from a stale snapshot could
+claim after another consumer already sent, acked and resolved (deleted) its
+entry -- the tombstone is the only durable proof the message is done.
+Lock order is ALWAYS send_state -> inbox; nothing takes them in reverse
+order, so no deadlock is possible.
+
 Storage layout
 --------------
 ``send_state.json`` (atomic write: tmp + fsync + replace + dir fsync, with
@@ -25,10 +35,24 @@ reads), so two consumer processes can never interleave a read-modify-write.
 
 Corruption rule: the file is NEVER silently treated as empty.
 Load order is primary -> ``.tmp`` (leftover of a crashed write, itself
-fsynced so it is a complete newer version) -> ``.bak``.  If none parses,
-all three are quarantined to ``send_state.json.corrupt.<millis>*`` (evidence
-preserved) and ``StateCorruptError`` is raised.  The consumer then refuses to
-send anything (fail-closed) until an operator restores a good copy.
+fsynced so it is a complete NEWER version -- recovering from it is safe)
+-> ``.bak``.  Every candidate is parsed, v1-migrated and STRICTLY validated
+(version + structure); anything else is treated as unusable, never as
+usable state.
+
+``.bak`` is special: it is the version from BEFORE the last save, so it
+can be missing claims that the lost primary already had.  If primary and
+``.tmp`` are both unusable and only ``.bak`` parses, the restore is
+potentially STALE -- a claim that existed in primary (possibly already
+sent) would look fresh again and could be resent.  That cannot be proven
+safe, so the store quarantines the evidence and raises instead of coming
+up (fail-closed) until an operator restores a known-good copy.
+
+If nothing usable remains, all candidates are quarantined to
+``send_state.json.corrupt.<millis>.<primary|tmp|bak>`` (each source keeps
+its own suffix so no evidence overwrites another) and
+``StateCorruptError`` is raised.  The consumer then refuses to send
+anything (fail-closed) until an operator restores a good copy.
 
 v1 migration: files written by the old in-memory-dict consumer
 (``{"sent_unacked": [...], "uncertain": {...}}``) are converted once, on
@@ -47,16 +71,24 @@ STATUS_SENDING = "sending"
 STATUS_UNACKED = "unacked"
 STATUS_UNCERTAIN = "uncertain"
 
+# claim() outcomes
+CLAIM_CLAIMED = "claimed"      # this caller now owns the send right
+CLAIM_HELD = "held"            # another live consumer holds the claim
+CLAIM_COMPLETED = "completed"  # durable inbox tombstone exists: done
+
 
 class StateCorruptError(Exception):
-    """send_state.json and its backups are all unparseable.
+    """send_state.json and its backups are unusable.
 
-    The damaged files were quarantined as ``send_state.json.corrupt.*``
-    (evidence preserved) and a ``send_state.json.quarantined`` marker was left
-    behind so that even after a restart the store refuses to come up empty.
-    The consumer must NOT send while this holds: without state, every
-    undelivered inbox message looks fresh and would be resent.
-    Recovery: inspect the quarantined copies, restore a good one to
+    The damaged files were quarantined as
+    ``send_state.json.corrupt.<millis>.<primary|tmp|bak>`` (evidence
+    preserved, each source keeps its own suffix) and a
+    ``send_state.json.quarantined`` marker was left behind so that even
+    after a restart the store refuses to come up empty.  The consumer must
+    NOT send while this holds: without state, every undelivered inbox
+    message looks fresh and would be resent.
+    Recovery: inspect the quarantined copies; restore a copy you can prove
+    safe (i.e. one that cannot predate a persisted send claim) to
     ``send_state.json``, delete the ``.quarantined`` marker, restart.
     """
 
@@ -80,20 +112,22 @@ def _parse_file(path):
 
 
 class SendState:
-    def __init__(self, path):
+    def __init__(self, path, inbox_path=None, inbox_lock_path=None):
         self.path = path
         self.lock_path = path + ".lock"
         self.tmp_path = path + ".tmp"
         self.bak_path = path + ".bak"
         self.quarantined_path = path + ".quarantined"
+        # Durable completion marker consulted by claim().  Kept as plain
+        # paths (no import of inbox_store: consumer/ must not depend on
+        # muse/ being importable) -- poll_consumer wires the real paths.
+        self.inbox_path = inbox_path
+        self.inbox_lock_path = inbox_lock_path
         with _locked(self.lock_path, True):
             data = self._load_locked()
             changed = False
-            if self._is_v1(data):
-                data = self._migrate_v1(data)
-                changed = True
             # Restart rule: in-flight sends become uncertain, never sendable.
-            for mid, e in data.get("sends", {}).items():
+            for mid, e in data["sends"].items():
                 if isinstance(e, dict) and e.get("status") == STATUS_SENDING:
                     e["status"] = STATUS_UNCERTAIN
                     e["attempts"] = max(1, int(e.get("attempts") or 0))
@@ -106,9 +140,37 @@ class SendState:
 
     # ---- persistence internals (caller holds the lock) ----
 
+    @staticmethod
+    def _valid_data(data):
+        """Strict structure check.  A file that parses as JSON but does not
+        match the v2 schema is corrupt, never usable state."""
+        if not isinstance(data, dict):
+            return False
+        if data.get("v") != SCHEMA_VERSION:
+            return False
+        sends = data.get("sends")
+        if not isinstance(sends, dict):
+            return False
+        for e in sends.values():
+            if not isinstance(e, dict):
+                return False
+            if e.get("status") not in (STATUS_SENDING, STATUS_UNACKED,
+                                       STATUS_UNCERTAIN):
+                return False
+        if not isinstance(data.get("hist_deferred", {}), dict):
+            return False
+        return True
+
     def _load_locked(self):
-        """Load, trying primary -> tmp -> bak.  Quarantines + raises on total
-        failure; never silently returns empty."""
+        """Load, trying primary -> tmp -> bak.  Never silently empty.
+
+        ``.tmp`` is the fsynced leftover of a crashed write, i.e. a
+        complete NEWER version: recovering from it is safe.  ``.bak`` is
+        the version from BEFORE the last save: if it is the ONLY usable
+        candidate, the restore may be missing claims the lost primary
+        already had (possibly already sent) -- that cannot be proven
+        safe, so quarantine + raise instead of coming up stale.
+        """
         paths = (self.path, self.tmp_path, self.bak_path)
         if not any(os.path.exists(p) for p in paths):
             if os.path.exists(self.quarantined_path):
@@ -118,18 +180,36 @@ class SendState:
                     "(see send_state.json.corrupt.*); restore a good copy "
                     "to send_state.json and remove .quarantined")
             return {"v": SCHEMA_VERSION, "sends": {}, "hist_deferred": {}}
+        good = {}
         for p in paths:
             if os.path.exists(p):
                 data = _parse_file(p)
                 if isinstance(data, dict):
-                    if p != self.path:
-                        print(f"send_state: recovered from {p}",
-                              flush=True)
-                    return data
+                    data = self._migrate_v1(data)  # idempotent
+                    if self._valid_data(data):
+                        good[p] = data
+        if self.path in good or self.tmp_path in good:
+            src = self.path if self.path in good else self.tmp_path
+            if src != self.path:
+                print(f"send_state: recovered from {src}", flush=True)
+            return good[src]
+        if self.bak_path in good:
+            # STALE backup: primary and .tmp are both unusable, so this
+            # .bak may predate persisted send claims.  Restoring it would
+            # make those messages look fresh and directly sendable.
+            self._quarantine_locked()
+            raise StateCorruptError(
+                "send_state.json and .tmp are unusable; only the older "
+                ".bak parses, which may predate persisted send claims.  "
+                "Restoring it could resend already-sent messages.  "
+                "Evidence quarantined as send_state.json.corrupt.* -- "
+                "restore a copy you can prove safe to send_state.json "
+                "and remove .quarantined")
         self._quarantine_locked()
         raise StateCorruptError(
-            "send_state.json, .tmp and .bak are all unparseable; "
-            "quarantined as send_state.json.corrupt.*")
+            "send_state.json, .tmp and .bak are all unparseable or "
+            "structurally invalid; quarantined as "
+            "send_state.json.corrupt.*")
 
     def _save_locked(self, data):
         tmp = self.tmp_path
@@ -150,10 +230,14 @@ class SendState:
 
     def _quarantine_locked(self):
         stamp = int(time.time() * 1000)
-        for p in (self.path, self.tmp_path, self.bak_path):
+        # Each source gets its own suffix: one quarantine pass must never
+        # overwrite another source's evidence.
+        for p, tag in ((self.path, "primary"), (self.tmp_path, "tmp"),
+                       (self.bak_path, "bak")):
             if os.path.exists(p):
                 try:
-                    os.replace(p, "%s.corrupt.%d" % (self.path, stamp))
+                    os.replace(p, "%s.corrupt.%d.%s" % (self.path, stamp,
+                                                        tag))
                 except OSError:
                     pass
         # 隔离标记：重启后也不许静默变空（fail-closed）。
@@ -161,8 +245,8 @@ class SendState:
             with open(self.quarantined_path, "w") as f:
                 f.write(json.dumps(
                     {"at": time.time(),
-                     "reason": "primary/.tmp/.bak all unparseable; "
-                               "evidence in send_state.json.corrupt.*"},
+                     "reason": "primary/.tmp/.bak unusable; evidence in "
+                               "send_state.json.corrupt.*"},
                     ensure_ascii=False))
                 f.flush()
                 os.fsync(f.fileno())
@@ -173,7 +257,11 @@ class SendState:
 
     @staticmethod
     def _is_v1(data):
-        return isinstance(data, dict) and data.get("v") != SCHEMA_VERSION
+        # 精确判定：真正的 v1 文件没有 "v" 键（旧 consumer 只写
+        # sent_unacked/uncertain）。带未知版本号（v=99 等未来版本）
+        # 的文件绝不能被"迁移"成空状态——那会静默丢失数据。
+        return (isinstance(data, dict) and "v" not in data
+                and ("sent_unacked" in data or "uncertain" in data))
 
     @staticmethod
     def _migrate_v1(data):
@@ -198,6 +286,35 @@ class SendState:
         return {"v": SCHEMA_VERSION, "sends": sends,
                 "hist_deferred": data.get("hist_deferred", {}) or {}}
 
+    # ---- durable completion marker (caller holds send_state EX) ----
+
+    def _inbox_tombstone_locked(self, msg_id):
+        """True if the inbox already holds an ack tombstone for msg_id.
+
+        Takes the inbox SH lock; inbox_store.ack() takes the inbox EX
+        lock, so no ack can slip between this check and the claim write.
+        """
+        if not self.inbox_path:
+            return False
+        lock_path = self.inbox_lock_path or (self.inbox_path + ".lock")
+        with _locked(lock_path, False):
+            try:
+                f = open(self.inbox_path, "r")
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return False
+            with f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(r, dict) and r.get("type") == "ack" \
+                            and r.get("msg_id") == msg_id:
+                        return True
+        return False
+
     # ---- public API (each call is a locked, durable transition) ----
 
     def ensure_usable(self):
@@ -209,8 +326,6 @@ class SendState:
     def _mutate(self, fn):
         with _locked(self.lock_path, True):
             data = self._load_locked()
-            data.setdefault("v", SCHEMA_VERSION)
-            data.setdefault("sends", {})
             result = fn(data["sends"])
             self._save_locked(data)
             return result
@@ -218,25 +333,38 @@ class SendState:
     def get(self, msg_id):
         with _locked(self.lock_path, False):
             data = self._load_locked()
-            e = data.get("sends", {}).get(msg_id)
+            e = data["sends"].get(msg_id)
             return dict(e) if isinstance(e, dict) else None
 
-    def claim(self, msg_id, channel, thread_ts, text_hash):
+    def claim(self, msg_id, channel, thread_ts, text_hash,
+              client_msg_id=None):
         """Durably record a send attempt BEFORE spawning send.py.
 
-        Returns ``(entry, is_new)``.  ``is_new`` is False when another
-        live consumer already holds the claim: the caller must NOT send,
-        only verify.  This is the atomic mutual-exclusion primitive --
-        without it two consumers could both spawn send.py for one message.
+        Returns ``(entry, outcome)``; outcome is ``"claimed"`` (this
+        caller now owns the send right), ``"held"`` (another live
+        consumer already holds the claim: do NOT send, only verify), or
+        ``"completed"`` (the durable inbox tombstone already exists:
+        another consumer sent and acked this message: do NOT send).
+
+        The tombstone check runs inside the same critical section as the
+        claim write, so a consumer working from a stale snapshot can
+        never claim a message that another consumer already finished --
+        even after that consumer resolved (deleted) its claim entry.
+        Locking only the claim creation is NOT enough; the durable
+        completion marker must participate in the claim decision.
         """
         now = time.time()
-
-        def _do(sends):
+        with _locked(self.lock_path, True):
+            data = self._load_locked()
+            if self._inbox_tombstone_locked(msg_id):
+                return (None, CLAIM_COMPLETED)
+            sends = data["sends"]
             e = sends.get(msg_id)
             if isinstance(e, dict):
-                return (dict(e), False)
+                return (dict(e), CLAIM_HELD)
             e = {"status": STATUS_SENDING, "channel": channel,
                  "thread_ts": thread_ts or "", "text_hash": text_hash,
+                 "client_msg_id": client_msg_id,
                  "attempts": 0, "claimed_at": now, "updated_at": now,
                  "owner_pid": os.getpid()}
             try:
@@ -245,9 +373,8 @@ class SendState:
             except Exception:
                 pass
             sends[msg_id] = e
-            return (dict(e), True)
-
-        return self._mutate(_do)
+            self._save_locked(data)
+            return (dict(e), CLAIM_CLAIMED)
 
     def set_unacked(self, msg_id):
         """Sent ok, inbox ack failed: only the ack may be retried."""
@@ -285,12 +412,11 @@ class SendState:
     def get_hist_deferred(self, msg_id):
         with _locked(self.lock_path, False):
             data = self._load_locked()
-            return int(data.get("hist_deferred", {}).get(msg_id, 0) or 0)
+            return int(data["hist_deferred"].get(msg_id, 0) or 0)
 
     def set_hist_deferred(self, msg_id, n):
         with _locked(self.lock_path, True):
             data = self._load_locked()
-            data.setdefault("hist_deferred", {})
             if n:
                 data["hist_deferred"][msg_id] = n
             else:

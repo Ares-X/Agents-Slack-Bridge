@@ -85,6 +85,10 @@ def main():
             "ts": m.get("ts", ""),
             "thread_ts": m.get("thread_ts", ""),
             "is_bot": bool(m.get("bot_id")),
+            # 本次发送尝试的关联证据：发送时随 POST 提交的唯一 id，
+            # Slack 会原样存进消息并在 history 里回显。核验"这次发送"
+            # 是否成功时必须命中它；同身份+同正文+时间窗口不够。
+            "client_msg_id": m.get("client_msg_id", ""),
         }, ensure_ascii=False))
 
 

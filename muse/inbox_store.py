@@ -170,11 +170,18 @@ def _fsync_dir():
 
 
 def _fsync_data_file():
-    """Confirm the data file is durable.  Raises on failure."""
+    """Confirm the data file AND its directory entry are durable.
+
+    Raises on failure.  The directory fsync matters for files whose
+    creation was never confirmed (e.g. a previous append reported
+    success without it); confirming it on the duplicate path closes
+    that hole at negligible cost.
+    """
     if not os.path.exists(INBOX_PATH):
         return
     with open(INBOX_PATH, "a") as f:
         os.fsync(f.fileno())
+    _fsync_dir()
 
 
 def _quarantine_torn_tail():
@@ -324,6 +331,11 @@ def _ensure_migrated():
         _quarantine_torn_tail()
         lines = _read_all_lines()
         if _has_schema_marker(lines):
+            # 已迁移：但上一次迁移的目录 fsync 可能没完成（例如 EIO
+            # 导致 replace 后 _fsync_dir 抛异常）。目录项不确认就不能
+            # 报成功，否则崩溃后新文件可能丢失而调用方已经 ACK。
+            # 持续失败时这里持续抛异常 -> 调用方持续拒绝 ACK。
+            _fsync_dir()
             _MIGRATED[INBOX_PATH] = True
             return
         parsed = [_parse(l) for l in lines]
@@ -334,6 +346,7 @@ def _ensure_migrated():
                                    ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            _fsync_dir()
         else:
             now = time.time()
             new_lines = _migrate_lines(lines, now)
@@ -354,6 +367,10 @@ def append_record(record):
     Durability contract: on a duplicate hit the data file is fsynced
     BEFORE returning False, so the caller may safely treat the record as
     stored.  An fsync failure raises instead of returning success.
+    Directory durability is confirmed on every success boundary
+    (migration recovery, first creation, duplicate append): a persistent
+    directory-sync failure keeps raising, so the bridge keeps refusing
+    to ACK instead of confirming messages that a crash could lose.
     """
     _ensure_migrated()
     mid = _identity(record)
@@ -372,10 +389,15 @@ def append_record(record):
             # now; a failure raises and the caller must NOT ack to Slack.
             _fsync_data_file()
             return False
+        created = not os.path.exists(INBOX_PATH)
         with open(INBOX_PATH, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             f.flush()                       # user-space buffer -> kernel
             os.fsync(f.fileno())            # kernel -> durable storage
+        if created:
+            # 新文件：目录项本身也必须落盘，否则崩溃后文件可能消失，
+            # 而调用方已经按 True 去 ACK。
+            _fsync_dir()
         return True
 
 
@@ -416,6 +438,7 @@ def ack(msg_ids):
     now = time.time()
     with _locked(exclusive=True):
         _quarantine_torn_tail()
+        created = not os.path.exists(INBOX_PATH)
         with open(INBOX_PATH, "a") as f:
             for mid in msg_ids:
                 f.write(json.dumps(
@@ -423,6 +446,9 @@ def ack(msg_ids):
                     ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        if created:
+            # 新文件：目录项也必须落盘，否则崩溃后 tombstone 可能丢失。
+            _fsync_dir()
 
 
 def compact(now=None):
