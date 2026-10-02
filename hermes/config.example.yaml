@@ -11,7 +11,8 @@ platforms:
     extra:
       # 频道里顶层直接回复（false）；true = 开 thread 回复
       reply_in_thread: false
-      # 多 agent 协作：只有对方 bot 的消息里明确 @了本 bot 才受理（防回环推荐值）
+      # 多 agent 协作：只有对方 bot 的消息里明确 @了本 bot 才受理（防回环推荐值）。
+      # 只管 bot 签名消息的受理，不是身份白名单；带 user_id 的 bot 帖还需通过用户授权（README「授权模型」）
       allow_bots: mentions
       # Block Kit 富渲染（表格/嵌套列表/分割线），纯发送侧开关，无需重装 App
       rich_blocks: true

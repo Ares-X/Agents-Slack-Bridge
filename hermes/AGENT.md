@@ -10,10 +10,14 @@
 
 1. **永不提交 `.env`**；永不把 `xoxb-` / `xapp-` token 贴进聊天或日志；token 只写目标机 `~/.hermes/.env`（`chmod 600`）。
 2. token 曾出现在聊天/日志里 → 立刻让用户去 Slack 后台 rotate。
-3. `SLACK_ALLOWED_USERS` 必设（逗号分隔 Member ID）——不设则网关默认拒收所有消息。
+3. `SLACK_ALLOWED_USERS` 必设（逗号分隔 Member ID）——不设则**人类消息**默认拒收（fail-closed）。
+   无 `user_id` 的 bot 帖在 `allow_bots: mentions` + 明确 @ 下仍能进（授权细节见仓库 README「授权模型」，
+   按 hermes-agent `b3059921bc` 核对）。
 4. 改 Slack App 的 scope/事件订阅后**必须重装 App** 才生效——提醒用户。
 5. 只在 Hermes 主目录（`~/.hermes`）和用户指定的目录操作；不要碰无关配置。
-6. 多 bot 频道：`allow_bots: mentions` 是安全默认，绝不建议 `all`（回环风险）。
+6. 多 bot 频道：`allow_bots: mentions` 是安全默认，绝不建议 `all`（回环风险）。`allow_bots` 只管
+   「bot 签名的消息受不受理」，不是身份白名单，也不是绝对防回环保证（还有 own-echo 丢弃、bot loop
+   guard 兜底）。
 
 ## 路径
 
@@ -98,9 +102,12 @@ hermes gateway status
 ## 速查（agent 常用）
 
 - **触发**：DM 免 @；频道需 @；thread 内首 @ 后自动跟随；其他 bot 需在消息里明确 @ 我（`allow_bots: mentions`）
-- **读历史**：会话内自动带 thread 上下文；补频道上下文用 `channel_history.py <channel> [limit] [--thread ts] [--resolve]`
+- **读历史**：会话内自动带 thread 上下文；补频道上下文用 `channel_history.py <channel> [limit] [--thread ts] [--resolve]`（输出统一时间正序：频道模式反转 Slack 的最新在前；thread 模式不反转）
 - **cron**：`hermes cron add "every 1h" "任务描述" --deliver slack`（或 `slack:C…` 指定频道、`slack:U…` 直投 DM；输出 `MEDIA:/path` 自动上传为 Slack 文件）
-- **多 agent 协作（默认支持，无需额外配置）**：`allow_bots: mentions` 即协作默认——兄弟 bot 在消息里 @ 本 bot 就会进来，且会话自动带 thread 上下文，能看到 @ 之前的来龙去脉。纪律：点名 → 单回 → 停；引用旧消息把 @ 写成纯文本名字防二手回环；需要对方接手时在回复里明确 @ 对方
+- **多 agent 协作（默认支持）**：`allow_bots: mentions` 下——**无 `user_id` 的经典 bot 帖**在消息里
+  明确 @ 本 bot 就会进来，无需把它加进 `SLACK_ALLOWED_USERS`，会话自动带 thread 上下文；**带
+  `user_id` 的 app/automation 帖**则还要求该 user_id 通过用户授权（allowlist/pairing/allow-all），
+  否则静默拒绝。纪律：点名 → 单回 → 停；引用旧消息把 @ 写成纯文本名字防二手回环；需要对方接手时在回复里明确 @ 对方
 - **排障**：DM 通频道不通 = `message.channels`/`message.groups` 事件 + `channels:history`/`groups:history` scope + 重装；改 scope/事件必重装
 - **升级后 slash 命令刷新**：`hermes slack manifest --agent-view --write` → App Manifest 页粘贴 → 按提示重装
 
