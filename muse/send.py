@@ -1,8 +1,10 @@
 """Post a reply back to Slack. Token 从 .env 读（0600），绝不在 argv/日志里出现。
 
 Usage:
-  echo "正文" | python send.py <channel> [--thread-ts <ts>]
+  echo "正文" | python send.py <channel> [--thread-ts <ts>] [--mention <UID>]...
 正文走 stdin，避免进 shell 历史。
+--mention 可重复：主动点名某人（显式 <@UID>）。默认正文里的 mention
+  原样发送——调用方负责先做 strip_mentions() 脱敏，见 consumer。
 """
 import os
 import ssl
@@ -36,10 +38,19 @@ def main():
     thread_ts = None
     if "--thread-ts" in args:
         thread_ts = args[args.index("--thread-ts") + 1]
+    mentions = []
+    for i, a in enumerate(args):
+        if a == "--mention" and i + 1 < len(args):
+            uid = args[i + 1].strip()
+            if uid:
+                mentions.append(uid)
     text = sys.stdin.read()
     if not text.strip():
         print("empty message", file=sys.stderr)
         sys.exit(1)
+    if mentions:
+        # 显式点名追加在正文末尾；调用方已明确表达点名意图。
+        text = text.rstrip() + " " + " ".join(f"<@{u}>" for u in mentions)
 
     from slack_sdk.web import WebClient
     ctx = ssl.create_default_context(

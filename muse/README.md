@@ -70,8 +70,14 @@ tail -f bridge.log                          # → "socket mode connected, listen
 
 | 方案 | 说明 | 延迟 | 上下文 |
 |---|---|---|---|
-| **A. `consumer/poll_consumer.py`**（开箱即用） | 轮询 inbox → 按 channel 维护 `channel_sessions.json` 会话 → 调你的 LLM → `send.py` 发回 | ~1 分钟 | 按 channel 隔离，文件持久化 |
+| **A. `consumer/poll_consumer.py`**（参考实现） | 轮询 inbox → 按 channel 维护 `channel_sessions.json` 会话 → 调你的 LLM → `send.py` 发回 | ~1 分钟 | 按 channel 隔离，文件持久化 |
 | **B. 平台 side chat**（如 Muse） | 定时任务把消息转给各 channel 的独立子对话，子对话里的 agent 回复 | 1~3 分钟 | 子对话天然隔离 |
+
+> ⚠️ 方案 A 的 `generate_reply()` **默认只是 echo 示例**（`收到：…`，mention 已脱敏），**不是真实回复**。生产使用必须换成你的模型调用：把函数体替换为 LLM 请求，返回 `str`（正文）或 `(str, [uid...])`（正文 + 显式点名，经 `send.py --mention` 发出真实 @）。
+>
+> 真实回复位置：`send.py <channel>` 发到频道顶层；带 `--thread-ts` 则跟帖。多 agent 协作想让同伴看见时用顶层（不传 `--thread-ts`）。
+>
+> 已验证范围：`tests/` 30 个隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤）全部通过；**真实 Slack 联调（NOT_EXERCISED）**——未在授权测试频道执行，需部署者按 §6 自行验证。
 
 用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；需要同伴看见回复时不要默认跟帖。
 
@@ -83,14 +89,20 @@ Agents-Slack-Bridge/
     ├── README.md                 # 本文档
     ├── manifest.yaml             # Slack App 定义（从 manifest 建应用）
     ├── .env.example              # 凭据模板 → 复制为 .env（0600，不提交）
-    ├── bridge.py                 # ★ 核心：Socket Mode 监听 → inbox.jsonl（只收不发）
-    ├── send.py                   # 发消息：echo "正文" | python send.py <channel> [--thread-ts <ts>]
+    ├── bridge.py                 # ★ 核心：Socket Mode 监听 → inbox.jsonl（只收不发；先落盘后 ACK）
+    ├── inbox_store.py            # 队列存储：append-only + tombstone ack，锁文件并发控制
+    ├── send.py                   # 发消息：echo "正文" | python send.py <channel> [--thread-ts <ts>] [--mention <UID>]...
     ├── inbox_peek.py             # 打印未处理消息（不标记）
-    ├── inbox_ack.py              # 按 ts 标记已处理（处理成功后调）
+    ├── inbox_ack.py              # 按 <channel:ts> 标记已处理（处理成功后调）
     ├── channel_history.py        # 拉频道最近 N 条（python channel_history.py <channel> [N]）
+    ├── resolve.py                # ID → 显示名（user|channel）
     ├── slack-bridge.service      # systemd unit（改路径后用，WorkingDirectory=.../muse）
-    └── consumer/
-        └── poll_consumer.py      # 消费层方案 A 参考实现（~30s 轮询）
+    ├── consumer/
+    │   └── poll_consumer.py      # 消费层方案 A 参考实现（~30s 轮询；默认 echo 示例，需接模型）
+    └── tests/
+        ├── test_store.py         # 并发入队/跨频道同 ts/ack 语义/compact
+        ├── test_bridge.py        # 事件分类/子类型过滤/bot 白名单
+        └── test_consumer.py      # mention 脱敏/发送状态机/历史降级
 ```
 
 运行时产生（不提交）：`inbox.jsonl`（队列）、`bridge.log`（日志）、`consumer/channel_sessions.json`（会话）。
@@ -99,13 +111,18 @@ Agents-Slack-Bridge/
 
 ## 4. 消息队列格式
 
-`inbox.jsonl` 每行一条：
+`inbox.jsonl` append-only，每行一条。消息身份统一为 `msg_id = "<channel>:<ts>"`
+（入队去重与确认都用它，跨频道同 `ts` 互不干扰）：
+
 ```json
-{"channel":"C...","channel_name":"general","user":"U...","user_name":"AresX",
- "text":"@bot 你好","kind":"mention","ts":"...","thread_ts":"",
- "received_at":1234567890.0,"delivered":false}
+{"msg_id":"C...:123.456","channel":"C...","user":"U...","text":"@bot 你好",
+ "kind":"mention","ts":"123.456","thread_ts":"","received_at":1234567890.0}
+{"type":"ack","msg_id":"C...:123.456","at":1234567900.0}
 ```
-`kind`: `dm`（私信）/`mention`（被@）。消费流程：`inbox_peek.py` 读 → 处理 → `inbox_ack.py <ts>` 确认（失败不确认，下轮重试）。
+- `kind`: `dm`（私信）/`mention`（被@）。热路径不做名称查询，显示名用 `resolve.py` 按需解析。
+- 确认是追加 tombstone（`{"type":"ack",...}`），**不做原地重写**——中途中断不会损坏已存消息。
+- 消费流程：`inbox_peek.py` 读未确认消息 → 处理 → `inbox_ack.py <channel:ts>` 确认（失败不确认，下轮重试；退出码非 0 = 未确认，调用方不得重发正文）。
+- 维护：`python -c "import inbox_store; print(inbox_store.compact())"` 清理已确认记录。
 
 ## 5. 踩坑清单（实测）
 
@@ -115,7 +132,9 @@ Agents-Slack-Bridge/
 4. **频道必须先邀请 bot**，否则收不到 `app_mention`。
 5. **多 agent 协作（默认开）**：其他 bot 的 @mention 默认放行，自己的消息永远过滤（防自循环）。要收紧成白名单，把协作对象的 user ID / bot ID 填进 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（任一非空即白名单模式）。防回环纪律：被 @ 才回、回一轮就停、转述别人 @ 时写纯文本名字不写实 @。
 6. **回复前读上下文**：消费层应先 `channel_history.py` 再生成回复（参考 `poll_consumer.py`）。
-7. **Socket Mode 先 ack 再处理**，否则 Slack 重发。
+7. **可靠性顺序：先落盘，再 ACK**：`bridge.py` 收到事件后先 `flush+fsync` 写入队列，**成功后才**向 Slack 发 ACK；名称查询等慢操作不在热路径。落盘失败则不 ACK，靠 Slack 重发 + `msg_id` 去重实现 at-least-once（重复入队会被去重丢弃）。
+8. **mention 回声脱敏**：默认 echo/转述必须把 `<@U...>` 转成纯文本 `@U...`（不触发通知）；主动点名走 `send.py --mention <UID>` 显式发出。不要为了防回环禁掉全部 mention。
+9. **子类型白名单**：DM 里只有无 subtype 和 `me_message` 被当作新消息；`message_changed` / `message_deleted` 等只 ACK 不入队。
 8. **中断期消息会丢**（Slack 不补发），健康检查把中断窗口压到分钟级。
 9. **回复位置**：默认有 `thread_ts` 则跟帖；多 agent 想让同伴看见时，改成频道顶层（不传 `--thread-ts`）。
 
@@ -124,6 +143,15 @@ Agents-Slack-Bridge/
 1. `systemctl is-active` → active，日志出现 `socket mode connected`
 2. Slack 私信 bot → `python inbox_peek.py` 看到这条 → `echo hi | python send.py <DM频道ID>` → Slack 收到
 3. 拉 bot 进测试频道，`@bot hello` → 收到 mention → 消费层回复出现在频道
+
+## 8. 隔离行为测试
+
+```bash
+cd muse && python3 -m unittest discover -s tests -v
+```
+30 个测试，覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。仅标准库，无新增依赖。
+
+**NOT_EXERCISED**：真实 Slack 联调未在授权测试频道执行（无凭据、无部署修改），需部署者按 §6 自行验证。
 
 ## 7. 安全
 

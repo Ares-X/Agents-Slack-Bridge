@@ -1,7 +1,12 @@
 """Print recent messages of a channel as compact JSON lines (chronological).
 
 Usage: python channel_history.py <channel> [limit]
-给回复生成提供上下文用。失败时输出 {"error": ...}，调用方应如实报告失败、不编造。
+给回复生成提供上下文用。
+
+失败语义（调用方必须处理，不可当空历史）：
+  - 打印 {"error": "history fetch failed", "reason": "<异常类型: 信息>"} 到 stdout
+  - 退出码 2
+  调用方应保留 reason，执行可见的降级/延迟策略（见 consumer）。
 """
 import json
 import os
@@ -42,15 +47,18 @@ def main():
                   **({"proxy": proxy} if proxy else {}), ssl=ctx)
 
     msgs = None
-    for _ in range(5):
+    last_err = None
+    for _ in range(3):
         try:
             msgs = c.conversations_history(channel=channel, limit=limit)["messages"]
             break
-        except Exception:
+        except Exception as e:
+            last_err = "%s: %s" % (type(e).__name__, e)
             time.sleep(3)
     if msgs is None:
-        print(json.dumps({"error": "history fetch failed"}))
-        return
+        print(json.dumps({"error": "history fetch failed",
+                          "reason": last_err or "unknown"}))
+        sys.exit(2)
 
     names = {}
 

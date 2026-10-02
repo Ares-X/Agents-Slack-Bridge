@@ -1,23 +1,28 @@
 """Slack Socket Mode -> local inbox queue. 只收不发。
 
 监听 bot 的私信（message.im）与频道 @mention（app_mention），
-把每条消息以 JSON 行追加到 inbox.jsonl，供消费层（cron/轮询脚本/agent）
-读取处理。发送请用 send.py。
+把每条消息追加到 inbox.jsonl（见 inbox_store.py：append-only + tombstone ack），
+供消费层读取处理。发送请用 send.py。
+
+可靠性顺序（关键）：
+  1. 先把事件可靠落盘（flush + fsync），
+  2. 再向 Slack 发 ACK，
+  3. 名称查询等慢操作一律不在热路径（见 resolve.py，消费层按需调用）。
+落盘失败则不 ACK，靠 Slack 重发 + msg_id 去重实现 at-least-once。
 
 配置：同目录 .env（0600），见 .env.example。
 依赖：pip install slack_sdk
 """
-import json
 import logging
 import os
 import ssl
 import sys
 import time
-import fcntl
+
+import inbox_store
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE, ".env")
-INBOX_PATH = os.path.join(BASE, "inbox.jsonl")
 LOG_PATH = os.path.join(BASE, "bridge.log")
 
 
@@ -40,7 +45,6 @@ CA_BUNDLE = _ENV.get("CA_BUNDLE") or None      # 自签 CA 路径，默认系统
 # 可选白名单：.env 里 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔）。
 # 两者都留空 = 允许任意其他 bot（协作默认）；任一非空 = 白名单模式，仅放行列出的 ID。
 def _parse_csv_set(raw):
-    """Comma-separated IDs → set of non-empty stripped strings."""
     if not raw:
         return set()
     return {x.strip() for x in raw.split(",") if x.strip()}
@@ -49,6 +53,10 @@ def _parse_csv_set(raw):
 ALLOWED_BOT_USERS = _parse_csv_set(_ENV.get("ALLOWED_BOT_USERS", ""))
 ALLOWED_BOT_IDS = _parse_csv_set(_ENV.get("ALLOWED_BOT_IDS", ""))
 WHITELIST_MODE = bool(ALLOWED_BOT_USERS or ALLOWED_BOT_IDS)
+
+# DM 里明确支持的消息子类型；其他（如 message_changed / message_deleted /
+# channel_join 等）一律只 ACK 不入队，并在日志里可见。
+SUPPORTED_IM_SUBTYPES = frozenset({None, "me_message"})
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -66,24 +74,70 @@ def _ssl_ctx():
         cafile=CA_BUNDLE if CA_BUNDLE and os.path.exists(CA_BUNDLE) else None)
 
 
-def append_inbox(record):
-    """Append one record with an exclusive lock. Skip duplicates."""
-    key = (record["channel"], record["ts"])
-    with open(INBOX_PATH, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    if (r.get("channel"), r.get("ts")) == key:
-                        return False  # duplicate
-                except Exception:
-                    continue
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            return True
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+def classify_event(event):
+    """Return "mention" | "dm" | None. Pure; no I/O.
+
+    Explicitly enumerates supported message subtypes so that edits,
+    deletes and other housekeeping events are never mistaken for new
+    messages.
+    """
+    etype = event.get("type")
+    if etype == "app_mention":
+        return "mention"
+    if etype == "message" and event.get("channel_type") == "im":
+        subtype = event.get("subtype")
+        if subtype not in SUPPORTED_IM_SUBTYPES:
+            return None  # e.g. message_changed / message_deleted: ignore
+        return "dm"
+    return None
+
+
+def is_own_message(event, me):
+    return bool(me) and event.get("user") == me
+
+
+def is_bot_message(event):
+    return bool(event.get("bot_id")) or event.get("subtype") == "bot_message"
+
+
+def bot_allowed(event):
+    """Other bots: default-allow (collab), or allowlist-only in whitelist mode."""
+    if not WHITELIST_MODE:
+        return True
+    return event.get("user") in ALLOWED_BOT_USERS \
+        or event.get("bot_id") in ALLOWED_BOT_IDS
+
+
+def build_record(event, kind):
+    """Minimal record. No API calls here -- name resolution is the
+    consumer's job (resolve.py), never on the ACK-critical path."""
+    channel = event.get("channel", "")
+    ts = event.get("ts", "")
+    return {
+        "msg_id": inbox_store.msg_id(channel, ts),
+        "channel": channel,
+        "user": event.get("user", ""),
+        "text": event.get("text", ""),
+        "kind": kind,                            # dm | mention
+        "ts": ts,
+        "thread_ts": event.get("thread_ts", ""),  # 原帖回复用
+        "received_at": time.time(),
+    }
+
+
+def process_event(event, me):
+    """Pure decision step (testable without Slack).
+
+    Returns ("queue", record) or ("ack_only", reason).
+    """
+    kind = classify_event(event)
+    if kind is None:
+        return ("ack_only", "not-subscribed-or-unsupported-subtype")
+    if is_own_message(event, me):
+        return ("ack_only", "own-message")
+    if is_bot_message(event) and not bot_allowed(event):
+        return ("ack_only", "bot-not-allowlisted")
+    return ("queue", build_record(event, kind))
 
 
 def main():
@@ -99,71 +153,31 @@ def main():
     from slack_sdk.socket_mode.response import SocketModeResponse
 
     web = WebClient(token=bot_token, **_proxy_kw(), ssl=_ssl_ctx())
-    me = web.auth_test().get("user_id")
-    logging.info("bridge starting, bot user %s", me)
-
-    names = {}
-
-    def disp_name(kind, id_):
-        if id_ in names:
-            return names[id_]
-        try:
-            if kind == "channel":
-                r = web.conversations_info(channel=id_)
-                n = r["channel"].get("name") or r["channel"].get("user") or id_
-            else:
-                r = web.users_info(user=id_)
-                p = r["user"].get("profile", {})
-                n = p.get("display_name") or p.get("real_name") or id_
-            names[id_] = n
-            return n
-        except Exception:
-            return id_
+    me = _ENV.get("SLACK_BOT_USER_ID") or web.auth_test().get("user_id")
+    logging.info("bridge starting, bot user %s (whitelist_mode=%s)",
+                 me, WHITELIST_MODE)
 
     def handle(client: SocketModeClient, req: SocketModeRequest):
         try:
-            # 先 ack，Slack 才不会重发
+            event = (req.payload or {}).get("event", {})
+            action, payload = process_event(event, me)
+            if action == "queue":
+                # 1) 先可靠落盘。失败则不 ACK，Slack 会重发，
+                #    msg_id 去重保证 at-least-once 不重复入队。
+                saved = inbox_store.append_record(payload)
+                logging.info("queued %s %s (duplicate=%s)",
+                             payload["kind"], payload["msg_id"], not saved)
+            else:
+                logging.debug("ack_only: %s", payload)
+        except Exception:
+            logging.exception("persist failed; withholding ACK for redelivery")
+            return  # no ACK -> Slack redelivers
+        # 2) 落盘成功后再 ACK（本地写盘毫秒级，远快于 Slack 的 ~3s ACK 时限）。
+        try:
             client.send_socket_mode_response(
                 SocketModeResponse(envelope_id=req.envelope_id))
-            event = (req.payload or {}).get("event", {})
-
-            kind = None
-            if req.type == "events_api" and event.get("type") == "app_mention":
-                kind = "mention"
-            elif (req.type == "events_api" and event.get("type") == "message"
-                    and event.get("channel_type") == "im"):
-                kind = "dm"
-            if not kind:
-                return
-
-            # 自己的消息永远丢弃（防自循环）；
-            # 其他 bot 默认放行（多 agent 协作）；白名单模式仅放行列出的 ID。
-            if event.get("user") == me:
-                return
-            is_bot_msg = bool(event.get("bot_id")) or \
-                event.get("subtype") == "bot_message"
-            if is_bot_msg and WHITELIST_MODE \
-                    and event.get("user") not in ALLOWED_BOT_USERS \
-                    and event.get("bot_id") not in ALLOWED_BOT_IDS:
-                return
-
-            record = {
-                "channel": event.get("channel", ""),
-                "channel_name": disp_name("channel", event.get("channel", "")),
-                "user": event.get("user", ""),
-                "user_name": disp_name("user", event.get("user", "")),
-                "text": event.get("text", ""),
-                "kind": kind,                            # dm | mention
-                "ts": event.get("ts", ""),
-                "thread_ts": event.get("thread_ts", ""),  # 原帖回复用
-                "received_at": time.time(),
-                "delivered": False,
-            }
-            if append_inbox(record):
-                logging.info("queued %s from %s in %s",
-                             kind, record["user_name"], record["channel_name"])
         except Exception:
-            logging.exception("handler error")
+            logging.exception("ack send failed")
 
     smc = SocketModeClient(app_token=app_token, web_client=web, **_proxy_kw())
     smc.socket_mode_request_listeners.append(handle)

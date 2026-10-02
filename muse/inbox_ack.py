@@ -1,37 +1,34 @@
-"""Mark inbox messages delivered by ts. 处理成功后调用，避免丢消息。
+"""Append ack tombstones for processed messages. 处理成功后调用。
 
-Usage: python inbox_ack.py <ts> [<ts> ...]
+Usage: python inbox_ack.py <channel:ts> [<channel:ts> ...]
+
+消息身份统一为 msg_id = "<channel>:<ts>"（与入队去重一致），
+跨频道同 ts 不会误确认。确认是追加 tombstone，不做原地重写，
+中途中断不会损坏已存消息。
+
+退出码：0 = 全部写入；非 0 = 失败（调用方不得视为已确认）。
 """
-import fcntl
-import json
-import os
 import sys
 
-INBOX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox.jsonl")
+import inbox_store
 
 
 def main():
-    want = set(sys.argv[1:])
-    if not want or not os.path.exists(INBOX_PATH):
-        return
-    with open(INBOX_PATH, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            out = []
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if r.get("ts") in want:
-                    r["delivered"] = True
-                out.append(json.dumps(r, ensure_ascii=False))
-            f.seek(0)
-            f.truncate()
-            f.write("\n".join(out) + "\n")
-            print("acked:", sorted(want))
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    args = sys.argv[1:]
+    if not args:
+        print("usage: inbox_ack.py <channel:ts> [<channel:ts> ...]",
+              file=sys.stderr)
+        sys.exit(2)
+    bad = [a for a in args if ":" not in a]
+    if bad:
+        print(f"invalid msg_id (want <channel:ts>): {bad}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        inbox_store.ack(args)
+    except Exception as e:
+        print(f"ack failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("acked:", sorted(args))
 
 
 if __name__ == "__main__":
