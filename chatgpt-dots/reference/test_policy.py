@@ -122,6 +122,27 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.decide(envelope(text)).reason, "missing_direct_mention")
 
+    def test_single_quotes_with_contractions_mask_mentions(self):
+        for opening, apostrophe, closing in (("'", "'", "'"), ("‘", "’", "’")):
+            quoted = f"{opening}Don{apostrophe}t {MENTION} reply{closing}"
+            with self.subTest(quote=opening):
+                self.assertEqual(self.decide(envelope(f"He said {quoted}")).reason,
+                                 "missing_direct_mention")
+                self.assertEqual(self.decide(envelope(quoted[:-1])).reason,
+                                 "missing_direct_mention")
+                self.assertTrue(self.decide(envelope(
+                    f"He said {quoted}. {MENTION} Can you review the wording?")).allowed)
+
+    def test_quoted_contractions_do_not_expose_test_markers(self):
+        for opening, apostrophe, closing in (("'", "'", "'"), ("‘", "’", "’")):
+            text = f"{MENTION} Review {opening}Don{apostrophe}t {MARKER} reuse{closing}?"
+            with self.subTest(quote=opening):
+                self.assertEqual(self.decide(envelope(text)).candidate.test_markers, ())
+                self.assertEqual(self.decide(envelope(text), kind="test").reason,
+                                 "missing_test_marker")
+                self.assertEqual(self.decide(envelope(f"{text} {MARKER}"), kind="test")
+                                 .candidate.test_markers, (MARKER,))
+
     def test_corner_quoted_mentions_do_not_trigger(self):
         for text in (f"「{MENTION} review?」", f"『{MENTION} review?』",
                      f"「unclosed {MENTION}", f"『unclosed {MENTION}"):
@@ -266,6 +287,20 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(self.ledger.reserve(later))
         different_marker = replace(later, test_markers=("BRIDGE_TEST_SYNTHETIC_002",))
         self.assertIsNotNone(self.ledger.reserve(different_marker))
+
+    def test_quoted_contraction_does_not_consume_marker(self):
+        for index, (opening, apostrophe, closing) in enumerate(
+                (("'", "'", "'"), ("‘", "’", "’"))):
+            with self.subTest(quote=opening):
+                ledger = Ledger(Path(self.directory.name) / f"quoted-{index}.sqlite")
+                question = envelope(
+                    f"{MENTION} Review {opening}Don{apostrophe}t {MARKER} reuse{closing}?")
+                candidate = evaluate(question, policy(), classification="question").candidate
+                self.assertIsNotNone(ledger.reserve(candidate))
+                actual_test = envelope(f"{MENTION} {MARKER}", ts="1000000000.000002")
+                actual_test["event_id"] = "EvSYNTHETIC0002"
+                candidate = evaluate(actual_test, policy(), classification="test").candidate
+                self.assertIsNotNone(ledger.reserve(candidate))
 
     def test_all_markers_are_reserved_atomically(self):
         first = replace(self.candidate, test_markers=(MARKER, "BRIDGE_TEST_SYNTHETIC_002"))

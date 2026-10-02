@@ -51,7 +51,8 @@ All Slack-looking identifiers and test markers in the tests are synthetic.
 4. A candidate requires an exact raw `<@TARGET_USER_ID>` mention outside code,
    quotes, and escapes. Display names and HTML-encoded mentions do not count.
    Supported quote forms are straight/smart single and double quotes, corner
-   quotes (`「」` and `『』`), and Slack `>`/`>>>` quotes. The conservative masking
+   quotes (`「」` and `『』`), and Slack `>`/`>>>` quotes. In-word apostrophes
+   (for example, `Don't` / `Don’t`) do not end an enclosing single quotation. The conservative masking
    is not a full Slack mrkdwn parser: other quotation conventions are unsupported,
    and malformed or unclosed quotes/code can cause false negatives. Mentions nested inside Slack
    links or other angle-bracket markup are suppressed. Unclosed angle-bracket
@@ -116,3 +117,9 @@ atomically commit a Slack API send and a database update, so this reference does
 disable automatic mention/link parsing and must not put original raw input into
 other blocks, attachments, or output fields. This helper does not authorize
 sharing message contents or sanitize every possible Slack API output structure.
+
+## Review evidence
+
+The [2026-10-02 review](../REVIEW-2026-10-02.md) records the baseline, a narrowly
+scoped single-quote contraction fix, and offline regression results. These checks
+do not validate any hosted DOTS runtime or live Slack deployment.
