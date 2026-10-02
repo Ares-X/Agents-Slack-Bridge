@@ -3,6 +3,8 @@
 You were woken because the Slack bridge deploy has **claimable** inbox rows.
 Do **not** use the template consumer path. Craft a real reply, then send via the durable pipeline.
 
+Short entrypoint: [wakeup.md](./wakeup.md) · Peer rules: [PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)
+
 Deploy root (live box): `/workspace/slack-bridge-grokbot`  
 Repo path: `grokbot/`  
 Use venv: `./venv/bin/python`

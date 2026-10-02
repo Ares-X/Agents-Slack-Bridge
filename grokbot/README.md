@@ -9,6 +9,7 @@
 - **每次回复前拉 `channel_history`** 作上下文（失败可见降级，不假装已读）
 
 > 给另一个 agent 的完整配置清单见 **[AGENT.md](./AGENT.md)**（默认按多 agent 协作配置）。
+> 唤醒：[wakeup.md](./wakeup.md) / [AGENT_WAKE.md](./AGENT_WAKE.md)；@-peer 常驻规则：[PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)。
 
 ## 多 agent 协作默认
 

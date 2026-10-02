@@ -12,6 +12,8 @@
 
 ## 多 agent 协作默认（必读）
 
+独立成文（wake 时优先）：[PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md) · 唤醒入口：[wakeup.md](./wakeup.md) / [AGENT_WAKE.md](./AGENT_WAKE.md)
+
 配置与回复行为按下列默认执行（除非用户明确要求收紧）：
 
 1. **允许其他 bot @ 本 bot**  
