@@ -4,29 +4,61 @@
 把每条消息以 JSON 行追加到 inbox.jsonl，供消费层（cron/轮询脚本/agent）
 读取处理。发送请用 send.py。
 
+可靠性顺序：先 durable 入队（flock + fsync），再 Socket Mode ACK。
+入队路径不做网络查名（channel_name/user_name 先留空或用 id）；
+若入队失败则不 ACK，让 Slack 重试；重复入队由 (channel, ts) 去重消化。
+
 Grok Bot 多 agent 频道协作默认：
   - 永远丢弃自己的 user_id（auth_test），防止自循环
   - 默认允许其他 bot 的 app_mention / 发言进入队列（不要改成丢弃全部 bot）
     （Grok Bot 与其他 agent 常在同一频道互相 @）
   - 若 .env 设置了 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔），
     则改为白名单模式：仅这些 bot 放行，其他 bot 丢弃（可选收紧）
+  - DM 的 edit/delete 等 subtype 显式过滤，避免空 user/text 任务绕过自过滤
   - 消费层配合：回复前 channel_history；REPLY_IN_THREAD=0 顶层可见
 
 配置：同目录 .env（0600），见 .env.example。
 依赖：pip install slack_sdk
 """
-import json
 import logging
 import os
 import ssl
 import sys
 import time
-import fcntl
+
+from inbox_store import append_record
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE, ".env")
 INBOX_PATH = os.path.join(BASE, "inbox.jsonl")
 LOG_PATH = os.path.join(BASE, "bridge.log")
+
+# DM subtypes that are not actionable user messages (empty/misleading user+text).
+DM_DROP_SUBTYPES = frozenset({
+    "message_changed",
+    "message_deleted",
+    "message_replied",
+    "tombstone",
+    "channel_join",
+    "channel_leave",
+    "channel_topic",
+    "channel_purpose",
+    "channel_name",
+    "channel_archive",
+    "channel_unarchive",
+    "group_join",
+    "group_leave",
+    "group_topic",
+    "group_purpose",
+    "group_name",
+    "group_archive",
+    "group_unarchive",
+    "bot_add",
+    "bot_remove",
+    "pinned_item",
+    "unpinned_item",
+    "ekm_access_denied",
+})
 
 
 def load_env(path):
@@ -74,23 +106,19 @@ def _ssl_ctx():
 
 
 def append_inbox(record):
-    """Append one record with an exclusive lock. Skip duplicates."""
-    key = (record["channel"], record["ts"])
-    with open(INBOX_PATH, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    if (r.get("channel"), r.get("ts")) == key:
-                        return False  # duplicate
-                except Exception:
-                    continue
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            return True
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    """Append one record durably. Skip duplicates on (channel, ts)."""
+    return append_record(INBOX_PATH, record)
+
+
+def should_drop_dm_event(event):
+    """True if this IM event should not become an inbox task."""
+    subtype = event.get("subtype") or ""
+    if subtype in DM_DROP_SUBTYPES:
+        return True
+    # Edits/deletes sometimes omit top-level user; never queue those.
+    if not event.get("user") and not event.get("bot_id"):
+        return True
+    return False
 
 
 def main():
@@ -112,31 +140,17 @@ def main():
         "bridge starting, bot user %s (whitelist_mode=%s)", me, WHITELIST_MODE
     )
 
-    names = {}
+    # Name lookup is intentionally NOT on the receive→ack path (network I/O
+    # would delay durable enqueue + Socket Mode ACK). Enrich offline if needed.
 
-    def disp_name(kind, id_):
-        if not id_:
-            return ""
-        if id_ in names:
-            return names[id_]
-        try:
-            if kind == "channel":
-                r = web.conversations_info(channel=id_)
-                n = r["channel"].get("name") or r["channel"].get("user") or id_
-            else:
-                r = web.users_info(user=id_)
-                p = r["user"].get("profile", {})
-                n = p.get("display_name") or p.get("real_name") or id_
-            names[id_] = n
-            return n
-        except Exception:
-            return id_
+    def ack(client: SocketModeClient, req: SocketModeRequest):
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=req.envelope_id))
 
     def handle(client: SocketModeClient, req: SocketModeRequest):
+        # Durable enqueue FIRST, then fast Socket Mode ACK.
+        # On failure before durable write: do NOT ack → Slack retries.
         try:
-            # 先 ack，Slack 才不会重发
-            client.send_socket_mode_response(
-                SocketModeResponse(envelope_id=req.envelope_id))
             event = (req.payload or {}).get("event", {})
 
             kind = None
@@ -146,10 +160,21 @@ def main():
                     and event.get("channel_type") == "im"):
                 kind = "dm"
             if not kind:
+                # Non-target events: ack so Slack stops delivering them.
+                ack(client, req)
+                return
+
+            if kind == "dm" and should_drop_dm_event(event):
+                logging.info(
+                    "drop dm subtype=%s user=%s",
+                    event.get("subtype"), event.get("user"),
+                )
+                ack(client, req)
                 return
 
             # Always drop self (prevent self-loop)
             if event.get("user") == me:
+                ack(client, req)
                 return
 
             is_bot_msg = bool(event.get("bot_id")) or \
@@ -159,26 +184,37 @@ def main():
                     # Only allow listed bot users / bot IDs
                     if (event.get("user") not in ALLOWED_BOT_USERS
                             and event.get("bot_id") not in ALLOWED_BOT_IDS):
+                        ack(client, req)
                         return
                 # else: allow any other bot (multi-agent channels)
 
+            ch = event.get("channel", "") or ""
+            uid = event.get("user", "") or ""
             record = {
-                "channel": event.get("channel", ""),
-                "channel_name": disp_name("channel", event.get("channel", "")),
-                "user": event.get("user", ""),
-                "user_name": disp_name("user", event.get("user", "")),
+                "channel": ch,
+                # ids first; names left empty for fast ACK (enrich later offline)
+                "channel_name": "",
+                "user": uid,
+                "user_name": "",
                 "text": event.get("text", ""),
                 "kind": kind,                            # dm | mention
                 "ts": event.get("ts", ""),
                 "thread_ts": event.get("thread_ts", ""),  # 原帖回复用
                 "received_at": time.time(),
                 "delivered": False,
+                "reply_status": None,  # None|retryable|sending|sent|uncertain
             }
-            if append_inbox(record):
+            # Durable write under lock+fsync; duplicate → still ACK.
+            appended = append_inbox(record)
+            ack(client, req)
+            if appended:
                 logging.info("queued %s from %s in %s",
-                             kind, record["user_name"], record["channel_name"])
+                             kind, uid or "?", ch or "?")
+            else:
+                logging.info("duplicate skip %s %s",
+                             record.get("channel"), record.get("ts"))
         except Exception:
-            logging.exception("handler error")
+            logging.exception("handler error (no ack — Slack may retry)")
 
     smc = SocketModeClient(app_token=app_token, web_client=web, **_proxy_kw())
     smc.socket_mode_request_listeners.append(handle)
