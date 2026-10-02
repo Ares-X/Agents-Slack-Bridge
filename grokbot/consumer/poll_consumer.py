@@ -241,6 +241,22 @@ def handle_one(m, sessions, *, runner=None):
         )
         return False
 
+    if status == "rate_limited":
+        import time as _time
+        try:
+            until = float(m.get("retry_after_until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        now = _time.time()
+        if now < until:
+            print(
+                f"rate-limited wait for {ch}:{ts}: "
+                f"{until - now:.1f}s remaining; not sending",
+                file=sys.stderr,
+            )
+            return False
+        # Wait expired → fall through to normal history + claim + send.
+
     sess = sessions.setdefault(ch, [])
     hist, hist_err = channel_history(ch)
     if hist_err:
@@ -277,6 +293,22 @@ def handle_one(m, sessions, *, runner=None):
                 flush=True,
             )
         return True
+    if outcome == "wait_rate_limit":
+        print(
+            f"rate-limited wait for {ch}:{ts}: "
+            f"{result.get('wait_sec', 0):.1f}s remaining "
+            f"(until {result.get('retry_after_until')}); not sending",
+            file=sys.stderr,
+        )
+        return False
+    if outcome == "rate_limited":
+        print(
+            f"rate-limited for {ch}:{ts}: retry after "
+            f"{result.get('retry_after_sec')}s "
+            f"(until {result.get('retry_after_until')})",
+            file=sys.stderr,
+        )
+        return False
     if outcome == "fail_retryable":
         print(
             f"send proven-not-sent for {ch}:{ts}: "

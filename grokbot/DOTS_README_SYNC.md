@@ -13,3 +13,4 @@
 9. **接收路径**：bridge 入队不做网络查名（快 ACK）。
 10. **测试**：`grokbot/tests/`；live Slack **NOT_EXERCISED**；无新第三方依赖。
 11. **Corrupt-tail repair** 用 temp+fsync+replace，崩溃不丢旧队列；Slack `internal_error`/`fatal_error` → uncertain；WebClient `retry_handlers=[]`；pending actionable 含 sent ack-only。
+12. **Rate limit**: HTTP 429 / ratelimited → `rate_limited` + `retry_after_until`; wait then retry; no hammer; internal_error 仍 uncertain。

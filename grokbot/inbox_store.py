@@ -23,6 +23,7 @@ AckKey = Tuple[str, str]  # (channel, ts)
 
 # reply_status values
 #   None/""/"retryable" — claimable for send
+#   "rate_limited"      — wait until retry_after_until, then claimable again
 #   "sending"           — durable in-flight claim (never blind-resend on restart)
 #   "sent"              — Slack send confirmed; ack only
 #   "uncertain"         — send outcome unknown; never blind-resend
@@ -40,6 +41,26 @@ def msg_key(record: dict) -> AckKey:
 
 def is_claimable(status) -> bool:
     return status in STATUS_CLAIMABLE or status is None
+
+
+def is_send_ready(record: dict, now: Optional[float] = None) -> bool:
+    """True if this undelivered row may be claimed for send right now.
+
+    rate_limited rows become ready only after retry_after_until (absolute epoch).
+    """
+    if record.get("delivered"):
+        return False
+    st = record.get("reply_status")
+    if is_claimable(st):
+        return True
+    if st == "rate_limited":
+        try:
+            until = float(record.get("retry_after_until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        tnow = time.time() if now is None else float(now)
+        return tnow >= until
+    return False
 
 
 def parse_ack_argv(argv: Sequence[str]) -> Set[AckKey]:
@@ -303,24 +324,25 @@ def peek_undelivered(path: str) -> List[dict]:
         _release_lock(lf)
 
 
-def peek_claimable(path: str) -> List[dict]:
-    """Undelivered rows whose reply_status is claimable (not sending/sent/uncertain)."""
+def peek_claimable(path: str, now: Optional[float] = None) -> List[dict]:
+    """Undelivered rows ready to send (claimable or rate_limited wait expired)."""
     out = []
     for r in peek_undelivered(path):
-        if is_claimable(r.get("reply_status")):
+        if is_send_ready(r, now=now):
             out.append(r)
     return out
 
 
 def peek_actionable(path: str) -> List[dict]:
-    """Undelivered rows for fallback: claimable OR sent (ack-only recovery).
+    """Undelivered rows for fallback: claimable, rate_limited, or sent (ack-only).
 
-    Excludes sending/uncertain (no auto-resend).
+    Excludes sending/uncertain (no auto-resend). rate_limited is included so
+    process_one can honor wait (skip) or send after expiry — no hammering.
     """
     out = []
     for r in peek_undelivered(path):
         st = r.get("reply_status")
-        if is_claimable(st) or st == "sent":
+        if is_claimable(st) or st in ("sent", "rate_limited"):
             out.append(r)
     return out
 
@@ -392,7 +414,7 @@ def claim_for_send(
 ) -> bool:
     """Atomically claim a message for sending (reply_status → sending).
 
-    Only succeeds if undelivered and reply_status claimable.
+    Only succeeds if undelivered and is_send_ready (incl. rate_limited after wait).
     If durable persist fails, raises — caller must NOT send.
     Returns True iff this caller owns the claim.
     """
@@ -413,11 +435,14 @@ def _claim_for_send_locked(path: str, key: AckKey, token: str) -> bool:
                 break
         if hit is None or hit.get("delivered"):
             return False
-        if not is_claimable(hit.get("reply_status")):
+        if not is_send_ready(hit):
             return False
         hit["reply_status"] = "sending"
         hit["claim_id"] = token
         hit["claim_at"] = time.time()
+        # Clear prior rate-limit fields once we re-claim after wait.
+        hit.pop("retry_after_until", None)
+        hit.pop("retry_after_sec", None)
         _atomic_rewrite(path, rows)
         return True
     finally:

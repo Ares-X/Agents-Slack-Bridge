@@ -522,3 +522,134 @@ class TestPendingAckOnlyRecovery(unittest.TestCase):
             self.assertEqual(r["outcome"], "acked")
             self.assertEqual(sends, [])
             self.assertEqual(peek_undelivered(inbox), [])
+
+
+class TestRateLimitRecovery(unittest.TestCase):
+    """Behavioral: rate-limit → wait (no send) → after expiry send+ACK; no dup."""
+
+    def test_classify_rate_limited(self):
+        self.assertEqual(
+            rp.classify_send_result(
+                _fake(3, "sent ok: False", "rate_limited: retry_after=30")
+            ),
+            "rate_limited",
+        )
+        # Must not become uncertain
+        self.assertNotEqual(
+            rp.classify_send_result(
+                _fake(3, "", "rate_limited: retry_after=1")
+            ),
+            "uncertain",
+        )
+
+    def test_classify_slack_rate_limit_helpers(self):
+        import send as send_mod
+        self.assertEqual(
+            send_mod.classify_slack_api_error("ratelimited"), "rate_limited"
+        )
+        self.assertEqual(
+            send_mod.classify_slack_api_error("rate_limited"), "rate_limited"
+        )
+        self.assertEqual(
+            send_mod.classify_slack_api_error("x", status_code=429), "rate_limited"
+        )
+        # Still uncertain for ambiguous
+        self.assertEqual(
+            send_mod.classify_slack_api_error("internal_error"), "uncertain"
+        )
+        # Retry-After extraction
+        class Resp:
+            headers = {"Retry-After": "42"}
+            def get(self, k, default=None):
+                return default
+        self.assertEqual(send_mod.extract_retry_after_seconds(Resp()), 42.0)
+
+    def test_rate_limit_wait_then_success_no_duplicate(self):
+        clock = {"t": 1000.0}
+
+        def now():
+            return clock["t"]
+
+        with tempfile.TemporaryDirectory() as d:
+            inbox = os.path.join(d, "inbox.jsonl")
+            append_record(inbox, {
+                "channel": "C1", "ts": "10.1", "text": "ping",
+                "user": "U1", "delivered": False, "reply_status": None,
+            })
+            sends = []
+
+            def runner(*args, input_text=None):
+                sends.append({"t": clock["t"], "text": input_text})
+                if len(sends) == 1:
+                    return _fake(3, "sent ok: False", "rate_limited: retry_after=30")
+                return _fake(0, "sent ok: True ts: 99.0")
+
+            m = peek_undelivered(inbox)[0]
+            r1 = rp.process_one(
+                inbox, m, "hi", runner=runner, time_fn=now,
+            )
+            self.assertEqual(r1["outcome"], "rate_limited")
+            self.assertEqual(r1["retry_after_sec"], 30.0)
+            self.assertEqual(r1["retry_after_until"], 1030.0)
+            self.assertEqual(len(sends), 1)
+
+            m2 = peek_undelivered(inbox)[0]
+            self.assertEqual(m2["reply_status"], "rate_limited")
+
+            # During wait — no send
+            r2 = rp.process_one(
+                inbox, m2, "hi", runner=runner, time_fn=now,
+            )
+            self.assertEqual(r2["outcome"], "wait_rate_limit")
+            self.assertEqual(len(sends), 1)
+
+            # Still during wait (advance but not enough)
+            clock["t"] = 1029.0
+            m3 = peek_undelivered(inbox)[0]
+            r3 = rp.process_one(
+                inbox, m3, "hi", runner=runner, time_fn=now,
+            )
+            self.assertEqual(r3["outcome"], "wait_rate_limit")
+            self.assertEqual(len(sends), 1)
+
+            # After expiry — send + ACK
+            clock["t"] = 1030.0
+            m4 = peek_undelivered(inbox)[0]
+            from inbox_store import is_send_ready
+            self.assertTrue(is_send_ready(m4, now=clock["t"]))
+            r4 = rp.process_one(
+                inbox, m4, "hi", runner=runner, time_fn=now,
+            )
+            self.assertIn(r4["outcome"], ("sent_acked", "sent_ack_pending"))
+            self.assertEqual(len(sends), 2)
+
+            # No further undelivered / no duplicate send
+            self.assertEqual(peek_undelivered(inbox), [])
+            r5 = rp.process_one(
+                inbox,
+                {"channel": "C1", "ts": "10.1", "delivered": True,
+                 "reply_status": "sent"},
+                "hi", runner=runner, time_fn=now,
+            )
+            self.assertEqual(r5["outcome"], "already_delivered")
+            self.assertEqual(len(sends), 2)
+
+    def test_internal_error_still_no_resend_after_rate_limit_fix(self):
+        """Regression: ambiguous errors remain uncertain forever."""
+        with tempfile.TemporaryDirectory() as d:
+            inbox = os.path.join(d, "inbox.jsonl")
+            append_record(inbox, {
+                "channel": "C1", "ts": "1", "text": "x",
+                "delivered": False, "reply_status": None,
+            })
+            sends = []
+
+            def runner(*args, input_text=None):
+                sends.append(1)
+                return _fake(2, "", "send_error: slack_api internal_error")
+
+            r1 = rp.process_one(inbox, peek_undelivered(inbox)[0], "a", runner=runner)
+            self.assertEqual(r1["outcome"], "uncertain")
+            r2 = rp.process_one(inbox, peek_undelivered(inbox)[0], "a", runner=runner)
+            self.assertEqual(r2["outcome"], "no_resend")
+            self.assertEqual(len(sends), 1)

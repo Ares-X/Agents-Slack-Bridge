@@ -5,13 +5,13 @@ Usage:
 正文走 stdin，避免进 shell 历史。
 
 Outcome lines (stdout/stderr) for consumer classification:
-  sent ok: True …     — Slack accepted (ok)
-  sent ok: False …    — Slack rejected with proven-not-sent error (retryable)
-  not_sent: <reason>  — failed before/without accepting post (retryable)
-  send_error: <…>     — ambiguous / possible partial success → uncertain
+  sent ok: True …              — Slack accepted (ok)
+  sent ok: False …             — proven rejection (retryable)
+  not_sent: <reason>           — failed before accept (retryable)
+  rate_limited: retry_after=N  — HTTP 429 / ratelimited; retry AFTER wait
+  send_error: <…>              — ambiguous / partial success → uncertain
 
-WebClient is constructed with retry_handlers=[] so a post that is accepted
-then disconnects is NOT retried inside one claim (would double-post).
+WebClient uses retry_handlers=[] (no SDK auto-retry → no double POST).
 """
 import os
 import ssl
@@ -19,8 +19,9 @@ import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
+DEFAULT_RETRY_AFTER_SEC = 60.0
+
 # Slack API errors that PROVE the message was not posted (safe to auto-retry).
-# internal_error / fatal_error / unknown codes → uncertain (may be after accept).
 PROVEN_NOT_SENT_SLACK_ERRORS = frozenset({
     "channel_not_found",
     "not_in_channel",
@@ -48,6 +49,8 @@ PROVEN_NOT_SENT_SLACK_ERRORS = frozenset({
     "cant_update_message",
 })
 
+RATE_LIMIT_SLACK_ERRORS = frozenset({"ratelimited", "rate_limited"})
+
 
 def load_env(path):
     d = {}
@@ -73,12 +76,49 @@ def build_web_client(token, *, proxy=None, ssl_context=None):
     return WebClient(**kw)
 
 
-def classify_slack_api_error(err_code: str) -> str:
-    """Return 'not_sent' or 'uncertain' for a Slack API error string."""
+def extract_retry_after_seconds(response, default: float = DEFAULT_RETRY_AFTER_SEC) -> float:
+    """Parse Retry-After from Slack response headers or body; seconds >= 0."""
+    if response is None:
+        return float(default)
+    # Header (HTTP 429)
+    headers = getattr(response, "headers", None) or {}
+    raw = None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        raw = None
+    if raw is None and hasattr(response, "get"):
+        # body field sometimes present
+        try:
+            raw = response.get("retry_after")
+        except Exception:
+            raw = None
+    if raw is None:
+        return float(default)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def classify_slack_api_error(err_code: str, *, status_code=None) -> str:
+    """Return 'not_sent' | 'rate_limited' | 'uncertain'."""
     code = (err_code or "").strip()
+    try:
+        sc = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        sc = None
+    if sc == 429 or code in RATE_LIMIT_SLACK_ERRORS:
+        return "rate_limited"
     if code in PROVEN_NOT_SENT_SLACK_ERRORS or code == "ok_false":
         return "not_sent"
     return "uncertain"
+
+
+def _emit_rate_limited(response, err_code: str) -> None:
+    sec = extract_retry_after_seconds(response)
+    print(f"rate_limited: retry_after={sec}", file=sys.stderr)
+    print("sent ok: False")
 
 
 def main():
@@ -121,11 +161,23 @@ def main():
         r = c.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
     except SlackApiError as e:
         err = ""
+        status_code = None
+        resp = getattr(e, "response", None)
         try:
-            err = e.response.get("error") if e.response is not None else str(e)
+            if resp is not None:
+                err = resp.get("error") if hasattr(resp, "get") else ""
+                status_code = getattr(resp, "status_code", None)
+                if status_code is None and hasattr(resp, "get"):
+                    # some slack_sdk versions expose status_code on response
+                    status_code = getattr(resp, "status_code", None)
         except Exception:
             err = str(e)
-        kind = classify_slack_api_error(str(err))
+        if not err:
+            err = str(e)
+        kind = classify_slack_api_error(str(err), status_code=status_code)
+        if kind == "rate_limited":
+            _emit_rate_limited(resp, str(err))
+            sys.exit(3)
         if kind == "not_sent":
             print(f"not_sent: slack_api {err}", file=sys.stderr)
             print("sent ok: False")
@@ -142,7 +194,11 @@ def main():
     print("sent ok:", ok, "ts:", r.get("ts"))
     if not ok:
         err = str(r.get("error") or "ok_false")
-        if classify_slack_api_error(err) == "uncertain":
+        kind = classify_slack_api_error(err)
+        if kind == "rate_limited":
+            _emit_rate_limited(r, err)
+            sys.exit(3)
+        if kind == "uncertain":
             print(f"send_error: slack_api {err}", file=sys.stderr)
             sys.exit(2)
         print(f"not_sent: {err}", file=sys.stderr)

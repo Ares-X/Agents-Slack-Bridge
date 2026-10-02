@@ -5,58 +5,70 @@ Rules:
      fails → do NOT send.
   2. On restart, stale sending → uncertain (escalate_stale_sending); never
      direct resend.
-  3. classify_send_result: ONLY auto-retry when output PROVES not sent
-     (not_sent: / sent ok: False). Everything else → uncertain.
+  3. classify_send_result:
+       - ok / fail (proven not_sent) / rate_limited / uncertain
+       - rate_limited → wait until retry_after_until, then retry (no hammer)
+       - internal_error/fatal_error/unknown → uncertain (no auto-resend)
   4. sent → ack only on later rounds; uncertain/sending → never blind-resend.
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+import time
 import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 
 from inbox_store import (
     ack_keys,
     claim_for_send,
     escalate_stale_sending,
     is_claimable,
+    is_send_ready,
     msg_key,
     set_reply_status,
 )
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-
-# Slack API codes that must NEVER auto-retry even if mis-tagged not_sent.
 _AMBIGUOUS_SLACK_API = frozenset({"internal_error", "fatal_error"})
+_DEFAULT_RETRY_AFTER = 60.0
+_RETRY_AFTER_RE = re.compile(
+    r"rate_limited:\s*retry_after=([0-9]+(?:\.[0-9]+)?)", re.I
+)
+
+
+def parse_retry_after_seconds(text: str, default: float = _DEFAULT_RETRY_AFTER) -> float:
+    m = _RETRY_AFTER_RE.search(text or "")
+    if not m:
+        return float(default)
+    try:
+        return max(0.0, float(m.group(1)))
+    except ValueError:
+        return float(default)
 
 
 def classify_send_result(proc) -> str:
-    """Return 'ok' | 'fail' | 'uncertain'.
-
-    fail = proven NOT sent (safe to release claim → retryable).
-    uncertain = anything that does not prove absence of a successful post
-                (incl. nonzero exit without not_sent / success text,
-                 and Slack internal_error/fatal_error).
-    """
+    """Return 'ok' | 'fail' | 'rate_limited' | 'uncertain'."""
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
     out = stdout + stderr
     if proc.returncode == 0 and "sent ok: True" in stdout:
         return "ok"
-    # Ambiguous Slack server errors → uncertain (may be after partial success).
+    # Rate limit before ambiguous / not_sent checks.
+    if "rate_limited:" in out or proc.returncode == 3:
+        # Don't treat as uncertain even if send_error also present.
+        if "rate_limited:" in out or "ratelimited" in out.lower():
+            return "rate_limited"
     for code in _AMBIGUOUS_SLACK_API:
         if f"slack_api {code}" in out:
             return "uncertain"
-    # Proven not sent — safe to retry after releasing claim.
     if "not_sent:" in out:
         return "fail"
-    if "sent ok: False" in stdout and "send_error:" not in out:
+    if "sent ok: False" in stdout and "send_error:" not in out and "rate_limited:" not in out:
         return "fail"
-    # Nonzero exit with no proof → UNCERTAIN (Slack may have accepted then
-    # client timed out). Never treat as fail.
     return "uncertain"
 
 
@@ -90,10 +102,11 @@ def process_one(
     root: str = ROOT,
     runner: Optional[Callable[..., Any]] = None,
     escalate_sending: bool = False,
+    time_fn: Callable[[], float] = time.time,
 ) -> Dict[str, Any]:
     """Claim → send → mark status → ack.
 
-    Returns dict with keys: action, outcome, detail.
+    time_fn is injectable for rate-limit wait tests (mocked clock).
     """
     if escalate_sending:
         escalate_stale_sending(inbox_path)
@@ -101,6 +114,7 @@ def process_one(
     key = msg_key(message)
     ch, ts = key
     status = message.get("reply_status")
+    now = float(time_fn())
 
     if message.get("delivered"):
         return {"action": "skip", "outcome": "already_delivered"}
@@ -114,14 +128,27 @@ def process_one(
         }
 
     if status in ("uncertain", "sending"):
-        # sending without escalate: treat as no-resend (verify path).
         return {
             "action": "skip",
             "outcome": "no_resend",
             "detail": status,
         }
 
-    if not is_claimable(status):
+    if status == "rate_limited":
+        try:
+            until = float(message.get("retry_after_until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if now < until:
+            return {
+                "action": "skip",
+                "outcome": "wait_rate_limit",
+                "retry_after_until": until,
+                "wait_sec": until - now,
+            }
+        # Wait expired — fall through to claim+send (is_send_ready True).
+
+    if not is_send_ready(message, now=now) and not is_claimable(status):
         return {"action": "skip", "outcome": "not_claimable", "detail": status}
 
     token = uuid.uuid4().hex
@@ -136,7 +163,6 @@ def process_one(
     if not claimed:
         return {"action": "skip", "outcome": "claim_lost"}
 
-    # Claim durable — only now may we send.
     tt = None
     if reply_in_thread:
         tt = (thread_ts or message.get("thread_ts") or message.get("ts") or "").strip() or None
@@ -154,7 +180,6 @@ def process_one(
     if outcome == "ok":
         n, missing = set_reply_status(inbox_path, {key}, "sent")
         if n == 0 or missing:
-            # Send ok but status persist failed → uncertain (no blind resend).
             try:
                 set_reply_status(
                     inbox_path, {key}, "uncertain",
@@ -174,8 +199,29 @@ def process_one(
             "stdout": proc.stdout,
         }
 
+    if outcome == "rate_limited":
+        out = (proc.stdout or "") + (proc.stderr or "")
+        sec = parse_retry_after_seconds(out)
+        until = float(time_fn()) + sec
+        set_reply_status(
+            inbox_path, {key}, "rate_limited",
+            extra_fields={
+                "retry_after_sec": sec,
+                "retry_after_until": until,
+                "last_send_error": out[:300],
+            },
+        )
+        return {
+            "action": "send",
+            "outcome": "rate_limited",
+            "retry_after_sec": sec,
+            "retry_after_until": until,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "returncode": proc.returncode,
+        }
+
     if outcome == "fail":
-        # Proven not sent — release claim to retryable.
         set_reply_status(
             inbox_path, {key}, "retryable",
             extra_fields={"last_send_error": (proc.stderr or proc.stdout or "")[:300]},
