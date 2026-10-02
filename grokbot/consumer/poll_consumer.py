@@ -3,14 +3,22 @@
 多 agent 协作默认（可用 .env 覆盖）：
   - SLACK_BRIDGE_POLL_SEC=5
   - REPLY_IN_THREAD=0 → 频道顶层回复（不传 --thread-ts；同伴看得见）
-  - 每条消息回复前先 channel_history（上下文）
+  - REPLY_IN_THREAD=1 → 跟帖：thread_ts 优先，否则用消息自身 ts（顶层开帖）
+  - 每条消息回复前先 channel_history（上下文）；失败时可见降级，不假装读过
   - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test；勿 @ 自己、防回环
 
+发送 / ack 状态机（避免 ack 失败导致双发）：
+  - reply_status 空 → 尝试 send；成功则 durable 标 reply_status=sent 再 ack
+  - reply_status=sent 且未 delivered → 只重试 ack，不再 send
+  - reply_status=uncertain → 不盲发、不 ack；需人工/上层处理
+  - inbox_ack 用 (channel, ts)，与去重一致
+
 会话历史落在 consumer/channel_sessions.json。
-脚本在 consumer/ 下，inbox_peek / send / channel_history 在上一层 grokbot/，
+脚本在 consumer/ 下，inbox_* / send / channel_history 在上一层 grokbot/，
 因此 ROOT = dirname(BASE)，所有子进程 cwd=ROOT。
 
-把 generate_reply() 换成 LLM API 或 wake your Grok Bot agent（须使用 history）。
+★ generate_reply() 是模板 stub，不是已接线的 Grok 模型。
+  「模板回过一次」≠ Agent / LLM 集成完成；换成真实 LLM 后仍须使用 history。
 """
 import json
 import os
@@ -24,6 +32,13 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)  # grokbot/
 SESSIONS_PATH = os.path.join(BASE, "channel_sessions.json")
 ENV_PATH = os.path.join(ROOT, ".env")
+INBOX_PATH = os.path.join(ROOT, "inbox.jsonl")
+
+# Allow `from inbox_store import ...` when run as script from consumer/
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from inbox_store import ack_keys, msg_key, set_reply_status  # noqa: E402
 
 
 def load_env(path):
@@ -113,36 +128,62 @@ def save_sessions(s):
 
 
 def channel_history(channel, limit=15):
-    """回复前拉历史做上下文（失败返回空，不阻塞）。"""
+    """回复前拉历史做上下文。
+
+    Returns (messages, error_or_None).
+    Preserves real errors from subprocess / error JSON; never pretends success.
+    """
     r = sh(sys.executable, "channel_history.py", channel, str(limit))
     out = []
-    for line in r.stdout.splitlines():
+    err = None
+    if r.returncode != 0:
+        err = (
+            f"history subprocess exit {r.returncode}: "
+            f"{(r.stderr or r.stdout or '').strip()[:300]}"
+        )
+    for line in (r.stdout or "").splitlines():
         try:
             m = json.loads(line)
-            if "error" not in m:
-                out.append(m)
         except Exception:
             continue
-    return out
+        if "error" in m:
+            err = str(m.get("error") or "history error")
+            continue
+        out.append(m)
+    if err and not out:
+        return [], err
+    if err and out:
+        # Partial: keep messages but surface the error too.
+        return out, err
+    return out, None
 
 
 def strip_mentions(text):
     return re.sub(r"<@[^>]+>", "", text or "").strip()
 
 
-def generate_reply(channel, message, session, history):
-    """短上下文感知模板回复。
+def thread_target(message):
+    """For REPLY_IN_THREAD=1: existing thread_ts else message ts (start thread)."""
+    return (message.get("thread_ts") or message.get("ts") or "").strip()
+
+
+def generate_reply(channel, message, session, history, history_error=None):
+    """短上下文感知模板回复（stub，非 Grok 模型接线）。
 
     ★ replace with LLM API or wake your Grok Bot agent.
     不要硬编码真实 bot user ID；需要 @ 其他 agent 时用占位符，例如 <@U_PEER_BOT_ID>。
+    若 history_error：不得声称「已读上下文」。
     """
     text = strip_mentions(message.get("text") or "")
     user = message.get("user_name") or message.get("user") or "someone"
 
+    degrade = ""
+    if history_error:
+        degrade = f"（注意：频道历史读取失败，本次无上下文：{history_error[:120]}）"
+
     # 最近非自己的历史作上下文提示
     ctx = []
     for h in history[-10:]:
-        # channel_history 行有 user_name / text / is_bot；兼容 user 字段
         uname = h.get("user_name") or h.get("user") or ""
         if ME and (h.get("user") == ME or uname == ME):
             continue
@@ -153,16 +194,27 @@ def generate_reply(channel, message, session, history):
 
     low = text.lower()
     if "上下文" in text or "聊天记录" in text or "互相交流" in text:
+        if history_error:
+            return (
+                "收到。我本应拉本频道最近消息再回，但这次历史读取失败，"
+                f"没有可用上下文。{degrade}"
+            )
         return (
             "收到。我会在被 @ 时先拉本频道最近消息再回；"
             "只在被点名时发言，不 @ 自己，避免回环。"
         )
     if "认识" in text or "你是谁" in text or "who are you" in low:
-        return "我是 Grok Bot。被 @ 就会回；能拉频道历史当上下文。"
+        base = "我是 Grok Bot。被 @ 就会回；能拉频道历史当上下文。"
+        return base + (degrade and (" " + degrade) or "")
     if not text:
-        return f"在，{user}。"
+        return f"在，{user}。" + (degrade and (" " + degrade) or "")
 
     hint = ctx[-1] if ctx else ""
+    if history_error:
+        return (
+            f"收到「{text[:120]}」。{degrade} "
+            "说下你要我具体做什么。"
+        )
     if hint and hint != text:
         return (
             f"看到了频道上下文。关于「{text[:120]}」："
@@ -171,10 +223,149 @@ def generate_reply(channel, message, session, history):
     return f"收到。你要我针对「{text[:120]}」做什么？"
 
 
+def _ack_message(m):
+    """Ack by (channel, ts). Returns True on success (exit 0)."""
+    ch, ts = msg_key(m)
+    if not ch or not ts:
+        print(f"ack skipped: missing channel/ts in {m!r}", file=sys.stderr)
+        return False
+    n, missing = ack_keys(INBOX_PATH, {(ch, ts)})
+    if n > 0 and not missing:
+        return True
+    # Also try CLI for visibility in logs when library path differs
+    r = sh(sys.executable, "inbox_ack.py", ch, ts)
+    ok = r.returncode == 0
+    if not ok:
+        print(
+            f"ack failed for {ch}:{ts} rc={r.returncode} "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}",
+            file=sys.stderr,
+        )
+    return ok
+
+
+def _mark_reply_status(m, status):
+    ch, ts = msg_key(m)
+    n, missing = set_reply_status(INBOX_PATH, {(ch, ts)}, status)
+    if n == 0 or missing:
+        print(
+            f"mark reply_status={status} failed for {ch}:{ts} "
+            f"(matched={n}, missing={missing})",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def classify_send_result(proc):
+    """Return 'ok' | 'fail' | 'uncertain' from send.py subprocess result."""
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode == 0 and "sent ok: True" in (proc.stdout or ""):
+        return "ok"
+    if proc.returncode != 0 and "sent ok: True" not in out:
+        return "fail"
+    # Nonzero with success text, or zero without clear success → uncertain
+    if "sent ok: True" in out and proc.returncode != 0:
+        return "uncertain"
+    if proc.returncode == 0 and "sent ok:" in (proc.stdout or ""):
+        # e.g. sent ok: False
+        if "sent ok: True" not in (proc.stdout or ""):
+            return "fail"
+    return "uncertain"
+
+
+def handle_one(m, sessions):
+    """Process one undelivered message. Returns True if newly replied this round."""
+    if ME and m.get("user") == ME:
+        _ack_message(m)
+        return False
+
+    status = m.get("reply_status")
+    ch = m.get("channel") or ""
+    ts = m.get("ts") or ""
+    label = m.get("channel_name") or ch
+
+    # Already sent: only retry ack (do not resend).
+    if status == "sent":
+        if _ack_message(m):
+            print(f"acked prior send in {label} ({ch}:{ts})", flush=True)
+        return False
+
+    # Uncertain prior send: do not blindly resend.
+    if status == "uncertain":
+        print(
+            f"skip uncertain send outcome for {ch}:{ts} "
+            f"(manual check; will not resend)",
+            file=sys.stderr,
+        )
+        return False
+
+    sess = sessions.setdefault(ch, [])
+    hist, hist_err = channel_history(ch)
+    if hist_err:
+        print(f"history degrade for {ch}: {hist_err}", file=sys.stderr)
+
+    try:
+        reply = generate_reply(ch, m, sess, hist, history_error=hist_err)
+        cmd = [sys.executable, "send.py", ch]
+        if REPLY_IN_THREAD:
+            tt = thread_target(m)
+            if tt:
+                cmd += ["--thread-ts", tt]
+        r = sh(*cmd, input_text=reply)
+        outcome = classify_send_result(r)
+        if outcome == "ok":
+            if not _mark_reply_status(m, "sent"):
+                # Send succeeded but could not persist status → treat as uncertain
+                # to avoid double-send on next loop if ack also fails.
+                print(
+                    f"send ok but status mark failed for {ch}:{ts}; "
+                    f"will not blind-resend",
+                    file=sys.stderr,
+                )
+                return False
+            sess.append({"role": "user", "text": m.get("text")})
+            sess.append({"role": "assistant", "text": reply})
+            sessions[ch] = sess[-40:]
+            if _ack_message(m):
+                print(f"replied in {label}", flush=True)
+            else:
+                print(
+                    f"replied in {label} but ack failed "
+                    f"(will retry ack only next round)",
+                    flush=True,
+                )
+            return True
+        if outcome == "fail":
+            print(
+                f"send failed for {ch}:{ts}: {r.stdout} {r.stderr}",
+                file=sys.stderr,
+            )
+            return False
+        # uncertain
+        _mark_reply_status(m, "uncertain")
+        print(
+            f"send outcome uncertain for {ch}:{ts}: "
+            f"rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}; "
+            f"will NOT resend",
+            file=sys.stderr,
+        )
+        return False
+    except Exception as e:
+        # Exception after possible partial send → mark uncertain, do not resend.
+        _mark_reply_status(m, "uncertain")
+        print(f"error handling {ch}:{ts}: {e}", file=sys.stderr)
+        return False
+
+
 def main():
     print(
         f"grokbot consumer polling every {POLL_INTERVAL}s "
         f"(REPLY_IN_THREAD={REPLY_IN_THREAD}, me={ME or 'auto-pending'}, ROOT={ROOT})",
+        flush=True,
+    )
+    print(
+        "NOTE: generate_reply() is a template stub — not auto-wired to Grok models.",
         flush=True,
     )
     while True:
@@ -183,33 +374,7 @@ def main():
             if msgs:
                 sessions = load_sessions()
                 for m in msgs:
-                    # skip self if somehow queued
-                    if ME and m.get("user") == ME:
-                        sh(sys.executable, "inbox_ack.py", m["ts"])
-                        continue
-                    ch = m["channel"]
-                    sess = sessions.setdefault(ch, [])
-                    hist = channel_history(ch)
-                    try:
-                        reply = generate_reply(ch, m, sess, hist)
-                        cmd = [sys.executable, "send.py", ch]
-                        # Grok 默认顶层回复；仅当 REPLY_IN_THREAD 且有 thread_ts 才跟帖
-                        if REPLY_IN_THREAD and m.get("thread_ts"):
-                            cmd += ["--thread-ts", m["thread_ts"]]
-                        r = sh(*cmd, input_text=reply)
-                        if "sent ok: True" in r.stdout:
-                            sess.append({"role": "user", "text": m["text"]})
-                            sess.append({"role": "assistant", "text": reply})
-                            sessions[ch] = sess[-40:]
-                            sh(sys.executable, "inbox_ack.py", m["ts"])
-                            print(f"replied in {m.get('channel_name', ch)}", flush=True)
-                        else:
-                            print(
-                                f"send failed for {m['ts']}: {r.stdout} {r.stderr}",
-                                file=sys.stderr,
-                            )
-                    except Exception as e:
-                        print(f"error handling {m.get('ts')}: {e}", file=sys.stderr)
+                    handle_one(m, sessions)
                 save_sessions(sessions)
         except Exception as e:
             print(f"poll error: {e}", file=sys.stderr)

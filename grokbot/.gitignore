@@ -1,0 +1,11 @@
+# runtime (also covered by root .gitignore patterns)
+.env
+inbox.jsonl
+inbox.jsonl.lock
+inbox.jsonl.tmp.*
+pending.json
+*.log
+venv/
+consumer/channel_sessions.json
+__pycache__/
+*.pyc

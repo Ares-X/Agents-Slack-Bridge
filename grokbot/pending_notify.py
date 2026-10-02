@@ -4,33 +4,25 @@
 agent 定时读 pending.json → 生成回复 → send.py → inbox_ack.py。
 比本地 consumer 慢（分钟级），但是纯 agent 侧 fallback。
 
+Ack identity = channel + ts（与去重一致），例如：
+  python inbox_ack.py <channel> <ts>
+  python inbox_ack.py <channel>:<ts>
+
 Usage (from grokbot/):
   python pending_notify.py
 → 写出 pending.json，stdout 打印未处理条数。
 """
-import fcntl
 import json
 import os
 import time
+
+from inbox_store import peek_undelivered
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 INBOX = os.path.join(BASE, "inbox.jsonl")
 PENDING = os.path.join(BASE, "pending.json")
 
-rows = []
-if os.path.exists(INBOX):
-    with open(INBOX) as f:
-        fcntl.flock(f, fcntl.LOCK_SH)
-        try:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if not r.get("delivered"):
-                    rows.append(r)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+rows = peek_undelivered(INBOX)
 
 with open(PENDING, "w") as f:
     json.dump({"updated_at": time.time(), "items": rows}, f, ensure_ascii=False, indent=2)

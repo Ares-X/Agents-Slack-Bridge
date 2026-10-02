@@ -1,7 +1,8 @@
 """Print recent messages of a channel as compact JSON lines (chronological).
 
 Usage: python channel_history.py <channel> [limit]
-给回复生成提供上下文用。失败时输出 {"error": ...}，调用方应如实报告失败、不编造。
+给回复生成提供上下文用。失败时输出 {"error": ...} 并 exit 1；
+调用方应如实报告失败、不编造、不假装已读上下文。
 """
 import json
 import os
@@ -35,6 +36,10 @@ def main():
     proxy = env.get("PROXY_URL") or None
     ca = env.get("CA_BUNDLE") or None
 
+    if not env.get("SLACK_BOT_TOKEN"):
+        print(json.dumps({"error": "missing SLACK_BOT_TOKEN"}))
+        sys.exit(1)
+
     from slack_sdk.web import WebClient
     ctx = ssl.create_default_context(
         cafile=ca if ca and os.path.exists(ca) else None)
@@ -42,15 +47,19 @@ def main():
                   **({"proxy": proxy} if proxy else {}), ssl=ctx)
 
     msgs = None
+    last_err = None
     for _ in range(5):
         try:
             msgs = c.conversations_history(channel=channel, limit=limit)["messages"]
             break
-        except Exception:
+        except Exception as e:
+            last_err = e
             time.sleep(3)
     if msgs is None:
-        print(json.dumps({"error": "history fetch failed"}))
-        return
+        print(json.dumps({
+            "error": f"history fetch failed: {last_err!r}",
+        }, ensure_ascii=False))
+        sys.exit(1)
 
     names = {}
 
@@ -66,6 +75,7 @@ def main():
     for m in reversed(msgs):  # chronological order
         print(json.dumps({
             "user_name": nm(m.get("user", "")),
+            "user": m.get("user", ""),
             "text": (m.get("text") or "")[:500],
             "ts": m.get("ts", ""),
             "is_bot": bool(m.get("bot_id")),
