@@ -653,3 +653,212 @@ class TestRateLimitRecovery(unittest.TestCase):
             r2 = rp.process_one(inbox, peek_undelivered(inbox)[0], "a", runner=runner)
             self.assertEqual(r2["outcome"], "no_resend")
             self.assertEqual(len(sends), 1)
+
+
+# --- agent_wake / pending single-target / mode resolution (PR #6 fixes) ---
+
+class TestPendingConsumeOnceSingleTarget(unittest.TestCase):
+    """P1: --text must not broadcast; channel+ts targets one row only."""
+
+    def test_two_channels_only_target_sends_and_acks(self):
+        import pending_consume_once as pco
+
+        with tempfile.TemporaryDirectory() as d:
+            inbox = os.path.join(d, "inbox.jsonl")
+            append_record(inbox, {
+                "channel": "C_ALPHA", "ts": "100.1", "text": "question A?",
+                "user": "U1", "delivered": False, "reply_status": None,
+            })
+            append_record(inbox, {
+                "channel": "C_BETA", "ts": "200.2", "text": "question B?",
+                "user": "U2", "delivered": False, "reply_status": None,
+            })
+            sends = []
+
+            def runner(*args, input_text=None):
+                # send.py argv includes channel
+                ch = None
+                for i, a in enumerate(args):
+                    if a.endswith("send.py") and i + 1 < len(args):
+                        ch = args[i + 1]
+                        break
+                sends.append({"channel": ch, "text": input_text})
+                return _fake(0, "sent ok: True ts: 9.0")
+
+            r = pco.consume_one(
+                inbox, "C_ALPHA", "100.1", "answer for A only", runner=runner
+            )
+            self.assertIn(r["outcome"], ("sent_acked", "sent_ack_pending"))
+            self.assertEqual(len(sends), 1)
+            self.assertEqual(sends[0]["channel"], "C_ALPHA")
+            self.assertEqual(sends[0]["text"], "answer for A only")
+
+            left = {(x["channel"], x["ts"]) for x in peek_undelivered(inbox)}
+            self.assertEqual(left, {("C_BETA", "200.2")})
+            self.assertNotIn(("C_ALPHA", "100.1"), left)
+
+            # Second channel still claimable — different text would go only there
+            r2 = pco.consume_one(
+                inbox, "C_BETA", "200.2", "answer for B only", runner=runner
+            )
+            self.assertIn(r2["outcome"], ("sent_acked", "sent_ack_pending"))
+            self.assertEqual(len(sends), 2)
+            self.assertEqual(sends[1]["channel"], "C_BETA")
+            self.assertEqual(sends[1]["text"], "answer for B only")
+            self.assertEqual(peek_undelivered(inbox), [])
+
+    def test_cli_requires_channel_ts_refuses_broadcast(self):
+        import pending_consume_once as pco
+        rc = pco.main(["--text", "broadcast-me"])
+        self.assertEqual(rc, 2)
+
+
+class TestResolveReplyMode(unittest.TestCase):
+    """P2: template only if explicit; else error (keep messages)."""
+
+    def test_template_only_when_explicit(self):
+        pc = _load_consumer()
+        with tempfile.TemporaryDirectory() as d:
+            wh = os.path.join(d, "webhook.env")
+            # no webhook.env, no REPLY_MODE → error
+            with mock.patch.dict(os.environ, {"REPLY_MODE": ""}, clear=False):
+                os.environ.pop("REPLY_MODE", None)
+                self.assertEqual(
+                    pc.resolve_reply_mode(env={}, webhook_env_path=wh),
+                    "error",
+                )
+            # invalid mode → error even if webhook present
+            Path = __import__("pathlib").Path
+            Path(wh).write_text("WEBHOOK_URL=http://x\nWEBHOOK_KEY=k\n")
+            self.assertEqual(
+                pc.resolve_reply_mode(
+                    env={"REPLY_MODE": "bogus"}, webhook_env_path=wh
+                ),
+                "error",
+            )
+            # explicit template → template (even without webhook)
+            self.assertEqual(
+                pc.resolve_reply_mode(
+                    env={"REPLY_MODE": "template"},
+                    webhook_env_path=os.path.join(d, "missing.env"),
+                ),
+                "template",
+            )
+            # webhook.env + unset → agent_wake
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("REPLY_MODE", None)
+                self.assertEqual(
+                    pc.resolve_reply_mode(env={}, webhook_env_path=wh),
+                    "agent_wake",
+                )
+            # explicit agent_wake
+            self.assertEqual(
+                pc.resolve_reply_mode(
+                    env={"REPLY_MODE": "agent_wake"},
+                    webhook_env_path=os.path.join(d, "missing.env"),
+                ),
+                "agent_wake",
+            )
+
+
+class TestWakeAgentConsumerBackoff(unittest.TestCase):
+    """P2: 429 Retry-After honored; failures not success; bounded backoff."""
+
+    def test_429_honors_retry_after_not_success(self):
+        pc = _load_consumer()
+        clock = {"t": 1000.0}
+        calls = {"wake": 0}
+
+        def runner(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                return _fake(4, "retry_after_sec=10\n", "wake_agent: 429")
+            return _fake(0, "")
+
+        claimable = [{"channel": "C1", "ts": "1.0", "reply_status": None}]
+        st = {
+            "last_fp": "", "last_keys": frozenset(), "last_at": 0.0,
+            "wake_fail_count": 0, "wake_retry_after_until": 0.0,
+            "wake_backoff_until": 0.0,
+        }
+        st1 = pc.maybe_wake_agent(
+            claimable, st, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+        # Must NOT treat as success fingerprint post
+        self.assertEqual(st1.get("last_at"), 0.0)
+        self.assertEqual(st1.get("wake_retry_after_until"), 1010.0)
+
+        # Within Retry-After — no second wake
+        clock["t"] = 1005.0
+        st2 = pc.maybe_wake_agent(
+            claimable, st1, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+        self.assertEqual(st2.get("wake_retry_after_until"), 1010.0)
+
+        # After wait — may wake again
+        clock["t"] = 1010.0
+
+        def runner_ok(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                return _fake(0, "wake_agent: posted webhook for 1 claimable\n")
+            return _fake(0, "")
+
+        st3 = pc.maybe_wake_agent(
+            claimable, st2, time_fn=lambda: clock["t"], runner=runner_ok
+        )
+        self.assertEqual(calls["wake"], 2)
+        self.assertEqual(st3.get("last_at"), 1010.0)
+        self.assertEqual(st3.get("wake_fail_count"), 0)
+
+    def test_failure_bounded_backoff_not_success(self):
+        pc = _load_consumer()
+        clock = {"t": 5000.0}
+        calls = {"wake": 0}
+
+        def runner(*args, input_text=None):
+            cmd = " ".join(str(a) for a in args)
+            if "pending_notify" in cmd:
+                return _fake(0, "1")
+            if "wake_agent" in cmd:
+                calls["wake"] += 1
+                return _fake(3, "", "wake_agent: HTTPError status=500")
+            return _fake(0, "")
+
+        claimable = [{"channel": "C9", "ts": "9.0"}]
+        st = {
+            "last_fp": "", "last_keys": frozenset(), "last_at": 0.0,
+            "wake_fail_count": 0, "wake_retry_after_until": 0.0,
+            "wake_backoff_until": 0.0,
+        }
+        st1 = pc.maybe_wake_agent(
+            claimable, st, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+        self.assertEqual(st1["wake_fail_count"], 1)
+        self.assertEqual(st1["wake_backoff_until"], 5000.0 + 5.0)
+        self.assertEqual(st1.get("last_at"), 0.0)
+
+        # During backoff — skip
+        clock["t"] = 5003.0
+        st2 = pc.maybe_wake_agent(
+            claimable, st1, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 1)
+
+        # After backoff — second failure doubles
+        clock["t"] = 5005.0
+        st3 = pc.maybe_wake_agent(
+            claimable, st2, time_fn=lambda: clock["t"], runner=runner
+        )
+        self.assertEqual(calls["wake"], 2)
+        self.assertEqual(st3["wake_fail_count"], 2)
+        self.assertEqual(st3["wake_backoff_until"], 5005.0 + 10.0)
