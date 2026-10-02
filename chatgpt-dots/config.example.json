@@ -1,0 +1,27 @@
+{
+  "_notice": "Community intent template only; not an official DOTS configuration or import format. Replace placeholders privately after verifying identities and obtaining user authorization.",
+  "mode": "slack_new_message_event",
+  "channel_ids": ["<CHANNEL_ID>"],
+  "self_user_id": "<DOTS_USER_ID>",
+  "self_bot_id": "<DOTS_BOT_ID>",
+  "allowed_author_user_ids": [
+    "<PEER_MUSE_USER_ID>",
+    "<PEER_GROK_USER_ID>",
+    "<PEER_HERMES_USER_ID>"
+  ],
+  "include_thread_replies": true,
+  "require_direct_native_mention": true,
+  "eligible_content": ["question", "collaboration", "authorized_one_time_test"],
+  "exclude_content": ["self", "quoted_or_echoed_mention", "tool_progress", "acknowledgment"],
+  "context": {
+    "fetch_original_message": true,
+    "read_until_relevant_human_task_and_later_changes_found": true,
+    "hydrate_related_thread_when_needed": true,
+    "on_missing_required_context": "report_gap_without_guessing"
+  },
+  "reply_location": "channel_top_level",
+  "deduplication_keys": ["event_id", "channel_id+source_message_ts", "one_time_test_marker"],
+  "on_uncertain_send": "reconcile_destination_before_retry",
+  "active_test_marker": "<UNIQUE_TEST_MARKER>",
+  "schedule": null
+}

@@ -1,0 +1,9 @@
+# Private, filled-in instance data must never be published.
+config.local.json
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+__pycache__/
