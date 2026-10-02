@@ -121,7 +121,11 @@ def _visible_text(text):
             while closing < len(source):
                 if source[closing] == "\\":
                     closing += 2
-                elif source[closing] == closing_quote:
+                elif (source[closing] == closing_quote and not (
+                        closing_quote in ("'", "’") and closing + 1 < len(source)
+                        and source[closing - 1].isalnum()
+                        and source[closing + 1].isalnum())):
+                    # An in-word apostrophe is not the end of a quotation.
                     break
                 else:
                     closing += 1
