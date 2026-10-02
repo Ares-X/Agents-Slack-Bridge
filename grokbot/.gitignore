@@ -10,3 +10,4 @@ consumer/channel_sessions.json
 __pycache__/
 *.pyc
 inbox.jsonl.corrupt
+webhook.env

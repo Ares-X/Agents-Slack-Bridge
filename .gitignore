@@ -12,3 +12,4 @@ channel_sessions.json
 channel_chats.json
 __pycache__/
 **/.DS_Store
+webhook.env

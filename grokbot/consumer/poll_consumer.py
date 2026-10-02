@@ -1,10 +1,17 @@
-"""Grok Bot 消费层：~5s 轮询，拉频道历史，上下文感知模板回复，ack。
+"""Grok Bot 消费层：~5s 轮询。
+
+Modes:
+  - agent_wake (default when webhook.env present, or REPLY_MODE=agent_wake):
+    escalate stale sending; ack-only for reply_status=sent; respect rate_limited;
+    for NEW claimable messages do NOT template-send — run pending_notify.py then
+    wake_agent.py (debounced by claimable fingerprint).
+  - template (only when REPLY_MODE=template explicitly):
+    context-aware template stub via generate_reply + process_one.
 
 多 agent 协作默认（可用 .env 覆盖）：
   - SLACK_BRIDGE_POLL_SEC=5
   - REPLY_IN_THREAD=0 → 频道顶层回复
   - REPLY_IN_THREAD=1 → 跟帖：thread_ts 优先，否则消息 ts
-  - 每条消息回复前先 channel_history；失败可见降级
   - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test
 
 发送状态机（reply_pipeline，与 pending fallback 共用）：
@@ -13,8 +20,6 @@
   - 其余失败 → uncertain；sending/uncertain 永不盲发
   - sent → 只重试 ack
   - 启动时 escalate stale sending → uncertain
-
-★ generate_reply() 是模板 stub，不是已接线的 Grok 模型。
 """
 import json
 import os
@@ -29,6 +34,8 @@ ROOT = os.path.dirname(BASE)  # grokbot/
 SESSIONS_PATH = os.path.join(BASE, "channel_sessions.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 INBOX_PATH = os.path.join(ROOT, "inbox.jsonl")
+WEBHOOK_ENV_PATH = os.path.join(ROOT, "webhook.env")
+WAKE_DEBOUNCE_SEC = 45.0
 
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -36,6 +43,7 @@ if ROOT not in sys.path:
 from inbox_store import (  # noqa: E402
     ack_keys,
     escalate_stale_sending,
+    is_send_ready,
     msg_key,
 )
 from reply_pipeline import (  # noqa: E402
@@ -70,6 +78,26 @@ _raw_thread = (
     or "0"
 ).strip().lower()
 REPLY_IN_THREAD = _raw_thread in ("1", "true", "yes", "on")
+
+
+def resolve_reply_mode():
+    """template only if REPLY_MODE=template; else agent_wake when webhook.env
+    present or REPLY_MODE=agent_wake; otherwise template fallback."""
+    raw = (
+        os.environ.get("REPLY_MODE")
+        or _ENV.get("REPLY_MODE")
+        or ""
+    ).strip().lower()
+    if raw == "template":
+        return "template"
+    if raw == "agent_wake":
+        return "agent_wake"
+    if os.path.exists(WEBHOOK_ENV_PATH):
+        return "agent_wake"
+    return "template"
+
+
+REPLY_MODE = resolve_reply_mode()
 
 
 def resolve_me():
@@ -164,7 +192,7 @@ def thread_target(message):
 
 
 def generate_reply(channel, message, session, history, history_error=None):
-    """短上下文感知模板回复（stub，非 Grok 模型接线）。"""
+    """短上下文感知模板回复（stub，非 Grok 模型接线）。仅 REPLY_MODE=template。"""
     text = strip_mentions(message.get("text") or "")
     user = message.get("user_name") or message.get("user") or "someone"
 
@@ -213,18 +241,31 @@ def generate_reply(channel, message, session, history, history_error=None):
     return f"收到。你要我针对「{text[:120]}」做什么？"
 
 
-def handle_one(m, sessions, *, runner=None):
-    """Process one undelivered message via shared reply_pipeline."""
+def claimable_fingerprint(msgs):
+    """Stable fingerprint of claimable (channel,ts) set."""
+    keys = sorted(
+        f"{m.get('channel') or ''}:{m.get('ts') or ''}"
+        for m in msgs
+    )
+    return "|".join(keys), frozenset(keys)
+
+
+def handle_ack_and_skips(m, *, runner=None):
+    """Handle self-ack, sent ack-only, uncertain/sending skip, rate_limited wait.
+
+    Returns:
+      ("done", False) — handled / skip, no further action
+      ("claimable", False) — ready for agent wake (or template send)
+    """
     if ME and m.get("user") == ME:
         ack_keys(INBOX_PATH, {msg_key(m)})
-        return False
+        return "done", False
 
     ch = m.get("channel") or ""
     ts = m.get("ts") or ""
     label = m.get("channel_name") or ch
     status = m.get("reply_status")
 
-    # Fast paths that need no reply text
     if status == "sent":
         result = process_one(
             INBOX_PATH, m, "", reply_in_thread=REPLY_IN_THREAD,
@@ -232,30 +273,49 @@ def handle_one(m, sessions, *, runner=None):
         )
         if result.get("outcome") == "acked":
             print(f"acked prior send in {label} ({ch}:{ts})", flush=True)
-        return False
+        return "done", False
 
     if status in ("uncertain", "sending"):
         print(
             f"skip {status} for {ch}:{ts} (will not resend; verify manually)",
             file=sys.stderr,
         )
-        return False
+        return "done", False
 
     if status == "rate_limited":
-        import time as _time
         try:
             until = float(m.get("retry_after_until") or 0)
         except (TypeError, ValueError):
             until = 0.0
-        now = _time.time()
+        now = time.time()
         if now < until:
             print(
                 f"rate-limited wait for {ch}:{ts}: "
                 f"{until - now:.1f}s remaining; not sending",
                 file=sys.stderr,
             )
-            return False
-        # Wait expired → fall through to normal history + claim + send.
+            return "done", False
+        # Wait expired → claimable again
+
+    if not is_send_ready(m):
+        print(
+            f"skip not-send-ready for {ch}:{ts} status={status!r}",
+            file=sys.stderr,
+        )
+        return "done", False
+
+    return "claimable", False
+
+
+def handle_one_template(m, sessions, *, runner=None):
+    """Process one undelivered message via template + reply_pipeline."""
+    kind, _ = handle_ack_and_skips(m, runner=runner)
+    if kind != "claimable":
+        return False
+
+    ch = m.get("channel") or ""
+    ts = m.get("ts") or ""
+    label = m.get("channel_name") or ch
 
     sess = sessions.setdefault(ch, [])
     hist, hist_err = channel_history(ch)
@@ -335,27 +395,152 @@ def handle_one(m, sessions, *, runner=None):
     return False
 
 
+# Back-compat alias for tests that call handle_one
+def handle_one(m, sessions, *, runner=None):
+    return handle_one_template(m, sessions, runner=runner)
+
+
+def maybe_wake_agent(claimable, wake_state):
+    """Run pending_notify + wake_agent with fingerprint debounce.
+
+    wake_state: dict with keys last_fp (str), last_keys (frozenset), last_at (float)
+
+    Debounce rules:
+      - DO post when claimable set gains new (channel,ts) keys
+      - do NOT re-POST the same set within WAKE_DEBOUNCE_SEC
+      - after debounce window, same set may re-POST (agent may have missed)
+      - shrink-only changes within debounce are skipped
+    """
+    if not claimable:
+        return wake_state
+
+    fp, keys = claimable_fingerprint(claimable)
+    now = time.time()
+    last_fp = wake_state.get("last_fp") or ""
+    last_keys = wake_state.get("last_keys") or frozenset()
+    last_at = float(wake_state.get("last_at") or 0)
+    gained_keys = keys - last_keys
+    gained = bool(gained_keys)
+    age = now - last_at if last_at else None
+
+    if not gained and fp == last_fp and age is not None and age < WAKE_DEBOUNCE_SEC:
+        print(
+            f"agent_wake: skip webhook same fingerprint within "
+            f"{WAKE_DEBOUNCE_SEC:.0f}s (n={len(claimable)})",
+            flush=True,
+        )
+        return wake_state
+
+    if (
+        not gained
+        and fp != last_fp
+        and last_keys
+        and age is not None
+        and age < WAKE_DEBOUNCE_SEC
+    ):
+        print(
+            f"agent_wake: skip webhook shrink-only fingerprint within "
+            f"{WAKE_DEBOUNCE_SEC:.0f}s (n={len(claimable)})",
+            flush=True,
+        )
+        # Still remember current fingerprint so later polls compare correctly
+        wake_state = {
+            "last_fp": fp,
+            "last_keys": keys,
+            "last_at": last_at,  # keep original post time for debounce
+        }
+        return wake_state
+
+    r_notify = sh(sys.executable, "pending_notify.py")
+    if r_notify.returncode != 0:
+        print(
+            f"agent_wake: pending_notify failed rc={r_notify.returncode}: "
+            f"{(r_notify.stderr or r_notify.stdout or '')[:200]}",
+            file=sys.stderr,
+        )
+        return wake_state
+
+    r_wake = sh(sys.executable, "wake_agent.py")
+    if r_wake.returncode == 0:
+        reason = "gained keys" if gained else (
+            "debounce expired" if fp == last_fp else "fingerprint changed"
+        )
+        print(
+            f"agent_wake: posted webhook for {len(claimable)} claimable "
+            f"({reason})",
+            flush=True,
+        )
+        wake_state = {
+            "last_fp": fp,
+            "last_keys": keys,
+            "last_at": now,
+        }
+    else:
+        print(
+            f"agent_wake: wake_agent failed rc={r_wake.returncode}: "
+            f"{(r_wake.stderr or r_wake.stdout or '')[:200]}",
+            file=sys.stderr,
+        )
+    return wake_state
+
+
+def poll_agent_wake_once(wake_state, *, runner=None):
+    """One poll cycle in agent_wake mode. Returns updated wake_state."""
+    msgs = peek()
+    if not msgs:
+        return wake_state
+    claimable = []
+    for m in msgs:
+        kind, _ = handle_ack_and_skips(m, runner=runner)
+        if kind == "claimable":
+            claimable.append(m)
+    if claimable:
+        wake_state = maybe_wake_agent(claimable, wake_state)
+    else:
+        print("agent_wake: no claimable this round (acks/skips only)", flush=True)
+    return wake_state
+
+
 def main():
     n = escalate_stale_sending(INBOX_PATH)
     if n:
         print(f"escalated {n} stale sending → uncertain", flush=True)
+
+    mode = resolve_reply_mode()
+    # refresh module-level for logging
+    global REPLY_MODE
+    REPLY_MODE = mode
+
     print(
         f"grokbot consumer polling every {POLL_INTERVAL}s "
+        f"mode={mode} "
         f"(REPLY_IN_THREAD={REPLY_IN_THREAD}, me={ME or 'auto-pending'}, ROOT={ROOT})",
         flush=True,
     )
-    print(
-        "NOTE: generate_reply() is a template stub — not auto-wired to Grok models.",
-        flush=True,
-    )
+    if mode == "template":
+        print(
+            "NOTE: generate_reply() is a template stub — not auto-wired to Grok models.",
+            flush=True,
+        )
+    else:
+        print(
+            "agent_wake: claimable messages wake Grok Bot via webhook "
+            "(no template send); see AGENT_WAKE.md",
+            flush=True,
+        )
+
+    wake_state = {"last_fp": "", "last_keys": frozenset(), "last_at": 0.0}
     while True:
         try:
-            msgs = peek()
-            if msgs:
-                sessions = load_sessions()
-                for m in msgs:
-                    handle_one(m, sessions)
-                save_sessions(sessions)
+            if mode == "agent_wake":
+                wake_state = poll_agent_wake_once(wake_state)
+            else:
+                msgs = peek()
+                if msgs:
+                    sessions = load_sessions()
+                    for m in msgs:
+                        handle_one_template(m, sessions)
+                    save_sessions(sessions)
         except Exception as e:
             print(f"poll error: {e}", file=sys.stderr)
         time.sleep(POLL_INTERVAL)
