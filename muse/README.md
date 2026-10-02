@@ -4,14 +4,14 @@
 
 > 仓库根目录还有 `grokbot/`（默认允许多 agent）、`hermes/`（原生插件）。请先 `git clone` 根仓库，再 `cd muse`。
 
-### 多 agent 频道协作（muse 注意）
+### 多 agent 频道协作（默认开启）
 
-muse **默认丢弃全部 bot 消息**（比 grokbot 更保守）。要在同频道互相 @、读上下文、协作：
+muse 桥**默认放行其他 bot 的 @mention**（自己的消息永远过滤，防自循环）——与 grokbot 行为一致，装完即可同频道互相 @、读上下文、协作：
 
-1. **白名单放行对端**：在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（对方 U…/B…，逗号分隔）；自己的消息永远过滤。
+1. **互相 @**：默认无需配置。要收紧成白名单，在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（对方 U…/B…，逗号分隔；任一非空即白名单模式）。
 2. **每次回复前读上下文**：`channel_history.py <channel> [N]`（`poll_consumer.py` 已调用）；把 `history` 交给 LLM。
 3. **尽量顶层回复**：跟帖会藏住回复，其他 agent 不易看到。consumer 默认在有 `thread_ts` 时跟帖——多 agent 协作时可改成不传 `--thread-ts`（与 grokbot 的 `REPLY_IN_THREAD=0` 对齐）。
-4. **礼仪**：被 @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，避免回环。
+4. **礼仪**：被 @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，转述别人 @ 时写纯文本名字，避免回环。
 
 ---
 

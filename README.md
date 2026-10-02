@@ -69,7 +69,7 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
   转述/引用别人说过的 @ 时写纯文本名字，不要写真实 @mention。
 
 多 agent 频道协作默认（配置与回复行为都按此执行）：
-- 允许其他 bot @ 本 bot：grokbot 默认放行其他 bot（仅丢弃自己）；muse 默认丢弃全部 bot，协作时把对端写入 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（或 bridge.py 白名单）；hermes 用 allow_bots: mentions。
+- 允许其他 bot @ 本 bot（三个 flavor 全部默认支持，装完即协作）：grokbot / muse 默认放行其他 bot（仅丢弃自己）；hermes 用 `allow_bots: mentions`（被明确 @ 即受理）。要收紧时才设白名单（muse/grokbot 的 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`；任一非空即白名单模式）。
 - 每次回复前：先跑 channel_history.py <channel> [N]（或 consumer 内同等调用），把近况当上下文再用。
 - 默认频道顶层回复（REPLY_IN_THREAD=0 / reply_in_thread: false），让同频道其他 agent 能看到；不要默认跟帖藏起来。
 - 协作：被其他 agent @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，避免 echo/回环风暴；需要收紧时再用 ALLOWED_BOT_* 白名单。
@@ -78,7 +78,7 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
 1. git clone https://github.com/Ares-X/Agents-Slack-Bridge.git
    进入仓库根目录。
 2. 让用户选择 flavor：
-   - muse/     → Muse / 通用 LLM（~30s consumer；协作需配 bot 白名单）
+   - muse/     → Muse / 通用 LLM（~30s consumer；默认允许多 agent）
    - grokbot/  → Grok Bot / Cursor Grok Bot（5s consumer 或 pending.json 5min fallback；默认允许多 agent）
    - hermes/   → Hermes Agent 本体（原生插件，无 consumer；读 hermes/AGENT.md）
    cd 进所选目录。若选 grokbot 或 hermes，同时阅读该目录的 AGENT.md。
@@ -93,7 +93,7 @@ bridge.py ──▶ inbox.jsonl ──▶ 消费层 ──▶ send.py ──▶ 
 4. cp .env.example .env && chmod 600 .env
    填入两个 token（及可选 PROXY_URL / CA_BUNDLE / SLACK_BOT_USER_ID）。
    grokbot：保持 REPLY_IN_THREAD=0；ALLOWED_BOT_* 默认可不设（允许多 agent）。
-   muse：多 agent 协作时填 ALLOWED_BOT_* 或编辑 bridge.py 白名单。
+   muse：ALLOWED_BOT_* 默认留空（允许任意其他 bot，多 agent 协作默认）；要收紧成白名单才填。
    不要把填好的 .env 内容回显到聊天。
 5. python3 -m venv venv && ./venv/bin/pip install slack_sdk
    （grokbot 可用 pip install -r requirements.txt；hermes 跳过本步）
