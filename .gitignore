@@ -1,0 +1,7 @@
+# 凭据与本地状态（绝不提交）
+.env
+venv/
+*.log
+inbox.jsonl
+channel_chats.json
+__pycache__/

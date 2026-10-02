@@ -1,0 +1,17 @@
+[Unit]
+Description=Agent Slack Bridge (Socket Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ★ 把下面两处 /path/to/slack-bridge 换成实际部署目录，
+#   把 /path/to/venv 换成虚拟环境的 python 路径
+ExecStart=/path/to/venv/bin/python /path/to/slack-bridge/bridge.py
+WorkingDirectory=/path/to/slack-bridge
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
