@@ -191,7 +191,14 @@ def main():
         sys.exit(2)
 
     ok = bool(r.get("ok"))
-    print("sent ok:", ok, "ts:", r.get("ts"))
+    ts_out = r.get("ts")
+    print("sent ok:", ok, "ts:", ts_out)
+    if ok and ts_out:
+        try:
+            from bot_ts_cache import remember as cache_remember
+            cache_remember(channel, str(ts_out))
+        except Exception as e:
+            print(f"bot_ts_cache warn: {e}", file=sys.stderr)
     if not ok:
         err = str(r.get("error") or "ok_false")
         kind = classify_slack_api_error(err)

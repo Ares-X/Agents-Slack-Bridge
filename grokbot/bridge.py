@@ -1,12 +1,22 @@
 """Slack Socket Mode -> local inbox queue. 只收不发。
 
-监听 bot 的私信（message.im）与频道 @mention（app_mention），
+监听：
+  - 私信（message.im）
+  - 频道 @mention（app_mention）
+  - 本 bot 消息线程下的跟帖回复（message.channels / message.groups + thread_ts，
+    且父消息 user==me；无需再 @mention）
+
 把每条消息以 JSON 行追加到 inbox.jsonl，供消费层（cron/轮询脚本/agent）
 读取处理。发送请用 send.py。
 
 可靠性顺序：先 durable 入队（flock + fsync），再 Socket Mode ACK。
-入队路径不做网络查名（channel_name/user_name 先留空或用 id）；
+入队路径不做频道/用户名查名（channel_name/user_name 先留空或用 id）；
 若入队失败则不 ACK，让 Slack 重试；重复入队由 (channel, ts) 去重消化。
+
+线程父消息判定：
+  1) bot_sent_ts.json 缓存命中（send.py 成功后写入）→ 接受
+  2) 否则 conversations.replies 查父消息 user==me → 接受并写入缓存
+  父查失败 → 不 ACK（Slack 重试）；确认非本 bot → ACK 丢弃
 
 Grok Bot 多 agent 频道协作默认：
   - 永远丢弃自己的 user_id（auth_test），防止自循环
@@ -14,11 +24,15 @@ Grok Bot 多 agent 频道协作默认：
     （Grok Bot 与其他 agent 常在同一频道互相 @）
   - 若 .env 设置了 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔），
     则改为白名单模式：仅这些 bot 放行，其他 bot 丢弃（可选收紧）
-  - DM 的 edit/delete 等 subtype 显式过滤，避免空 user/text 任务绕过自过滤
-  - 消费层配合：回复前 channel_history；REPLY_IN_THREAD=0 顶层可见
+  - DM / channel 的 edit/delete/bot_message 等 subtype 显式过滤
+  - 消费层：REPLY_IN_THREAD=0 时 mention/dm 仍顶层；kind=thread_reply
+    强制跟帖（同 thread_ts），见 AGENT_WAKE.md / .env.example
 
 配置：同目录 .env（0600），见 .env.example。
 依赖：pip install slack_sdk
+
+Slack App：改 manifest 后须在 api.slack.com 重新 Apply Manifest 并重装/
+更新事件订阅（至少增加 message.channels；私频加 message.groups）。
 """
 import logging
 import os
@@ -26,6 +40,8 @@ import ssl
 import sys
 import time
 
+from bot_ts_cache import contains as cache_contains
+from bot_ts_cache import remember as cache_remember
 from inbox_store import append_record
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -33,12 +49,13 @@ ENV_PATH = os.path.join(BASE, ".env")
 INBOX_PATH = os.path.join(BASE, "inbox.jsonl")
 LOG_PATH = os.path.join(BASE, "bridge.log")
 
-# DM subtypes that are not actionable user messages (empty/misleading user+text).
-DM_DROP_SUBTYPES = frozenset({
+# Subtypes that are not actionable user messages (empty/misleading user+text).
+DROP_SUBTYPES = frozenset({
     "message_changed",
     "message_deleted",
     "message_replied",
     "tombstone",
+    "bot_message",  # avoid bot echo / loop via subtype path
     "channel_join",
     "channel_leave",
     "channel_topic",
@@ -59,6 +76,9 @@ DM_DROP_SUBTYPES = frozenset({
     "unpinned_item",
     "ekm_access_denied",
 })
+
+# Back-compat alias used by older tests
+DM_DROP_SUBTYPES = DROP_SUBTYPES
 
 
 def load_env(path):
@@ -112,13 +132,88 @@ def append_inbox(record):
 
 def should_drop_dm_event(event):
     """True if this IM event should not become an inbox task."""
+    return should_drop_message_event(event)
+
+
+def should_drop_message_event(event):
+    """True if this message event should not become an inbox task."""
     subtype = event.get("subtype") or ""
-    if subtype in DM_DROP_SUBTYPES:
+    if subtype in DROP_SUBTYPES:
         return True
     # Edits/deletes sometimes omit top-level user; never queue those.
     if not event.get("user") and not event.get("bot_id"):
         return True
     return False
+
+
+def classify_inbound_kind(event, req_type):
+    """Return 'mention' | 'dm' | 'thread_reply' | None.
+
+    'thread_reply' here means a *candidate* (channel/group message with
+    thread_ts). Caller must still verify parent is our bot.
+    """
+    if req_type != "events_api":
+        return None
+    et = event.get("type")
+    if et == "app_mention":
+        return "mention"
+    if et != "message":
+        return None
+    ct = event.get("channel_type") or ""
+    if ct == "im":
+        return "dm"
+    # Public / private channel messages: only thread replies are candidates.
+    if ct in ("channel", "group"):
+        thread_ts = (event.get("thread_ts") or "").strip()
+        ts = (event.get("ts") or "").strip()
+        # Real reply: thread_ts present and (usually) differs from ts.
+        if thread_ts and thread_ts != ts:
+            return "thread_reply"
+    return None
+
+
+def parent_message_is_me(parent, me):
+    """True if conversations.replies parent belongs to our bot user."""
+    if not parent or not me:
+        return False
+    return parent.get("user") == me
+
+
+def fetch_thread_parent(web, channel, thread_ts):
+    """Return parent message dict or None. Raises on transport/API failure."""
+    r = web.conversations_replies(
+        channel=channel, ts=thread_ts, limit=1, inclusive=True
+    )
+    msgs = r.get("messages") or []
+    return msgs[0] if msgs else None
+
+
+def is_our_thread_parent(web, channel, thread_ts, me, *, cache_path=None):
+    """True if thread parent is our bot. Uses cache then API.
+
+    Returns (ok: bool, error: Optional[BaseException]).
+    ok=False + error set → caller should NOT ack (retry).
+    ok=False + error None → confirmed not ours → ack drop.
+    """
+    from bot_ts_cache import DEFAULT_PATH
+    path = cache_path or DEFAULT_PATH
+    if cache_contains(channel, thread_ts, path=path):
+        return True, None
+    try:
+        parent = fetch_thread_parent(web, channel, thread_ts)
+    except Exception as e:
+        return False, e
+    if parent_message_is_me(parent, me):
+        cache_remember(channel, thread_ts, path=path)
+        return True, None
+    return False, None
+
+
+def should_reply_in_thread(message, reply_in_thread_env=False):
+    """Env REPLY_IN_THREAD for mentions/dms; always True for thread_reply."""
+    if (message or {}).get("kind") == "thread_reply":
+        return True
+    return bool(reply_in_thread_env)
 
 
 def main():
@@ -142,6 +237,7 @@ def main():
 
     # Name lookup is intentionally NOT on the receive→ack path (network I/O
     # would delay durable enqueue + Socket Mode ACK). Enrich offline if needed.
+    # Exception: thread_reply parent check (cache-first; API only on miss).
 
     def ack(client: SocketModeClient, req: SocketModeRequest):
         client.send_socket_mode_response(
@@ -153,21 +249,16 @@ def main():
         try:
             event = (req.payload or {}).get("event", {})
 
-            kind = None
-            if req.type == "events_api" and event.get("type") == "app_mention":
-                kind = "mention"
-            elif (req.type == "events_api" and event.get("type") == "message"
-                    and event.get("channel_type") == "im"):
-                kind = "dm"
+            kind = classify_inbound_kind(event, req.type)
             if not kind:
                 # Non-target events: ack so Slack stops delivering them.
                 ack(client, req)
                 return
 
-            if kind == "dm" and should_drop_dm_event(event):
+            if should_drop_message_event(event):
                 logging.info(
-                    "drop dm subtype=%s user=%s",
-                    event.get("subtype"), event.get("user"),
+                    "drop %s subtype=%s user=%s",
+                    kind, event.get("subtype"), event.get("user"),
                 )
                 ack(client, req)
                 return
@@ -176,6 +267,23 @@ def main():
             if event.get("user") == me:
                 ack(client, req)
                 return
+
+            if kind == "thread_reply":
+                ch0 = event.get("channel", "") or ""
+                tts = (event.get("thread_ts") or "").strip()
+                ok, err = is_our_thread_parent(web, ch0, tts, me)
+                if err is not None:
+                    logging.error(
+                        "thread parent lookup failed (no ack): %s", err
+                    )
+                    return  # no ack → Slack retry
+                if not ok:
+                    logging.info(
+                        "drop thread_reply not under us ch=%s thread_ts=%s",
+                        ch0, tts,
+                    )
+                    ack(client, req)
+                    return
 
             is_bot_msg = bool(event.get("bot_id")) or \
                 event.get("subtype") == "bot_message"
@@ -197,7 +305,7 @@ def main():
                 "user": uid,
                 "user_name": "",
                 "text": event.get("text", ""),
-                "kind": kind,                            # dm | mention
+                "kind": kind,                            # dm | mention | thread_reply
                 "ts": event.get("ts", ""),
                 "thread_ts": event.get("thread_ts", ""),  # 原帖回复用
                 "received_at": time.time(),

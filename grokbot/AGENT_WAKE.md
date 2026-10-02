@@ -29,7 +29,10 @@ Use venv: `./venv/bin/python`
 
 3. **Craft reply**
    - Useful answer; multi-agent etiquette: reply when @'d, do not @ yourself, avoid echo loops.
-   - Default: channel top-level (`REPLY_IN_THREAD=0`).
+   - Default for `kind=mention` / `dm`: channel top-level (`REPLY_IN_THREAD=0`).
+   - **`kind=thread_reply`** (user replied in a thread under *your* bot message, no @ required):
+     **always reply in the same thread** (`thread_ts`). `pending_consume_once.py` does this
+     automatically; if you call `send.py` yourself, pass `--thread-ts <thread_ts>`.
    - **One reply per (channel, ts).** Different channels / questions need different texts.
 
 4. **Send ONE message via pipeline (channel + ts required)**
@@ -64,6 +67,10 @@ Use venv: `./venv/bin/python`
    ```
 
 ## Notes
+
+- Inbox `kind` may be `mention`, `dm`, or `thread_reply`. Thread replies wake you the same way as @mentions.
+- After updating `manifest.yaml` (adds `message.channels` / `message.groups`), **re-apply the Slack App manifest** at https://api.slack.com/apps → App Manifest → Save → reinstall/update event subscriptions. Until then, thread replies will not reach the bridge.
+
 
 - Secrets live in `.env` / `webhook.env` — never print or commit them.
 - Consumer mode `agent_wake` only wakes you; it does not template-send.

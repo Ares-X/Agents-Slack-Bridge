@@ -6,10 +6,14 @@
 #   2. Basic Information → App-Level Tokens → Generate Token（加 connections:write，
 #      会得到 xapp- 开头的 token；已有就直接复制）
 #   3. 把两个 token 填进 .env（见 .env.example）
+#
+# ★ 若已有 App：在 api.slack.com → App Manifest → 粘贴更新后的全文 → Save Changes
+#   → 按提示 Reinstall / 更新事件订阅。新增 message.channels（及 message.groups）
+#   后，未 Apply 则线程跟帖（无需 @）不会进 bridge。
 
 display_information:
   name: Agent Slack Bridge Grok
-  description: Grok Bot / Cursor Grok Bot 的 Slack 桥接（DM 与 @mention 转发）
+  description: Grok Bot / Cursor Grok Bot 的 Slack 桥接（DM、@mention、本 bot 线程跟帖）
   background_color: "#1A1A2E"
 
 features:
@@ -28,6 +32,8 @@ oauth_config:
       - channels:history
       - channels:read
       - chat:write
+      - groups:history          # private channels（message.groups）
+      - groups:read
       - im:history
       - im:read
       - im:write
@@ -36,8 +42,10 @@ oauth_config:
 settings:
   event_subscriptions:
     bot_events:
-      - app_mention      # 频道里被 @
-      - message.im       # 收到私信
+      - app_mention        # 频道里被 @
+      - message.channels   # 公开频道消息（bridge 仅收本 bot 线程跟帖）
+      - message.groups     # 私有频道消息（同上）
+      - message.im         # 收到私信
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

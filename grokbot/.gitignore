@@ -11,3 +11,4 @@ __pycache__/
 *.pyc
 inbox.jsonl.corrupt
 webhook.env
+bot_sent_ts.json

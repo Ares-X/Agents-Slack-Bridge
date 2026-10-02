@@ -12,8 +12,9 @@ Modes:
 
 多 agent 协作默认（可用 .env 覆盖）：
   - SLACK_BRIDGE_POLL_SEC=5
-  - REPLY_IN_THREAD=0 → 频道顶层回复
+  - REPLY_IN_THREAD=0 → mention/dm 频道顶层回复
   - REPLY_IN_THREAD=1 → 跟帖：thread_ts 优先，否则消息 ts
+  - kind=thread_reply → 无视 REPLY_IN_THREAD，强制同线程回复（thread_ts）
   - 本 bot user ID：SLACK_BOT_USER_ID 或 auth_test
 
 发送状态机（reply_pipeline，与 pending fallback 共用）：
@@ -205,6 +206,15 @@ def thread_target(message):
     return (message.get("thread_ts") or message.get("ts") or "").strip()
 
 
+def should_reply_in_thread(message, reply_in_thread_env=None):
+    """Force thread for kind=thread_reply; else honor REPLY_IN_THREAD env."""
+    if reply_in_thread_env is None:
+        reply_in_thread_env = REPLY_IN_THREAD
+    if (message or {}).get("kind") == "thread_reply":
+        return True
+    return bool(reply_in_thread_env)
+
+
 def generate_reply(channel, message, session, history, history_error=None):
     """短上下文感知模板回复（stub，非 Grok 模型接线）。仅 REPLY_MODE=template。"""
     text = strip_mentions(message.get("text") or "")
@@ -337,7 +347,8 @@ def handle_one_template(m, sessions, *, runner=None):
         print(f"history degrade for {ch}: {hist_err}", file=sys.stderr)
 
     reply = generate_reply(ch, m, sess, hist, history_error=hist_err)
-    tt = thread_target(m) if REPLY_IN_THREAD else None
+    in_thread = should_reply_in_thread(m)
+    tt = thread_target(m) if in_thread else None
 
     def _runner(*args, input_text=None):
         if runner is not None:
@@ -348,7 +359,7 @@ def handle_one_template(m, sessions, *, runner=None):
         INBOX_PATH,
         m,
         reply,
-        reply_in_thread=REPLY_IN_THREAD,
+        reply_in_thread=in_thread,
         thread_ts=tt,
         root=ROOT,
         runner=_runner,

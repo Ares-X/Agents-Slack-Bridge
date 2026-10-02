@@ -63,8 +63,17 @@ def consume_one(
             "claimable row requires non-empty --text "
             f"(got empty for {channel}:{ts})"
         )
+    # kind=thread_reply always stays in-thread even if REPLY_IN_THREAD=0 /
+    # --reply-in-thread omitted.
+    force_thread = reply_in_thread or (m.get("kind") == "thread_reply")
+    tt = None
+    if force_thread:
+        tt = (m.get("thread_ts") or m.get("ts") or "").strip() or None
     r = process_one(
-        inbox, m, reply, reply_in_thread=reply_in_thread, root=root, runner=runner
+        inbox, m, reply,
+        reply_in_thread=force_thread,
+        thread_ts=tt,
+        root=root, runner=runner,
     )
     r = dict(r)
     r["channel"] = channel
