@@ -125,9 +125,13 @@ platforms:
 
 > 以下按 hermes-agent commit `b3059921bc`（origin/main，2026-10-02）核对；`9a71d5a8..b3059921` 期间
 > `gateway/authz_mixin.py` 与 `plugins/platforms/slack/adapter.py` 的授权路径零改动。
-> 入站链：`adapter._drop_bot_sender`（含 own-echo/`allow_bots` gate）→ adapter `_early_reject_unauthorized`
-> （注入的网关 authz 回调，带 `is_bot`）→ 网关 `_is_user_authorized`（`_chat_scoped_grant` 内
-> `{PLATFORM}_ALLOW_BOTS` 短路 → allow-all → pairing → allowlist → default-deny）→ bot loop guard。
+> 入站链（按源码实际顺序）：`adapter._prefilter_inbound` 内 dedup → ignored-channel →
+> **`_drop_bot_sender`（own-echo 丢弃 + `allow_bots` gate）** → **`_early_reject_unauthorized`**
+> （仅当事件带 `user_id` 才运行；签名只有 `(user_id, channel_id, is_dm)`，**不带** `is_bot`，
+> 且对 `_is_sender_authorized` 的调用也不传 `is_bot` → 该 user_id 按人类路径裁决）→
+> MessageEvent 构建时才置 `is_bot=_event_declares_bot_sender(event)` → 网关入口
+> `_is_user_authorized`（`_chat_scoped_grant` 内 `{PLATFORM}_ALLOW_BOTS` 短路 → allow-all →
+> pairing → allowlist → default-deny）→ bot loop guard。
 
 **三件套分工，别混为一谈：**
 
@@ -145,9 +149,10 @@ platforms:
        `_chat_scoped_grant` 里 `{PLATFORM}_ALLOW_BOTS` 短路在 no-user-id guard **之前**生效——
        即 `allow_bots: mentions` + 明确 @ 就能进，**无需**把它加进 `SLACK_ALLOWED_USERS`。
      - **带 `user_id` 的 bot/app/automation 帖**（app 发的且带 user 字段、`app_id`+无 `client_msg_id` 签名）：
-       adapter 的早期授权检查带着 user_id 先行，**user_id 必须本身通过用户授权**（allowlist/pairing/allow-all），
-       否则在 allow_bots gate 之前就被静默拒绝。想接这类发送者：把它的 user_id 加进 `SLACK_ALLOWED_USERS`，
-       且 `allow_bots` 不能是 `none`。
+       这类帖子**先**过 adapter 的 `allow_bots` gate（`_drop_bot_sender`），**再**吃早期授权检查——
+       检查里 `user_id` 必须本身通过用户授权（allowlist/pairing/allow-all），否则被静默拒绝；
+       早期检查**不带** `is_bot`，所以这里的 ALLOW_BOTS 短路帮不上忙。想接这类发送者：把它的
+       user_id 加进 `SLACK_ALLOWED_USERS`，且 `allow_bots` 不能是 `none`。
    - `allow_bots` 不是身份白名单：它只决定「bot 签名的消息要不要受理」，身份与授权始终由上面的用户授权层裁决。
 
 3. **频道范围**（在哪响应）：`allowed_channels`（只在这些频道响应，DM 豁免）、`free_response_channels`
@@ -155,7 +160,8 @@ platforms:
    授权≠响应：**已授权**用户在非 `allowed_channels` 频道发消息，bot 也会静默不响应。
    事件订阅面另有限制：`app_mention` 只在 bot 已加入的频道/DM 生效（自身家 bot 例外）。
 
-**独立验证**（上游 smoke profile，`tests/gateway/test_slack_peer_agent_smoke.py` 同款加载方式，12/12 断言过）：
+**独立验证**（`hermes/test_authz_matrix.py`：固定 commit 临时 worktree 加载真 SlackAdapter，upstream
+smoke-test 同款 mock，12/12 断言；源码行级顺序另由 `hermes/verify_authz_order.sh` 钉住）：
 
 | # | 场景 | allowlist | allow_bots | @本bot | 结果 |
 |---|---|---|---|---|---|
@@ -188,9 +194,17 @@ python3 channel_history.py C01234567890 20 --resolve
 `conversations.replies` 本身旧→新（父消息开头），脚本不再二次反转——两种模式输出统一为时间正序。
 
 失败输出一行结构化 `{"error": {"kind", "detail", …}}` 并退出码 1——`kind` ∈ `missing_token /
-http_429 / timeout / connection_failed / invalid_json / slack_api_error`；429 带 `retry_after`（读
-Slack 的 `Retry-After` 头，秒）。不自动重试，调用方按 `retry_after` 自行调度。如实报告，不编造。需要
-更深的历史回放/搜索走 Hermes 的 `session_search` 工具或 Slack SDK。
+http_429 / timeout / connection_failed / connection_reset / incomplete_read / http_protocol_error /
+invalid_json / slack_api_error`；429 带 `retry_after`（读 Slack 的 `Retry-After` 头，秒）。不自动重试，
+调用方按 `retry_after` 自行调度。如实报告，不编造。响应体读取边界（连接中途重置/截断/坏状态行）同样
+结构化报错，不再以未捕获异常退出。`--resolve` 的名称解析是可选增强：任何失败（含 `users.info` 对
+bot ID 返回 `user_not_found`、网络错）只降级保留原 ID，绝不中止主读取；`B…` 前缀的 bot ID 走
+`bots.info`，`U…/W…` 走 `users.info`。需要更深的历史回放/搜索走 Hermes 的 `session_search` 工具或
+Slack SDK。
+
+回归测试：`python3 test_channel_history.py`（29 项断言，无网络、无真实 token、无真实 `~/.hermes`）；
+授权顺序声明的源码核验：`./verify_authz_order.sh [repo] [commit]`（默认 `b3059921bc`，需本地
+hermes-agent checkout，不联网）。
 
 ## Cron / 定时任务
 
@@ -234,9 +248,12 @@ hermes cron add "every 2h" "盯价格" --deliver slack:U0123456789    # 直投�
 
 ```
 hermes/
-├── README.md             # 本文档
-├── AGENT.md              # 给任意 agent 的端到端配置指令（整段复制）
-├── config.example.yaml   # ~/.hermes/config.yaml 的 platforms.slack 片段
-├── .env.example          # token 模板（真实值永不进仓）
-└── channel_history.py    # 频道/线程历史 CLI（stdlib-only，零依赖）
+├── README.md                    # 本文档
+├── AGENT.md                     # 给任意 agent 的端到端配置指令（整段复制）
+├── config.example.yaml          # ~/.hermes/config.yaml 的 platforms.slack 片段
+├── .env.example                 # token 模板（真实值永不进仓）
+├── channel_history.py           # 频道/线程历史 CLI（stdlib-only，零依赖）
+├── test_channel_history.py      # channel_history 回归测试（runpy 进程内，29 项断言，零网络）
+├── test_authz_matrix.py         # 授权矩阵回归（临时 worktree @b3059921bc，12 项断言）
+└── verify_authz_order.sh        # 授权模型源码顺序核验（固定 commit，零网络）
 ```
