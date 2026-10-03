@@ -1,0 +1,41 @@
+--- a/gateway/display_config.py
++++ b/gateway/display_config.py
+@@ -16,6 +16,7 @@
+     "tool_progress": "all",
+     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+     "show_reasoning": False,
++    "memory_notifications": "on",
+     "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
+     "tool_preview_length": 0,
+     "streaming": None,  # None = follow top-level streaming config
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1241,7 +1241,7 @@
+         agent._gateway_turn_request_overrides = turn_overrides
+ 
+     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
+-                                   stream_delta_cb, interim_assistant_cb, want_interim_messages):
++                                   stream_delta_cb, interim_assistant_cb, want_interim_messages, platform_key):
+         """Per-message state — callbacks and reasoning config change every turn, so they aren't
+         baked into the cached agent."""
+         ctx = self._ctx
+@@ -1280,9 +1280,7 @@
+                 if pdc is not None:
+                     pdc[ctx.session_key] = bg_release
+         # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
+-        # `display:` present-but-null yields None, not the {} default (same `or {}` guard as
+-        # display_config.py / runtime_footer.py).
+-        mem_notif = (ctx.user_config.get("display") or {}).get("memory_notifications")
++        mem_notif = ctx.resolve_display_setting(ctx.user_config, platform_key, "memory_notifications")
+         if isinstance(mem_notif, bool):
+             mem_notif = "on" if mem_notif else "off"
+         agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
+@@ -1948,7 +1946,7 @@
+         if pending_fallback_notice:
+             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
+             agent._pending_fallback_notice = pending_fallback_notice
+-        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
++        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim, platform_key)
+         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)

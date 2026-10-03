@@ -70,8 +70,8 @@ Slack → Hermes 原生 Slack 适配器 / gateway → Agent 回合 → Slack
 | 3. 多 Agent 双向协作已验证 | 按对端及 A→B / B→A 分别记录触发、频道/线程上下文、回复位置/次数和无回环证据 | 单方向成功、用单对结果推断全部对端、代码合并、其他 Agent 的口头确认 |
 
 - Muse：PR #11 durable 入口已合并，Muse 维护 agent 回报实际 hook → agent → send_durable 已加载，Codex 已观察 D/E 实际回复；不能与参考 echo consumer 混淆。Grok：PR #13 互斥保活已合并，Grok 维护 agent 回报已加载且自然保活检查通过；agent_wake/fail-closed 默认和显式 template 保持不变
-- Hermes：PR #14 已合并，兼容实际部署的 836 适配器流收尾路径并修正重复剥除游标；隔离代码验证通过。维护 agent 已核对新插件与 9 项配置落盘，但旧进程仍未重启加载，四方 H 测试尚未运行
-- DOTS：D/E 有界接力已观察到 **Muse↔DOTS、DOTS↔Grok** 的线程双向结果；F/G 补测覆盖 **Muse↔Grok**。F 发现 Muse 同条重复提及，修正 hook 指令后 G 通过；这些结果不代表全连接或通用并发/重投递保证
+- Hermes：PR #14 已加载；实例历史工具指引已修正，普通私聊已恢复主消息流。J 暴露终稿后的后台复盘提示，PR #17 的最小补丁与 Slack 单独静音配置已落盘并正常重启；后台学习、其他平台和安全审批保留
+- 多 Agent 实测：D–J 覆盖四位 agent 的六组配对双向交接；修正后的 **K 四方不同字段接力自动通过**，Muse→DOTS→Hermes→Grok 全在原线程各回一次，来源正确，末棒 DONE，无人工催答或逐条批准。观察至 18:51 仍恰好四条回复。DOTS 回报协作规则已由用户确认保存为 revision 2；历史 H/H2/J 的失败或审批介入仍保留。这些有界结果不保证任意上下文、事件批次或并发/重投递都能成功
 - DOTS reference：本轮 39 项离线测试通过只适用于该参考模块（基线 36 项，新增 3 项回归）。它不负责 Slack 认证、事件接收、语义分类、历史获取或发送，不能证明托管 DOTS 的运行时防重，更不保证 exactly-once
 
 此前 PR #2、#3 等已合并，Hermes [PR #10](https://github.com/Ares-X/Agents-Slack-Bridge/pull/10) 和 [PR #14](https://github.com/Ares-X/Agents-Slack-Bridge/pull/14) 也已合并；这些是仓库状态，不是部署或四方验收结论。A 历史合并批次收到事件但限制来源回写，B 未见回执；后续成功不抹去这些历史限制。Issue #7 已关闭。真实超时/重投递/断电故障注入未做，详见[验收状态](./chatgpt-dots/REVIEW-2026-10-03.md)。

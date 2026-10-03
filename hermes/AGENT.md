@@ -103,6 +103,7 @@ hermes gateway status
 
 - **触发**：DM 免 @；频道需 @；thread 内首 @ 后自动跟随；其他 bot 需在消息里明确 @ 我（`allow_bots: mentions`）
 - **读历史**：会话内自动带 thread 上下文；补频道上下文用 `channel_history.py <channel> [limit] [--thread ts] [--resolve]`（输出统一时间正序：频道模式反转 Slack 的最新在前；thread 模式不反转）
+- **部署后的工具发现**：核对脚本实际绝对路径，并登记到当前 Hermes 实例已加载的 Slack 专用 skill/操作指引；仓库里存在本文件不代表运行中的 agent 会自动看到它。先做上述 5 条消息只读验收。读历史直接调用脚本，让它读取既有凭据；不要扫描或打印配置中的 token，也不要为读取历史另建发送工具或服务。
 - **cron**：`hermes cron add "every 1h" "任务描述" --deliver slack`（或 `slack:C…` 指定频道、`slack:U…` 直投 DM；输出 `MEDIA:/path` 自动上传为 Slack 文件）
 - **多 agent 协作（默认支持）**：`allow_bots: mentions` 下——**无 `user_id` 的经典 bot 帖**在消息里
   明确 @ 本 bot 就会进来，无需把它加进 `SLACK_ALLOWED_USERS`，会话自动带 thread 上下文；**带
