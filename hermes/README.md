@@ -403,6 +403,38 @@ workspace 白名单、回合执行时刷新、历史引用隔离、失败/截断
 传输、媒体和运行时 owner 使用隔离替身，不是完整 gateway 测试。部署及重启须另由已授权 owner 执行，
 核对真实加载，再用无需预先配置根 ts 的新任务验收多轮协作；当前状态为 `NOT_EXERCISED`。
 
+### 每轮协作规则的运行时加载
+
+频道观察补丁提供数据，仓库 `AGENT.md` 或 skill 更新不保证既有作者会话看到了操作规则。
+固定 836 的绑定 skill 只在新会话自动加载。本目录的
+[增量补丁](./patches/collaboration-turn-contract-836.patch) 依赖固定 836 + PR17 + PR19，
+只修改 Slack adapter 的现有 `_channel_prompt_with_identity` 与事件装配调用：
+仅明确 `group`、非空 workspace、匹配 `collaboration_channels` 精确 `team:channel` 且配置项为 mapping
+时，在原 identity 和 channel prompt 之后追加短静态规则。DM、范围外及未分类调用保持原 prompt。
+
+规则通过已有 `channel_prompt` 进入 trusted ephemeral system prompt；公共观察仍留在数据路径，
+不增加作者/工具权限。每个新入站事件都携带规则，queued 回合沿用该事件自己的 prompt；
+runner 每次执行都重新合并，并把完整 prompt 纳入 agent cache signature，下一事件无需重置已有会话。
+规则不追溯修改已经运行或此前已创建的事件；正常加载新进程后须核对源码 hash 和真实回复。
+
+普通频道回复正文只走 adapter final，不在回合中用工具或 API 另发正文；每一步正常 final 后
+结束并等待新事件。需要时立即用已安装 history helper 补读，禁止用
+sleep、cron、延迟命令或 curl 轮询等候同伴。版本依据最新可见 ts 对账，已解决的旧 bot trigger
+按既有权限静默，未收回复保持 pending；旧版表态不能当作新版接受，不能凭沉默或自行冻结期
+宣称共同通过，须遵守实际任务的共识规则。修订先说变化点，实际定稿才提供全文。
+只原生点名实际接收请求的人。它保留必要的实质多轮讨论、会话隔离和安全审批。
+该指导能减少长回合与旧稿，不提供频道全局串行或模型遵守规则的保证。
+
+```bash
+git apply --check /path/to/hermes/patches/collaboration-turn-contract-836.patch
+git apply /path/to/hermes/patches/collaboration-turn-contract-836.patch
+python3 /path/to/hermes/test_collaboration_turn_contract.py /path/to/patched/hermes-agent
+```
+
+应用前核对版本、备份 adapter 并保留已有脏改；冲突即停，不重复应用前置补丁。
+回归执行真实 prompt/事件/runner/queued 方法，覆盖 scope、DM、原 prompt 顺序及作者归属；
+transport/runtime 使用隔离替身，不等于已加载、模型遵守或真实并发协作通过。
+
 排序依据（Slack 官方文档）：`conversations.history` 最新在前，脚本反转为旧→新；
 `conversations.replies` 本身旧→新（父消息开头），脚本不再二次反转——两种模式输出统一为时间正序。
 
@@ -470,7 +502,8 @@ hermes/
 ├── test_authz_matrix.py         # 授权矩阵回归（临时 worktree @b3059921bc，12 项断言）
 ├── test_memory_notifications_platform.py # 已补丁上游的只读平台通知回归
 ├── test_natural_collaboration.py # 已补丁 836 的频道上下文/忙碌回显隔离回归
-├── patches/                    # 固定 836 的平台通知补丁和自然协作候选补丁
+├── test_collaboration_turn_contract.py # 每轮 trusted 协作规则与 scope/queued 回归
+├── patches/                    # 固定 836 的平台通知、观察与每轮规则增量补丁
 ├── verify_authz_order.sh        # 授权模型源码顺序核验（固定 commit，零网络）
 └── slack-mention/               # 出站 @提及 插件（本机 owner 自建，见下节）
 ```
