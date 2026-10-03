@@ -540,6 +540,91 @@ check("R4i 流收尾自身照常：尾段无提及时前缀原文直达（对照
       repr(upd_final)[:300])
 
 
+class PlainClient(FakeClient):
+    """chat.stopStream 恒失败：逼出 _commit_stream 的恢复路径（chat.update 补投）。
+
+    纯文本部署（rich_blocks=False）下 orig _maybe_blocks 恒 None——正是评审
+    第五轮 P2 的回归现场：r4 的「final_blocks 探测」把它误判成「text 缺解析」
+    又跑了全文 _resolve_async_outlet，已发送前缀里的 @name 被二次改写。
+    """
+
+    async def chat_stopStream(self, **kw):
+        self.stops.append(kw)
+        raise RuntimeError("stopStream down (review round 5)")
+
+
+def plain_adapter(team="T1"):
+    """rich_blocks=False 的真实适配器（纯文本部署），已预热 TA 表。"""
+    cl = PlainClient([{"members": MEM_A4, "next_cursor": ""}])
+    ad = RealAdapter(PlatformConfig(extra={"rich_blocks": False}))
+    ad._app = type("App", (), {"client": cl})()
+    ad._team_clients = {team: cl}
+    mod._wrap_adapter(ad)
+    run_async(mod._name_table(ad, team_id=team))
+    return ad, cl
+
+
+# R5a 复现（P2 正文场景）：draft 已含已发送提及，终稿尾段再提一次同名——
+# 恢复 edit 必须保留前缀原文、只解析尾段。r4 缺陷：全文重解析把前缀里的
+# @Alice 也改成 <@U9>（"Done <@U9> and <@U9>"）；2bda701 保持前缀不动。
+adP, clP = plain_adapter()
+mdP = {"team_id": "T1", "thread_id": "5555"}
+run_async(adP.send_draft("CP", 1, "Done @Alice", metadata=mdP))
+sP = run_async(adP.send("CP", "Done @Alice and @Alice", metadata=mdP))
+rec = clP.updates[-1] if clP.updates else {}
+check("R5a 纯文本 stopStream 失败：恢复 edit 保留已发送前缀（@Alice 不二次改写）",
+      sP.success and rec.get("text") == "Done @Alice and <@U9>",
+      repr((rec, clP.updates))[:400])
+
+# R5b 复现（流式边界拆名变体）：draft 以半个提及收尾，恢复 edit 不得把它
+# 补写成实体（词内 @ 不是提及，前缀字节已上屏）。
+adQ, clQ = plain_adapter()
+mdQ = {"team_id": "T1", "thread_id": "6666"}
+run_async(adQ.send_draft("CQ", 1, "Done @Al", metadata=mdQ))
+sQ = run_async(adQ.send("CQ", "Done @Alice tail", metadata=mdQ))
+recQ = clQ.updates[-1] if clQ.updates else {}
+check("R5b 边界拆名：恢复 edit 保留被切开的提及原文（@Alice 不进实体）",
+      sQ.success and recQ.get("text") == "Done @Alice tail",
+      repr(recQ)[:400])
+
+# R5c 恢复 edit 不重复发布：收尾失败后没有新 chat.postMessage（一个答案）。
+check("R5c 恢复 edit 不重复发布（无新 post）",
+      not clP.posts and not clQ.posts,
+      f"posts={len(clP.posts)},{len(clQ.posts)}")
+
+
+# —— R5-2：取消清理（回归保留）——
+async def cancelled_finalize():
+    # 收尾停在恢复 edit 内（update 门闩）时任务被取消：finally 必须撤销
+    # contextvar 登记，否则同上下文后续同键编辑永远直通（解析被吞）。
+    cl = GatedClient([{"members": MEM_A4, "next_cursor": ""}], gate_update=True)
+    ad = RealAdapter(PlatformConfig(extra={"rich_blocks": False}))
+    ad._app = type("App", (), {"client": cl})()
+    ad._team_clients = {"T1": cl}
+    mod._wrap_adapter(ad)
+    await mod._name_table(ad, team_id="T1")
+    md = {"team_id": "T1", "thread_id": "7777"}
+    task = asyncio.create_task(ad._commit_stream(
+        ("T1", "CC", "7777"), {"ts": "7777", "sent": "keep @Alice"},
+        "keep @Alice tail", md, delta=" tail", replace=False))
+    await _settle()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    cl.update_gate.set()   # 打开门闩，让后续普通编辑能走通 chat_update
+    # 取消后同一事件循环内的普通编辑必须恢复解析（登记已被 finally 撤销）。
+    await ad.edit_message("CC", "7777", "later @Alice edit", metadata=md)
+    return cl.updates[-1] if cl.updates else {}
+
+
+rec_cancel = run_async(cancelled_finalize())
+check("R5d 取消清理：取消后 contextvar 登记撤销，后续编辑照常解析",
+      rec_cancel.get("text") == "later <@U9> edit",
+      repr(rec_cancel)[:400])
+
+
 print()
 print(f"checks={CHECKS} fails={len(FAILS)}")
 if FAILS:

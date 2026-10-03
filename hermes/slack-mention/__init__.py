@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slack mention 插件 v1.3 r4（2026-10-03，PR #10 三轮复核后续）
+"""Slack mention 插件 v1.3 r5（2026-10-03，PR #10 四轮复核 P2 回归修复）
 
 官方面（不变）：
 - ``ctx.register_platform_handler("slack", factory)`` — SlackAdapter.connect() 时把
@@ -23,8 +23,10 @@ v1.3 r4 修的三件事（评审第三轮复核）：
    子树）可见。不同工作区的同 ts 流并发收尾互不干扰（A 完成不再撤销 B 的
    保护）；A 等待期间 B 的同 ts 无关普通编辑照常解析（不再被错误跳过）。
    嵌套同步出口（``_commit_stream`` 内 ``_maybe_blocks`` 探测）同 task 天然
-   继承上下文。直通分支补 ``final_blocks`` 探测：渲染器返回 None 时补送解
-   析后的 plain text，杜绝 replace 路径 text/blocks 指人两套。
+   继承上下文。直通 edit **原样送达**包装已构造的载荷：纯文本部署
+   （rich_blocks=False）下渲染器恒 None，「没有 blocks」不等于「text 缺解
+   析」，再补偿解析会把已发送前缀二次改写（r5 撤销 r4 的 final_blocks
+   探测，回归见 round 5 P2）。
 ③ （评审 #3 为测试夹具修正，见 test_slack_mention_v13_r3.py：R1 场景加载
    MEM_A 而非 Muse/U1。）
 
@@ -686,19 +688,14 @@ def _wrap_adapter(adapter):
         except LookupError:
             active = None
         if active is not None and target is not None and target in active:
-            # 直通前仍补一步 final_blocks 探测（对齐上游 _commit_stream 的
-            # `sealed and not replace and not self._maybe_blocks(text)`）：
-            # replace 直通路径的 finalize edit 只有 blocks 在解析后正文上、
-            # plain text 是原文——若渲染器返回 None（纯文本单行等），补送
-            # 解析后的 plain，避免 text/blocks 同一条消息指人两套。
-            shown = content
-            try:
-                if not orig_maybe_blocks(content):
-                    shown = await _resolve_async_outlet(content, chat_id=chat_id,
-                                                        metadata=metadata)
-            except Exception:
-                shown = content
-            return await orig_edit_message(chat_id, message_id, shown,
+            # 载荷已由 _commit_stream 包装精确构造（extends → floor 限定尾段
+            # 解析；replace → 进入保护上下文**之前**已完成整篇解析），直通
+            # 原样送达，绝不再跑全文解析：纯文本部署（rich_blocks=False）下
+            # orig _maybe_blocks 恒 None——「没有 blocks」不等于「text 缺解
+            # 析」，再解析会把已发送前缀里的 @name 二次改写（round 5 P2：
+            # draft="Done @Alice" 的恢复 edit 被写成 "Done <@U9> and <@U9>"）。
+            # r4 的 final_blocks 探测补偿即此回归根源，撤销。
+            return await orig_edit_message(chat_id, message_id, content,
                                            finalize=finalize, metadata=metadata)
         content = await _resolve_async_outlet(content, chat_id=chat_id, metadata=metadata)
         return await orig_edit_message(chat_id, message_id, content,
@@ -786,8 +783,8 @@ def _wrap_adapter(adapter):
     adapter.edit_message = _edit_message_patched
     if orig_commit_stream is not None:
         adapter._commit_stream = _commit_stream_patched
-    LOG.info("[Slack] mention plugin v1.3 r4: adapter wrapped (instance-level)")
-    print("[slack-mention-plugin] adapter wrapped v1.3 r4", flush=True)
+    LOG.info("[Slack] mention plugin v1.3 r5: adapter wrapped (instance-level)")
+    print("[slack-mention-plugin] adapter wrapped v1.3 r5", flush=True)
 
 
 def _factory(native, adapter):
