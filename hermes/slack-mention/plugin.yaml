@@ -1,5 +1,5 @@
 name: slack-mention
-version: 1.2.0
-description: Slack outbound name->ID mention resolution + native rich_text mention elements (owner plugin; v1.2 aligns real upstream contracts - renderer style.code protection, ambiguity vs no-match, team-bound member tables, _seal_stream delta semantics, metadata-routed edit path)
+version: 1.3.0
+description: Slack outbound name->ID mention resolution + native rich_text mention elements (owner plugin; v1.3 aligns the REAL upstream contract - _commit_stream(key,stream,text,metadata,delta,replace) wrapper, AsyncSlackResponse .get() pagination, workspace-bound sync table routing)
 author: Hermes (owner install)
 kind: backend

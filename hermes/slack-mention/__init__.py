@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slack mention 插件 v1.2（2026-10-03，主人 review 2ef6547 的五项复核意见）
+"""Slack mention 插件 v1.3（2026-10-03，PR #10 二轮复核三项）
 
 官方面（不变）：
 - ``ctx.register_platform_handler("slack", factory)`` — SlackAdapter.connect() 时把
@@ -8,35 +8,38 @@
      凌晨血坑：async 化会被同步调用点拿到 coroutine）。
   2. ``adapter._post_chunks`` — 兜底路径预热成员表。
   3. ``adapter.edit_message`` — 编辑路径同样解析（v1.0 漏）。
-  4. ``adapter._seal_stream`` — 原生流收尾同样解析（v1.0 漏）。
+  4. ``adapter._commit_stream`` — 原生流收尾解析（v1.3 换位：v1.2 包的
+     ``_seal_stream`` 是旧上游契约，新上游文本收尾全部走 ``_commit_stream``）。
 
-v1.2 修的五件事（对齐树内真实契约，2026-10-03 二轮 review）：
-① 代码保护识别**真实 renderer** 的 style.code：block_kit.py 渲 inline code 时产出
-   ``{"type": "text", "style": {"code": true}}``（不是 rich_text_inline_code 元素
-   类型）；v1.1 只认元素类型 → 真实渲染产物漏保护。现在两者都认：元素类型
-   （rich_text_preformatted / rich_text_inline_code）或 text 元素带 style.code。
-② 「查无名称」与「名称歧义」分开：_lookup 返回
-   (uid, "") / (None, "ambiguous") / (None, "nomatch")。
-   @name 解析回退链（多词→截短）上遇到歧义**立即停止缩短**——两个 display 都叫
-   "alice" 的 workspace 里，"@alice please" 绝不许回退吃掉 please 去撞别的名字。
-③ 成员表严格绑定目标 team：上游 _get_client/_client_for 的 fallback 链（map 未知
-   → 单工作区兜底 → primary）只用于「发消息」；**建表固定用显式 team_id**（非
-   fallback），跨 team 复用 = 拿 A 工作区的名字解析 B 工作区的消息 = 指错人。
-④ ``_seal_stream`` 真实契约 = (chat_id, stream, final_text=None, blocks=None)，
-   且上游只把 final_text 当**完整终稿**、只发 ``final_text[len(sent):]`` 增量
-   （append-only，且仅当 final_text.startswith(sent)）。所以解析只能施加于
-   **尚未流出的尾部**：new_final = sent + resolve(final_text[len(sent):])，
-   绝不解析整篇再传——否则 startswith 断裂，上游一个字增量都不发（丢内容）；
-   已流入 stream 的 mention 无法追溯解析（append-only 的物理限制，接受）。
-   stream["sent"] 不动：上游正是靠它与 final_text 的差值算增量（见
-   _seal_stream_patched）。
-⑤ edit_message 的 kwargs 面保持 (chat_id, message_id, content, finalize=False,
-   metadata=None) 原样透传，**且成员表键走 metadata 工作区路由**
-   （scope_id/slack_team_id/team_id/team/guild_id/workspace_id，与树内
-   _metadata_team_id 同源 keys），不再依赖 _channel_team fallback。
+v1.3 修的三件事（对齐上游 a5e7df27c7 / b3059921bc 的真实契约）：
+① ``_commit_stream`` 才是带文本的收尾路径，真实签名
+   ``(key, stream, text, metadata, delta="", replace=False)``：
+   - ``key`` 是 ``(team_id, chat_id, thread_ts)`` 三元组（key[0] 即权威 team，
+     建表路由直接用它）；
+   - ``delta`` 是**未流出的尾段**——``chat.stopStream.markdown_text`` 是 APPEND
+     语义，上游不变式 ``text.endswith(delta)``（由 ``_stream_relation`` 切出）；
+   - ``replace=True`` 表示终稿被改写、不与 sent 前缀对齐，由 chat.update 整篇替换。
+   解析施加面：replace → 整篇解析（纯 update 载荷，无 append 约束）；delta 非空 →
+   只解析尾段并同步改写 ``text`` 尾部（保持 ``text.endswith(delta)`` 与 sent 前缀
+   关系）；delta 空 → 原样透传。上游对 ``_seal_stream`` 的其余直呼（片段切换封口、
+   前缀断裂封口、超龄清理、断连清理）都**不带文本**，无需包装——包了反而要猜旧签名。
+   已流入 stream 的 mention 无法追溯解析（append-only 物理限制，接受）；富文本路径
+   的 chat.update 会带解析后的整篇 blocks，等于收尾时把可见正文重新排一次版。
+② ``users_list`` 响应是 ``AsyncSlackResponse``：支持 ``.get()`` 但**不是 dict**。
+   ``isinstance(resp, dict)`` 判断会把整页成员丢掉、分页提前终止、缓存空表。
+   改为 ``hasattr(resp, "get")`` 鸭子型取值（dict 与 SlackResponse 通吃）。
+③ 同步取表严格绑工作区：有目标上下文（显式 team_id / chat 映射 / metadata）→
+   只认该 team 的表，未就绪宁可不解析；无上下文（``_maybe_blocks(content)`` 只有
+   正文）→ 仅当缓存里**只有一个** team 键时用它（单工作区主场景），多 team 键 =
+   目标工作区无法确定 → 保留原文。绝不禁用「任取第一个表」——那是拿 A 工作区的
+   名字解析 B 工作区的消息。
 
-v1.1 保留的既有修复（未回退）：短名回退（"@Muse please review"→只吃 Muse）、
-句末标点（"@Muse."→<@U1>.）、围栏/内联代码片段的文本级保护。
+v1.2 保留的修复（未回退）：真实 renderer 的 ``style.code`` 代码保护、「查无」与
+「歧义」分离（歧义立即停，绝不回退吃更短的名字）、成员表严格绑定目标 team、
+edit 路径 metadata 工作区路由。
+
+v1.1 保留的既有修复：短名回退（"@Muse please review"→只吃 Muse）、句末标点
+（"@Muse."→<@U1>.）、围栏/内联代码片段的文本级保护。
 """
 
 import asyncio
@@ -82,9 +85,11 @@ def _split_code(text):
 # 不靠正则贪婪回退——显式从最长候选逐级截短查表，解决两类洞：
 #   "@Muse please review" → 逐级退到 "muse" 命中，英文留在原文；
 #   "@Muse." → 候选 "muse." miss 后剥尾部句号 "muse" 命中，句号留在原文。
+# lookbehind 排除 '<'：已解析的实体 "<@U1>" 内部不再当候选（若某用户名恰为
+# "u1"，二次解析会把 "<@U1>" 改写成 "<<@UID>1>"——幂等性防线）。
 _TOKEN = r"[A-Za-z0-9_.\-]+"
 _MENTION_SPAN_RE = re.compile(
-    r"(?<![A-Za-z0-9_.@>\-])@(" + _TOKEN + r"(?:[ ]+" + _TOKEN + r")*)"
+    r"(?<![A-Za-z0-9_.@>\-<])@(" + _TOKEN + r"(?:[ ]+" + _TOKEN + r")*)"
 )
 
 
@@ -261,10 +266,10 @@ def _tokenize_blocks(blocks):
 # {lower_name: (score, [uid...])}  score: 3=username 2=display/real
 # ---------------------------------------------------------------------------
 
-# 与树内 SlackAdapter._metadata_team_id 同源的 metadata keys（上游用
-# _first_truthy 按序取第一个真值；source 子 dict 再查一遍同款 keys）。
 _METADATA_TEAM_KEYS = ("scope_id", "slack_team_id", "team_id", "team",
                        "guild_id", "workspace_id")
+# source 子 dict 层上游只认这四个（窄于顶层），见树内 _metadata_team_id。
+_SOURCE_TEAM_KEYS = ("scope_id", "slack_team_id", "team_id", "guild_id")
 
 
 def _first_truthy(d, keys):
@@ -276,17 +281,28 @@ def _first_truthy(d, keys):
 
 
 def _metadata_team_id(metadata):
-    """从出站 metadata 取工作区 id（只读 dict，不碰 adapter 状态）。"""
+    """从出站 metadata 取工作区 id（只读，不碰 adapter 状态）。
+
+    与树内 SlackAdapter._metadata_team_id 同构：顶层 keys 全集 → source 子 dict
+    用窄 keys → source 是对象时 getattr(scope_id/guild_id)。任何形状都不抛。
+    """
     if not metadata:
         return ""
+    if not isinstance(metadata, dict):
+        value = getattr(metadata, "scope_id", None) or getattr(metadata, "team_id", None)
+        return str(value) if value else ""
     found = _first_truthy(metadata, _METADATA_TEAM_KEYS)
     if found:
         return str(found)
-    source = metadata.get("source") or {}
+    source = metadata.get("source")
     if isinstance(source, dict):
-        found = _first_truthy(source, _METADATA_TEAM_KEYS)
+        found = _first_truthy(source, _SOURCE_TEAM_KEYS)
         if found:
             return str(found)
+    elif source is not None:
+        value = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+        if value:
+            return str(value)
     return ""
 
 
@@ -328,7 +344,10 @@ async def _name_table(adapter, chat_id=None, team_id=None):
                 kwargs = {"limit": 200}
                 while True:
                     resp = await client.users_list(**kwargs)
-                    listed = resp.get("members", []) if isinstance(resp, dict) else []
+                    # 响应是 AsyncSlackResponse：支持 .get() 但**不是 dict**
+                    # （isinstance(resp, dict) 会整页丢弃+分页终止+缓存空表）。
+                    # 鸭子型取值，dict 与 SlackResponse 通吃。
+                    listed = resp.get("members") or [] if hasattr(resp, "get") else []
                     for u in listed:
                         if u.get("deleted"):
                             continue
@@ -354,10 +373,9 @@ async def _name_table(adapter, chat_id=None, team_id=None):
                             if n:
                                 put(n, 2)
                     cur = None
-                    if isinstance(resp, dict):
-                        meta = resp.get("response_metadata")
-                        if isinstance(meta, dict):
-                            cur = meta.get("next_cursor")
+                    meta = resp.get("response_metadata") if hasattr(resp, "get") else None
+                    if isinstance(meta, dict):
+                        cur = meta.get("next_cursor")
                     if cur:
                         kwargs["cursor"] = cur
                     else:
@@ -385,20 +403,35 @@ def _team_client(adapter, team_id, chat_id):
         return None
 
 
-def _sync_table_if_ready(adapter):
-    """同步路径取表：仅当该 adapter 已有任一未过期缓存表（不 await、不建表）。
+def _sync_table_if_ready(adapter, chat_id=None, team_id=None, metadata=None):
+    """同步路径取表：仅用**目标工作区**的现成缓存表（不 await、不建表）。
 
-    _maybe_blocks 是同步签名（树内同步调用点），冷启动没表时宁可不解析，
-    也不能阻塞/返回 coroutine。async 出口（send/_post_chunks/edit/seal）都会先
-    await 建表，所以正常会话首条之前表就已就绪。
+    工作区上下文解析（与 async 出口同一条链）：
+      显式 team_id > metadata 工作区 keys > chat 映射（_channel_team）。
+    - 有上下文 → 只认该 team 的表；未就绪/未过期不存在 → 宁可不解析。
+    - 无任何上下文（``_maybe_blocks(content)`` 只有正文）→ 仅当缓存里恰好
+      **只有一个** team 键时用它（单工作区主场景的既有多数行为）；
+      多个 team 键 = 目标工作区无法确定 → 保留原文。
+    绝不「任取第一个表」——那是拿 A 工作区的名字表解析 B 工作区的消息 = 指错人。
+    _maybe_blocks 是同步签名（树内同步调用点），这里不能阻塞/返回 coroutine；
+    async 出口（send/_post_chunks/edit/commit）都会先 await 建表，正常会话首条
+    之前表就已就绪。
     """
     tables = getattr(adapter, _TABLES_ATTR, None)
     if not tables:
         return None, None
     now = time.monotonic()
-    for key, (table, ts) in tables.items():
-        if table and now - ts < _TABLE_TTL:
-            return key, table
+    tid = team_id or _metadata_team_id(metadata)
+    if not tid and chat_id:
+        tid = (getattr(adapter, "_channel_team", None) or {}).get(chat_id) or ""
+    if tid:
+        st = tables.get(tid)
+        if st and st[0] and now - st[1] < _TABLE_TTL:
+            return tid, st[0]
+        return None, None
+    fresh = [(k, st[0]) for k, st in tables.items() if st[0] and now - st[1] < _TABLE_TTL]
+    if len(fresh) == 1:
+        return fresh[0]
     return None, None
 
 
@@ -416,10 +449,16 @@ def _wrap_adapter(adapter):
     orig_maybe_blocks = adapter._maybe_blocks
     orig_post_chunks = adapter._post_chunks
     orig_edit_message = adapter.edit_message
-    orig_seal_stream = adapter._seal_stream
+    orig_commit_stream = adapter._commit_stream
+
+    # 目标工作区 id 的单一解析链：显式 team_id > metadata keys > chat 映射。
+    def _target_team_id(chat_id=None, team_id=None, metadata=None):
+        return team_id or _metadata_team_id(metadata) or _team_key(adapter, chat_id)
 
     def _maybe_blocks_patched(content):
         # 必须保持同步签名（树内调用点同步取值）。解析只用现成缓存表。
+        # 树内 _maybe_blocks(content) 只有正文、无工作区上下文——按
+        # _sync_table_if_ready 的「唯一 team 键或保留原文」规则取表。
         try:
             _, table = _sync_table_if_ready(adapter)
             if table:
@@ -438,7 +477,7 @@ def _wrap_adapter(adapter):
         team 路由与树内出站一致：显式 team_id（_post_chunks 自带）>
         metadata 工作区（edit 的 _client_for 同源 keys）> chat 映射 > ""。
         """
-        tid = team_id or _metadata_team_id(metadata) or _team_key(adapter, chat_id)
+        tid = _target_team_id(chat_id, team_id, metadata)
         try:
             table = await _name_table(adapter, chat_id=chat_id, team_id=tid)
             return _build_repl_string(content, table)
@@ -456,34 +495,45 @@ def _wrap_adapter(adapter):
         return await orig_edit_message(chat_id, message_id, content,
                                        finalize=finalize, metadata=metadata)
 
-    async def _seal_stream_patched(chat_id, stream, final_text=None, blocks=None):
-        # 上游真实契约（树内 adapter._seal_stream）：
-        #   def _seal_stream(self, chat_id, stream, final_text=None, blocks=None)
-        #   final_text 是**完整终稿**；仅当 final_text.startswith(sent) 才发
-        #   final_text[len(sent):] 增量（append-only，发了的收不回）。
-        # 因此解析只施加于尚未流出的尾部：
-        #   new_final = sent + resolve(final_text[len(sent):])
-        # 解析整篇会破坏 startswith → 上游一个字增量都不发（丢内容）；已流入
-        # stream 的 mention 无法追溯解析（append-only 的物理限制，接受）。
-        # stream["sent"] 保持原样——上游靠它与 final_text 的差值算增量。
-        if final_text is None:
-            return await orig_seal_stream(chat_id, stream)
+    async def _commit_stream_patched(key, stream, text, metadata=None, *,
+                                     delta="", replace=False):
+        # 上游真实契约（a5e7df27c7 / b3059921bc，plugins/platforms/slack/adapter.py）：
+        #   async def _commit_stream(self, key, stream, text, metadata=None, *,
+        #                             delta="", replace=False)
+        # - key = (team_id, chat_id, thread_ts)——key[0] 是权威 team（树内
+        #   _stream_key 用 metadata/_channel_team 建的），建表直接用它路由；
+        # - delta 是未流出尾段：orig 内部把 delta 原样递给 _seal_stream 的
+        #   chat.stopStream(markdown_text=delta)——APPEND 语义。所以解析后的
+        #   尾段必须**同时**改写 text 尾部与 delta 本身，两者保持一致；
+        # - replace=True：终稿被改写（不与 sent 前缀对齐），走 chat.update 整篇
+        #   替换——纯 update 载荷，无 append 约束，可整篇解析；
+        # - delta=""：纯封口（片段切换/清理），无文本可解析，原样透传；
+        # - extends 不变量被打破的防御形状：原样透传，宁可不解析（整篇解析会
+        #   让 stopStream 追加一段与 sent 不接续的文本 = 重复内容）。
+        team_id = key[0] if isinstance(key, (tuple, list)) and key else None
+        if not text or (not delta and not replace):
+            return await orig_commit_stream(
+                key, stream, text, metadata, delta=delta, replace=replace)
+        if replace:
+            new_text = await _resolve_async_outlet(text, team_id=team_id)
+            return await orig_commit_stream(
+                key, stream, new_text, metadata, delta=delta, replace=replace)
         sent = (stream or {}).get("sent", "")
-        if not final_text.startswith(sent):
-            return await orig_seal_stream(chat_id, stream, final_text=final_text,
-                                          blocks=blocks)
-        resolved_tail = await _resolve_async_outlet(
-            final_text[len(sent):], chat_id=chat_id)
-        new_final = sent + resolved_tail
-        return await orig_seal_stream(chat_id, stream, final_text=new_final,
-                                      blocks=blocks)
+        if not text.endswith(delta) or not text.startswith(sent):
+            return await orig_commit_stream(
+                key, stream, text, metadata, delta=delta, replace=replace)
+        head = text[:len(text) - len(delta)]  # == sent（extends 不变量），原样
+        resolved_tail = await _resolve_async_outlet(delta, team_id=team_id)
+        new_text = head + resolved_tail
+        return await orig_commit_stream(
+            key, stream, new_text, metadata, delta=resolved_tail, replace=replace)
 
     adapter._maybe_blocks = _maybe_blocks_patched
     adapter._post_chunks = _post_chunks_patched
     adapter.edit_message = _edit_message_patched
-    adapter._seal_stream = _seal_stream_patched
-    LOG.info("[Slack] mention plugin v1.2: adapter wrapped (instance-level)")
-    print("[slack-mention-plugin] adapter wrapped v1.2", flush=True)
+    adapter._commit_stream = _commit_stream_patched
+    LOG.info("[Slack] mention plugin v1.3: adapter wrapped (instance-level)")
+    print("[slack-mention-plugin] adapter wrapped v1.3", flush=True)
 
 
 def _factory(native, adapter):
