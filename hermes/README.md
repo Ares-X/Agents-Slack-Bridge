@@ -190,6 +190,17 @@ smoke-test 同款 mock，12/12 断言；源码行级顺序另由 `hermes/verify_
 Slack 出站全灭，10-03 凌晨实测 667 次报错）。名字解析只用缓存表，表由 `_post_chunks`
 的 async 路径预热。启用：`plugins.enabled` 列 `slack-mention`。
 
+**v1.3（PR #10 三项复核）**：流式收尾包装从 `_seal_stream` 换到 `_commit_stream`
+（上游 `a5e7df27c7` / `b3059921bc` 真实契约：key=(team,chat,thread_ts)、
+`delta=`=未流出尾段、stopStream APPEND 语义——解析后的尾段同时改写 text 尾部与
+delta 本身；`replace=True` 走 chat.update 整篇解析）。`users_list` 响应是
+`AsyncSlackResponse`：支持 `.get()` 但不是 dict——鸭子型取值，两页分页都能进表。
+同步取表严格绑目标工作区：显式 team_id > metadata keys > chat 映射；无上下文时
+只有唯一 team 键才用（多 team 键 = 保留原文，绝不幸存者偏差指错人）。
+测试 `slack-mention/test_slack_mention_v13.py`：固定 commit worktree 载真实上游，
+37 断言（契约/分页/全链路 send_draft→send→_commit_stream/多工作区隔离/歧义）
+——`HERMES_ROOT` 环境变量指 checkout，可选 argv 传 repo/commit。
+
 ## 读取历史
 
 Hermes 在会话内自动带 thread 上下文（adapter 内置 `conversations.replies` 水位缓存），一般不需要手动读。需要补频道级上下文（多 agent 对账、审计）时用本目录 CLI：
