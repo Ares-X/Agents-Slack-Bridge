@@ -24,7 +24,8 @@ chat -> agent。agent 用真实模型生成回复正文后，经 stdin 交给本
   2 = 结果不确定（已保持 uncertain，走 history 核验；不得 ack、
        不得盲目重发）
   3 = 发送成功但 ack 失败（已记 unacked，只重试 ack，绝不重发正文）
-  4 = 状态损坏、存储失败或静默来源不可确认（fail-closed）
+  4 = 状态损坏、存储失败、静默来源不可确认或新发送身份未知
+      （fail-closed；身份未知时不领取、不 POST）
 """
 import os
 import sys
@@ -58,6 +59,7 @@ EXIT = {
     "held-uncertain": 2,
     "held-unacked": 3,
     "held-retry_wait": 75,
+    "identity-unavailable": 4,  # No fresh claim/POST; retry identity resolution.
 }
 
 
