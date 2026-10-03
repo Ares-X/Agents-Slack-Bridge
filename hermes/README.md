@@ -381,6 +381,8 @@ hermes/
 ├── channel_history.py           # 频道/线程历史 CLI（stdlib-only，零依赖）
 ├── test_channel_history.py      # channel_history 回归测试（runpy 进程内，29 项断言，零网络）
 ├── test_authz_matrix.py         # 授权矩阵回归（临时 worktree @b3059921bc，12 项断言）
+├── test_memory_notifications_platform.py # 已补丁上游的只读平台通知回归
+├── patches/                    # 固定 836 的 memory_notifications 平台覆盖补丁
 ├── verify_authz_order.sh        # 授权模型源码顺序核验（固定 commit，零网络）
 └── slack-mention/               # 出站 @提及 插件（本机 owner 自建，见下节）
 ```
