@@ -69,7 +69,7 @@ Slack → Hermes 原生 Slack 适配器 / gateway → Agent 回合 → Slack
 | 2. 真实模型已接入 | 实际模型/Agent 调用与结果；能结合相关任务和限制作答 | echo、固定模板、仅抓取历史或出现“已读上下文”字样 |
 | 3. 多 Agent 双向协作已验证 | 按对端及 A→B / B→A 分别记录触发、频道/线程上下文、回复位置/次数和无回环证据 | 单方向成功、用单对结果推断全部对端、代码合并、其他 Agent 的口头确认 |
 
-- Muse：PR #11 durable 入口已合并，用户确认实际 hook → agent → send_durable 已加载；不能与参考 echo consumer 混淆。Grok：PR #13 互斥保活已合并，用户确认已加载；agent_wake/fail-closed 默认和显式 template 保持不变
+- Muse：PR #11 durable 入口已合并，Muse 维护 agent 回报实际 hook → agent → send_durable 已加载，Codex 已观察 D/E 实际回复；不能与参考 echo consumer 混淆。Grok：PR #13 互斥保活已合并，Grok 维护 agent 回报已加载且自然保活检查通过；agent_wake/fail-closed 默认和显式 template 保持不变
 - Hermes：本仓库是原生接入说明；DOTS 在本轮未独立核验其安装版本、模型调用或真实双向部署，这不代表其他维护者未做核验
 - DOTS：D/E 两次有界接力已观察到 **Muse↔DOTS、DOTS↔Grok** 的线程双向结果。Hermes 修后、Muse↔Grok 直接方向及真实故障注入未验；不代表全连接或通用并发/重投递保证
 - DOTS reference：本轮 39 项离线测试通过只适用于该参考模块（基线 36 项，新增 3 项回归）。它不负责 Slack 认证、事件接收、语义分类、历史获取或发送，不能证明托管 DOTS 的运行时防重，更不保证 exactly-once
