@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slack mention 插件 v1.3（2026-10-03，PR #10 二轮复核三项）
+"""Slack mention 插件 v1.3 r4（2026-10-03，PR #10 三轮复核后续）
 
 官方面（不变）：
 - ``ctx.register_platform_handler("slack", factory)`` — SlackAdapter.connect() 时把
@@ -11,38 +11,33 @@
   4. ``adapter._commit_stream`` — 原生流收尾解析（v1.3 换位：v1.2 包的
      ``_seal_stream`` 是旧上游契约，新上游文本收尾全部走 ``_commit_stream``）。
 
-v1.3 修的三件事（对齐上游 a5e7df27c7 / b3059921bc 的真实契约）：
-① ``_commit_stream`` 才是带文本的收尾路径，真实签名
-   ``(key, stream, text, metadata, delta="", replace=False)``：
-   - ``key`` 是 ``(team_id, chat_id, thread_ts)`` 三元组（key[0] 即权威 team，
-     建表路由直接用它）；
-   - ``delta`` 是**未流出的尾段**——``chat.stopStream.markdown_text`` 是 APPEND
-     语义，上游不变式 ``text.endswith(delta)``（由 ``_stream_relation`` 切出）；
-   - ``replace=True`` 表示终稿被改写、不与 sent 前缀对齐，由 chat.update 整篇替换。
-   解析施加面：replace → 整篇解析（纯 update 载荷，无 append 约束）；delta 非空 →
-   只解析尾段并同步改写 ``text`` 尾部（保持 ``text.endswith(delta)`` 与 sent 前缀
-   关系）；delta 空 → 原样透传。上游对 ``_seal_stream`` 的其余直呼（片段切换封口、
-   前缀断裂封口、超龄清理、断连清理）都**不带文本**，无需包装——包了反而要猜旧签名。
-   已流入 stream 的 mention 无法追溯解析（append-only 物理限制，接受）；富文本路径
-   的 chat.update 会带解析后的整篇 blocks，等于收尾时把可见正文重新排一次版。
-② ``users_list`` 响应是 ``AsyncSlackResponse``：支持 ``.get()`` 但**不是 dict**。
-   ``isinstance(resp, dict)`` 判断会把整页成员丢掉、分页提前终止、缓存空表。
-   改为 ``hasattr(resp, "get")`` 鸭子型取值（dict 与 SlackResponse 通吃）。
-③ 同步取表严格绑工作区：有目标上下文（显式 team_id / chat 映射 / metadata）→
-   只认该 team 的表，未就绪宁可不解析；无上下文（``_maybe_blocks(content)`` 只有
-   正文）→ 仅当缓存里**只有一个** team 键时用它（单工作区主场景），多 team 键 =
-   目标工作区无法确定 → 保留原文。绝不禁用「任取第一个表」——那是拿 A 工作区的
-   名字解析 B 工作区的消息。
+v1.3 r4 修的三件事（评审第三轮复核）：
+① 无上下文同步渲染不再信「唯一缓存表」：A/B 双工作区只预热 B 时，上游
+   ``_get_client`` 的 primary fallback 把无 metadata 消息发去 A 的客户端——
+   唯一幸存的 B 表不能证明目标工作区（text 留 @name、blocks 换 B 的用户
+   ID = 同一条消息两处指人不一致）。现在要求「缓存唯一键 == primary
+   fallback 实际路由的工作区」（``_app.client.team_id``）才解析；否则 text
+   与 blocks 都保留原文。
+② 流收尾直通状态从适配器级全局 ``set(ts)``/计数改为 **contextvar + 流身份
+   (team, channel, ts)**：直通/抑制窗口只对当前调用上下文（task 及其 await
+   子树）可见。不同工作区的同 ts 流并发收尾互不干扰（A 完成不再撤销 B 的
+   保护）；A 等待期间 B 的同 ts 无关普通编辑照常解析（不再被错误跳过）。
+   嵌套同步出口（``_commit_stream`` 内 ``_maybe_blocks`` 探测）同 task 天然
+   继承上下文。直通分支补 ``final_blocks`` 探测：渲染器返回 None 时补送解
+   析后的 plain text，杜绝 replace 路径 text/blocks 指人两套。
+③ （评审 #3 为测试夹具修正，见 test_slack_mention_v13_r3.py：R1 场景加载
+   MEM_A 而非 Muse/U1。）
 
-v1.2 保留的修复（未回退）：真实 renderer 的 ``style.code`` 代码保护、「查无」与
-「歧义」分离（歧义立即停，绝不回退吃更短的名字）、成员表严格绑定目标 team、
-edit 路径 metadata 工作区路由。
-
-v1.1 保留的既有修复：短名回退（"@Muse please review"→只吃 Muse）、句末标点
-（"@Muse."→<@U1>.）、围栏/内联代码片段的文本级保护。
+v1.3 r3 保留：``_commit_stream`` 真实契约（key/delta/replace）、尾段解析的
+floor 限定与完整终稿判界、``_stream_relation`` 两档 extends 委托、
+SlackResponse 鸭子型取值。
+v1.2 保留：真实 renderer 的 ``style.code`` 代码保护、「查无」与「歧义」分离、
+成员表严格绑定目标 team、edit 路径 metadata 工作区路由。
+v1.1 保留：短名回退、句末标点、围栏/内联代码片段的文本级保护。
 """
 
 import asyncio
+import contextvars
 import logging
 import re
 import time
@@ -54,15 +49,26 @@ _TABLE_TTL = 600.0
 
 _WRAP_ATTR = "_mention_wrap_done"
 _TABLES_ATTR = "_mention_team_tables"  # {team_id|"": (table, mono_ts)}
-# 流收尾期间的原位 finalize edit 标记（ts 集合）：_commit_stream 包装构造好
-# 精确载荷（floor 限定解析/整篇 replace 解析）后，把 stream ts 放进集合；
-# edit_message 包装看到 message_id 在集合里就直通原载荷——否则会把已发送
-# 前缀里的 @name 二次改写成实体（round 3 #2）。集合支持并发流不互踩。
-_STREAM_EDIT_ATTR = "_mention_stream_edits"
-# 收尾直通窗口计数：窗口内 _maybe_blocks 的同步解析被抑制（载荷已由
-# _commit_stream 包装精确构造，再解析会把已发送前缀写进 blocks）。计数而非
-# 布尔——多条流并发收尾时，先完成者不会把别人还开着的窗口关掉。
-_SUPPRESS_ATTR = "_mention_suppress_blocks_resolve"
+
+# v1.3 r4（评审第三轮 #2）：流收尾期间的原位 finalize edit 直通标记，不再用
+# 适配器上的全局 set(ts)/计数，而是 contextvar —— 直通/抑制窗口只对当前
+# 调用上下文（task + 其 await 子树）可见：
+# - 不同工作区/频道的同 ts 流并发收尾互不干扰（A 完成不再撤销 B 的保护，
+#   B 的无关普通编辑不再被 A 的窗口错误跳过提及解析）；
+# - 嵌套同步出口（_commit_stream 内 `not self._maybe_blocks(text)` 的探测
+#   调用）与外层 async 同 task，天然继承上下文，也无需再单独抑制；
+# - edit_message 的直通判定按调用现场解析目标 (team, channel, ts) 精确命中。
+# contextvar 在同步包装（非 async def）里也可 set（无运行循环要求），而其
+# 嵌套 async 函数（如 _commit_stream 内部调用）会继承当前值。
+_STREAM_CTX_NAME = "asb_slack_mention_stream_edit"
+_stream_edit_ctx = contextvars.ContextVar(_STREAM_CTX_NAME, default=None)
+
+# v1.3 r4（评审 #1）：primary fallback 工作区（上游 `_get_client` 最终档
+# `return self._app.client` 实际路由到的工作区）的缓存属性名。生产里
+# `_app.client` 与 `_team_clients[primary]` 是**不同对象**（同 token 各建一
+# 个，connect() 1821 行），对象身份在生产必失败——所以三层解析见
+# `_primary_team_id`：对象身份 → client.team_id 属性 → token 对账。
+_PRIMARY_TEAM_ATTR = "_mention_primary_team"
 
 # <@U…> / <#C…> / <!subteam^S…> / <!here|<!channel|<!everyone>
 _ENTITY_RE = re.compile(
@@ -326,6 +332,47 @@ def _team_key(adapter, chat_id=None, team_id=None):
     return tid or ""
 
 
+def _primary_team_id(adapter):
+    """primary fallback 实际路由到的工作区 id（上游 `_get_client` 最终档），
+
+    生产真实形状（connect()，1821 行起）：``AsyncApp(token=t0, client=web0)`` 与
+    ``_team_clients[T0] = web1`` 是**同 token 的不同对象**——auth.test 只给
+    ``_team_clients`` 添 team 名，``_app.client`` 上没有。所以按序三层：
+      ① 对象身份：``_app.client is _team_clients[tid]``（测试桩/同对象捷径）；
+      ② 属性：``client.team_id``（部分桩显式携带）；
+      ③ token 对账：``client.token == _team_clients[tid].token``（生产路径，
+         首个 bot token 既是 primary 又必在 map 里，auth.test 保证）。
+    三层全空（未认证/单测空 map）返回 ""；结果缓存到 adapter 属性（键带
+    ``id(_app)``，重连换 ``_app`` 对象时缓存即失效），避免每条无上下文消息
+    都跑 getattr 链。
+    """
+    app = getattr(adapter, "_app", None)
+    client = getattr(app, "client", None)
+    if client is None:
+        return ""
+    cached = getattr(adapter, _PRIMARY_TEAM_ATTR, None)
+    if cached is not None and cached[0] == id(app):
+        return cached[1]
+    team_id = ""
+    for tid, mapped in (getattr(adapter, "_team_clients", None) or {}).items():
+        if mapped is client:
+            team_id = str(tid)
+            break
+    if not team_id:
+        attr = getattr(client, "team_id", None)
+        if attr:
+            team_id = str(attr)
+    if not team_id:
+        primary_token = getattr(client, "token", None)
+        if primary_token:
+            for tid, mapped in (getattr(adapter, "_team_clients", None) or {}).items():
+                if getattr(mapped, "token", None) == primary_token:
+                    team_id = str(tid)
+                    break
+    setattr(adapter, _PRIMARY_TEAM_ATTR, (id(app), team_id))
+    return team_id
+
+
 async def _name_table(adapter, chat_id=None, team_id=None):
     """(table,) 按 team 缓存；过期重建。
 
@@ -423,8 +470,8 @@ def _sync_table_if_ready(adapter, chat_id=None, team_id=None, metadata=None):
       显式 team_id > metadata 工作区 keys > chat 映射（_channel_team）。
     - 有上下文 → 只认该 team 的表；未就绪/过期不存在 → 宁可不解析。
     - 无任何上下文（``_maybe_blocks(content)`` 只有正文）→ 仅当缓存里
-      **只见过一个工作区**时用它（单工作区主场景）；见过两个及以上 =
-      目标工作区无法确定 → 保留原文。
+      **只见过一个工作区**且它就是上游 primary fallback 的工作区时用它；
+      否则目标工作区无法确定 → 保留原文（r4 #1：唯一缓存不能证明目标）。
     「见过」按缓存键全集计（含空表/失败表/过期表）——空表和失败表同样是
     「第二个工作区存在」的证据；若只数新鲜非空表，B 建表失败会把 A 变成
     「唯一幸存者」，等于拿 A 的表猜 B（round 3 #1：预热 A、B 的
@@ -446,10 +493,16 @@ def _sync_table_if_ready(adapter, chat_id=None, team_id=None, metadata=None):
         if st and st[0] and now - st[1] < _TABLE_TTL:
             return tid, st[0]
         return None, None
+    # 无上下文（评审 r4 #1）：「唯一缓存表」不能证明目标工作区——必须要求
+    # 「缓存里只见过一个 team 键」**且**该键就是上游 primary fallback 实际
+    # 路由到的工作区（_app.client.team_id）。A/B 双工作区只预热 B 时，上游
+    # _get_client 把无上下文消息发去 A 的客户端：此时唯一表 B 与目标 A 不
+    # 一致 → text 与 blocks 都保留原文；同一条消息两处指人不一致的根源
+    # 就在此。只有「唯一键 == primary team」才解析（单工作区主场景，及
+    # 双工作区但 primary 已预热且确无他表时）。
     if len(tables) == 1:
-        # 唯一见过的 team 键且表就绪才用；表本身还得新鲜非空。
         k, st = next(iter(tables.items()))
-        if st[0] and now - st[1] < _TABLE_TTL:
+        if st[0] and now - st[1] < _TABLE_TTL and k == _primary_team_id(adapter):
             return k, st[0]
     return None, None
 
@@ -520,6 +573,38 @@ def _resolve_tail_mentions(text, table, floor):
     return "".join(out)
 
 
+def _stream_target_key(adapter, chat_id, message_id, metadata=None):
+    """edit_message 包装侧：按调用现场把 (team, channel, ts) 解析成流身份键。
+
+    team 解析顺序刻意与上游出站路由的**实际效果**一致（见 `_get_client`）：
+    metadata 显式 team > chat 映射（`_channel_team`，入站事件学习）>
+    `scope_id_for_chat`（含「唯一认证工作区」档）> 主客户端的 team。
+    同一条链同时供 `_pass_through_edit`（登记侧，key[0] 即 metadata team）
+    与 `_edit_message_patched`（判定侧）使用——两侧解析函数一致，时序差异
+    不影响命中；同 ts 不同 (team, channel) 的流天然互不干扰（评审 #2）。
+    """
+    team_id = _metadata_team_id(metadata) or _team_key(adapter, chat_id)
+    if not team_id:
+        team_id = _primary_team_id(adapter)
+    return (str(team_id or ""), str(chat_id or ""), str(message_id or ""))
+
+
+def _stream_identity(adapter, key, ts):
+    """_pass_through_edit 登记侧的流身份 = (team, channel, ts)。
+
+    team 取 key[0] 优先——上游 `_stream_key` 建 key 时就是
+    ``metadata team or scope_id_for_chat``，收尾的 finalize edit 又透传同一
+    metadata，两侧天然对齐；key[0] 空（无 metadata 的流）时退 chat 映射 →
+    primary，仍与 edit 侧（metadata 空）同链。
+    """
+    if ts is None:
+        return None
+    chat_id = key[1] if isinstance(key, (tuple, list)) and len(key) > 1 else None
+    team_id = (key[0] if isinstance(key, (tuple, list)) and key else None) \
+        or _team_key(adapter, chat_id) or _primary_team_id(adapter)
+    return (str(team_id or ""), str(chat_id or ""), str(ts))
+
+
 def _wrap_adapter(adapter):
     """实例级包装，幂等（connect/重连安全）。"""
     if getattr(adapter, _WRAP_ATTR, False):
@@ -538,12 +623,17 @@ def _wrap_adapter(adapter):
         return team_id or _metadata_team_id(metadata) or _team_key(adapter, chat_id)
 
     def _maybe_blocks_patched(content):
-        # 必须保持同步签名（树内调用点同步取值）。解析只用现成缓存表。
-        # 树内 _maybe_blocks(content) 只有正文、无工作区上下文——按
-        # _sync_table_if_ready 的「唯一 team 键或保留原文」规则取表。
-        # 收尾直通窗口内抑制：载荷已精确构造，再解析会改写已发送前缀。
+        # 必须保持同步签名（树内调用点同步取值）。
+        #
+        # v1.3 r4（评审 #1）：树内 _maybe_blocks(content) 只有正文、无工作区
+        # 上下文，「唯一缓存表」不能证明目标工作区——A/B 双工作区只预热 B
+        # 时，上游 `_get_client` 的 primary fallback 会把消息发去 A 的客户端，
+        # 此时若拿唯一幸存的 B 表解析，text 保留 @name 而 blocks 换成 B 的
+        # 用户 ID，同一条消息两处指人不一致。目标不明 → text 与 blocks 都
+        # 保留原文。直通窗口（contextvar，仅当前调用上下文可见）内同样不
+        # 解析：载荷已由 _commit_stream 包装精确构造。
         try:
-            if not (getattr(adapter, _SUPPRESS_ATTR, 0) or 0):
+            if _stream_edit_ctx.get() is None:
                 _, table = _sync_table_if_ready(adapter)
                 if table:
                     content = _build_repl_string(content, table)
@@ -585,10 +675,30 @@ def _wrap_adapter(adapter):
 
     async def _edit_message_patched(chat_id, message_id, content, *,
                                     finalize=False, metadata=None):
-        # 收尾直通：_commit_stream 包装已构造好精确载荷（floor 限定或 replace
-        # 整篇），这里再全文解析会把已发送前缀二次改写（round 3 #2）。
-        if message_id in (getattr(adapter, _STREAM_EDIT_ATTR, None) or ()):
-            return await orig_edit_message(chat_id, message_id, content,
+        # v1.3 r4（评审 #2）：流收尾的原位 finalize edit 直通判定改为按调用
+        # 现场解析目标 (team, channel, ts) 精确匹配，并只认当前调用上下文
+        # （contextvar）里登记的流——不再用适配器级全局 set(ts)：
+        #   - 不同工作区的同 ts 流并发收尾，A 完成后不再撤销 B 的保护；
+        #   - A 收尾等待期间，B 对同 ts 的普通编辑不再被错误跳过提及解析。
+        target = _stream_target_key(adapter, chat_id, message_id, metadata)
+        try:
+            active = _stream_edit_ctx.get()
+        except LookupError:
+            active = None
+        if active is not None and target is not None and target in active:
+            # 直通前仍补一步 final_blocks 探测（对齐上游 _commit_stream 的
+            # `sealed and not replace and not self._maybe_blocks(text)`）：
+            # replace 直通路径的 finalize edit 只有 blocks 在解析后正文上、
+            # plain text 是原文——若渲染器返回 None（纯文本单行等），补送
+            # 解析后的 plain，避免 text/blocks 同一条消息指人两套。
+            shown = content
+            try:
+                if not orig_maybe_blocks(content):
+                    shown = await _resolve_async_outlet(content, chat_id=chat_id,
+                                                        metadata=metadata)
+            except Exception:
+                shown = content
+            return await orig_edit_message(chat_id, message_id, shown,
                                            finalize=finalize, metadata=metadata)
         content = await _resolve_async_outlet(content, chat_id=chat_id, metadata=metadata)
         return await orig_edit_message(chat_id, message_id, content,
@@ -614,17 +724,18 @@ def _wrap_adapter(adapter):
         #   自作主张 text.startswith(sent) 把合法第二档误判断裂。
         team_id = key[0] if isinstance(key, (tuple, list)) and key else None
         if not text:
-            return await orig_commit_stream(
-                key, stream, text, metadata, delta=delta, replace=replace)
+            return await _pass_through_edit(
+                stream, key, orig_commit_stream(
+                    key, stream, text, metadata, delta=delta, replace=replace))
         if replace:
             new_text = await _resolve_async_outlet(text, team_id=team_id)
             return await _pass_through_edit(
-                stream, orig_commit_stream(
+                stream, key, orig_commit_stream(
                     key, stream, new_text, metadata, delta=delta, replace=replace))
         sent = (stream or {}).get("sent", "")
         if not _stream_extends(adapter, stream, text, delta):
             return await _pass_through_edit(
-                stream, orig_commit_stream(
+                stream, key, orig_commit_stream(
                     key, stream, text, metadata, delta=delta, replace=replace))
         # extends 确认：head 字节不动（已发送），只解析 floor 之后开始的提及；
         # 判定（代码围栏/词边界）基于完整终稿（round 3 #2）。
@@ -637,43 +748,46 @@ def _wrap_adapter(adapter):
         new_delta = new_text[floor:] if (len(new_text) >= floor
                                          and new_text[:floor] == text[:floor]) else delta
         return await _pass_through_edit(
-            stream, orig_commit_stream(
+            stream, key, orig_commit_stream(
                 key, stream, new_text, metadata, delta=new_delta, replace=replace))
 
-    async def _pass_through_edit(stream, awaitable):
+    async def _pass_through_edit(stream, key, awaitable):
         """_commit_stream 收尾的 finalize edit 用我们构造好的精确载荷直通。
 
         orig 内部 edit_message(chat_id, ts, shown, finalize=True) 会再进
         edit_message 包装 → 全文解析 → 已发送前缀里的 @name 被二次改写 =
         Slack 上同一条消息 text 与 blocks 不一致（round 3 #2 的复现形状）。
-        以 stream ts 集合标记在飞收尾：edit 包装看到 message_id 命中即跳过解析。
+
+        v1.3 r4（评审 #2）：流身份 = (team, channel, ts)，登记进 contextvar
+        ——只对当前调用上下文（task 及其 await 子树）可见，作用域即 orig 调
+        用期间。并发流互不干扰：A/B 两工作区的同 ts 流并发收尾，A 先完成不
+        会动到 B 的登记；A 等待期间 B 的同 ts 无关普通编辑因不在 A 的上下
+        文里照常解析。edit_message 包装按调用现场解析目标键精确命中才直通。
+        收尾异常/取消由 finally 撤销登记。嵌套收尾（同流内嵌 _commit_stream）
+        时外层登记已覆盖，直接透传，不叠加计数。
         """
         ts = (stream or {}).get("ts")
-        if ts is None:
+        ident = _stream_identity(adapter, key, ts)
+        if ident is None:
             return await awaitable
-        active = getattr(adapter, _STREAM_EDIT_ATTR, None)
-        if active is None:
-            active = set()
-            setattr(adapter, _STREAM_EDIT_ATTR, active)
-        active.add(ts)
+        prior = _stream_edit_ctx.get()
+        active = set(prior) if prior else set()
+        if ident in active:
+            return await awaitable  # 嵌套收尾：外层登记已覆盖本流
+        active.add(ident)
+        token = _stream_edit_ctx.set(frozenset(active))
         try:
-            prior = getattr(adapter, _SUPPRESS_ATTR, 0) or 0
-            setattr(adapter, _SUPPRESS_ATTR, prior + 1)
-            try:
-                return await awaitable
-            finally:
-                cur = getattr(adapter, _SUPPRESS_ATTR, 1) or 1
-                setattr(adapter, _SUPPRESS_ATTR, max(0, cur - 1))
+            return await awaitable
         finally:
-            active.discard(ts)
+            _stream_edit_ctx.reset(token)
 
     adapter._maybe_blocks = _maybe_blocks_patched
     adapter._post_chunks = _post_chunks_patched
     adapter.edit_message = _edit_message_patched
     if orig_commit_stream is not None:
         adapter._commit_stream = _commit_stream_patched
-    LOG.info("[Slack] mention plugin v1.3: adapter wrapped (instance-level)")
-    print("[slack-mention-plugin] adapter wrapped v1.3", flush=True)
+    LOG.info("[Slack] mention plugin v1.3 r4: adapter wrapped (instance-level)")
+    print("[slack-mention-plugin] adapter wrapped v1.3 r4", flush=True)
 
 
 def _factory(native, adapter):

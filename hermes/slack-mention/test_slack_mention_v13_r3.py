@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""slack-mention 第三轮复核回归（PR #10 review round 3）。
+"""slack-mention 第三/四轮复核回归（PR #10 review round 3 + r4）。
 
-三个已复现缺陷的 RED→GREEN 套件（对照 fcd5dd9 必红，修复后全绿）：
+RED→GREEN 套件（对照 fcd5dd9 必红，修复后全绿）：
   R1  同步渲染工作区绑定：预热 A 后，B 的表为空/查询失败/过期时，
       _maybe_blocks 无上下文不得拿 A 的表猜 B——text 与 blocks 都查。
+      （r4 #3 夹具修正：本场景应加载 MEM_A，此前 ok_client() 装的是
+      Muse/U1，断言查 Alice/U9 永远空转。）
   R2  流式尾段边界：以完整终稿判定代码围栏与词边界，只改写未发送尾段
       内的提及；已发送前缀字节不动。
   R3  合法空白差异 extends：上游 _stream_relation 第二档（去前缀空白后
       对齐 sent.strip()）也必须解析尾段，且不重复追加/不改写已发送内容。
+  R4  评审第四轮三缺陷：
+      #1 只预热次工作区（B），无 metadata 发送/编辑 → 上游 primary
+         fallback 路由到 A 的客户端；唯一幸存的 B 表不能证明目标工作区，
+         text 与 blocks 都保留原文。
+      #2 同 ts 并发收尾互不干扰：A 工作区流收尾等待期间——B 工作区同
+         ts 流收尾不受 A 完成/撤销影响（保护不丢）；B 的同 ts 无关普通
+         编辑照常解析（不被 A 的直通窗口错误跳过）。对照组：不同 ts。
+      RED 对照：同套测试在旧缺陷版本（fcd5dd9 基础上仅修 R1 夹具）必失败。
 
 用法：
   ~/.hermes/hermes-agent/venv/bin/python test_slack_mention_v13_r3.py [repo] [commit]
@@ -16,6 +26,7 @@
 import asyncio
 import importlib.util
 import inspect
+import json
 import os
 import shutil
 import subprocess
@@ -199,6 +210,11 @@ def ok_client(members=None):
                         "next_cursor": ""}])
 
 
+def ok_client_a():
+    """R1 场景专用：工作区 A 的健康表（alice→U9）——r4 #3 夹具修正。"""
+    return FakeClient([{"members": MEM_A, "next_cursor": ""}])
+
+
 # --------------------------------------------------------------------------- 
 # R1. 同步渲染必须绑定目标工作区：空表/失败表/过期表不许被"唯一非空缓存"挤掉
 # --------------------------------------------------------------------------- 
@@ -210,7 +226,7 @@ def r1_scenario(client_b, label):
     send 带 metadata（v1.2 hint 已护），edit 不带 team（纯同步路径）才是
     本轮要堵的洞：blocks 不得引用 A 的 U9。
     """
-    clA, clB = ok_client(), client_b
+    clA, clB = ok_client_a(), client_b
     ad = make_adapter({"TA": clA, "TB": clB})
     run_async(mod._name_table(ad, team_id="TA"))          # A 表就绪（非空）
     run_async(mod._name_table(ad, team_id="TB"))          # B 表：空或失败，也落缓存
@@ -351,6 +367,177 @@ cl, d, s = stream_pair("Done @Muse  ", "Done @Muse")
 check("R3c equal（仅尾部空白差异）：纯封口、无 markdown_text 追加",
       s.success and not stop_texts(cl),
       repr([k for k in cl.stops]))
+
+
+# ===========================================================================
+# R4：评审第四轮复核（PR #10 r4）
+# ===========================================================================
+# 公共夹具：A/B 双工作区。make_adapter 把 _app.client 挂在**第一个**键上：
+# make_adapter({TA, TB}) → primary=TA，上游 _get_client 无上下文最终档
+# `return self._app.client` → 无 metadata 消息实际路由到 TA 的客户端。
+MEM_A4 = [{"id": "U9", "name": "alice",
+           "profile": {"display_name": "Alice", "real_name": "A"}}]
+MEM_B4 = [{"id": "U1", "name": "muse",
+           "profile": {"display_name": "Muse", "real_name": "M"}}]
+
+
+def r4_setup():
+    """A/B 双工作区，只预热 B（次工作区）的表。返回 (ad, clA, clB)。"""
+    clA = FakeClient([{"members": MEM_A4, "next_cursor": ""}])
+    clB = FakeClient([{"members": MEM_B4, "next_cursor": ""}])
+    ad = make_adapter({"TA": clA, "TB": clB})
+    run_async(mod._name_table(ad, team_id="TB"))   # B 表健康；A 表从未建过
+    return ad, clA, clB
+
+
+def _blocks_str(payload):
+    return json.dumps(payload.get("blocks") or [], ensure_ascii=False)
+
+
+# —— R4-1：只预热次工作区，无 metadata 发送/编辑 → text 与 blocks 都保留原文 ——
+# 提及用 @muse（在 B 的预热表里）：旧缺陷版 text 保留原文（async 拒猜）但
+# blocks 拿唯一幸存的 B 表解析成 <@U1>——同一条消息两处指人不一致。
+ad, clA, clB = r4_setup()
+res = run_async(ad.send("CX", "hi @muse from B", metadata=None))
+posted = clA.posts[-1] if clA.posts else {}   # primary=TA，无上下文发去 A 的客户端
+check("R4a 无上下文发送：路由到 primary（TA）客户端，不去 B",
+      bool(clA.posts) and not clB.posts,
+      f"A.posts={len(clA.posts)} B.posts={len(clB.posts)}")
+check("R4a 无上下文发送：text 保留 @muse 原文",
+      posted.get("text", "") == "hi @muse from B",
+      repr(posted.get("text"))[:200])
+check("R4a 无上下文发送：唯一缓存表(TB)≠primary(TA) → blocks 同样保留原文",
+      bool(posted.get("blocks")) and "<@U1>" not in _blocks_str(posted),
+      _blocks_str(posted)[:200])
+
+ad, clA, clB = r4_setup()
+run_async(ad.edit_message("CX", "1777", "edit @muse no-md", finalize=True))
+upd = clA.updates[-1] if clA.updates else {}
+check("R4b 无上下文编辑（finalize）：text 保留 @muse 原文",
+      upd.get("text", "") == "edit @muse no-md",
+      repr(upd.get("text"))[:200])
+check("R4b 无上下文编辑（finalize）：blocks 同样保留原文（不引 TB 的 U1）",
+      "<@U1>" not in _blocks_str(upd),
+      _blocks_str(upd)[:200])
+
+# 对照：明确 A 目标（metadata TA）时照常解析——「目标不明才不猜」不是全禁。
+ad, clA, clB = r4_setup()
+res = run_async(ad.send("CX", "hi @alice from A", metadata={"team_id": "TA"}))
+posted = clA.posts[-1] if clA.posts else {}
+check("R4c 对照：metadata 指明 TA → 正常解析（<@U9>）",
+      "<@U9>" in posted.get("text", ""),
+      repr(posted.get("text"))[:200])
+
+# 对照：单工作区主场景不受影响（唯一键 == primary）。
+ad1 = make_adapter({"TA": FakeClient([{"members": MEM_A4, "next_cursor": ""}])})
+run_async(mod._name_table(ad1, team_id="TA"))
+res = run_async(ad1.send("CX", "hi @alice single", metadata=None))
+posted1 = ad1._app.client.posts[-1] if res.success else {}
+check("R4d 对照：单工作区无上下文 → 唯一表==primary，照常解析",
+      "<@U9>" in posted1.get("text", ""),
+      repr(posted1.get("text"))[:200])
+
+
+# —— R4-2：同 ts 并发收尾互不干扰 ——
+class GatedClient(FakeClient):
+    """可分别门闩 chat_stopStream / chat_update——复现收尾窗口内的时序交错。
+
+    A 停在自己收尾 edit 内（过了直通判定、chat.update 未返回）；B 停在
+    seal（还没到 edit 判定）——这正是旧版全局 set(ts) 互踩的时序形状。
+    """
+    def __init__(self, pages, gate_seal=False, gate_update=False):
+        super().__init__(pages)
+        self.seal_gate, self.update_gate = asyncio.Event(), asyncio.Event()
+        self.gate_seal, self.gate_update = gate_seal, gate_update
+        if not gate_seal:
+            self.seal_gate.set()
+        if not gate_update:
+            self.update_gate.set()
+
+    async def chat_stopStream(self, **kw):
+        await self.seal_gate.wait()
+        return await super().chat_stopStream(**kw)
+
+    async def chat_update(self, **kw):
+        await self.update_gate.wait()
+        return await super().chat_update(**kw)
+
+
+async def _settle(seconds=0.05):
+    for _ in range(10):
+        await asyncio.sleep(seconds / 10)
+
+
+async def concurrent_finalize():
+    # A：TA/CA/ts=1111，update 门闩；B：TB/CB/ts=1111（同 ts），seal 门闩。
+    clA = GatedClient([{"members": MEM_A4, "next_cursor": ""}], gate_update=True)
+    clB = GatedClient([{"members": MEM_B4, "next_cursor": ""}], gate_seal=True)
+    ad = make_adapter({"TA": clA, "TB": clB})
+    await mod._name_table(ad, team_id="TA")
+    await mod._name_table(ad, team_id="TB")
+    mdA = {"team_id": "TA", "thread_id": "1111"}
+    mdB = {"team_id": "TB", "thread_id": "1111"}
+    taskA = asyncio.create_task(ad._commit_stream(
+        ("TA", "CA", "1111"), {"ts": "1111", "sent": "done @alice"},
+        "done @alice tail", mdA, delta=" tail", replace=False))
+    taskB = asyncio.create_task(ad._commit_stream(
+        ("TB", "CB", "1111"), {"ts": "1111", "sent": "done @muse"},
+        "done @muse tail", mdB, delta=" tail", replace=False))
+    await _settle()   # A 停在收尾 edit 内；B 停在 seal
+    # 窗口内：B 工作区对同 ts（1111）的无关普通编辑照常解析——不被 A 的
+    # 直通窗口错误跳过（旧版：全局 set 里有 1111 → 跳过 ✗）。
+    await ad.edit_message("CB", "1111", "unrelated @muse edit", metadata=mdB)
+    upd_unrelated = clB.updates[-1] if clB.updates else {}
+    # A 先放行完成：旧版 finally 从全局 set 撤销 1111 = 连 B 的保护一起撤；
+    # B 随后过 seal 到达 edit 判定时集合已空 → 全文解析 ✗。
+    clA.update_gate.set()
+    await taskA
+    updA = clA.updates[-1] if clA.updates else {}
+    clB.seal_gate.set()
+    await taskB
+    updB = clB.updates[-1] if clB.updates else {}
+    return upd_unrelated, updA, updB
+
+
+upd_unrelated, updA, updB = run_async(concurrent_finalize())
+check("R4e 窗口内同 ts 无关编辑照常解析（不被 A 的直通窗口跳过）",
+      upd_unrelated.get("text") == "unrelated <@U1> edit",
+      repr(upd_unrelated)[:300])
+check("R4f A 先完成不撤销 B 的保护：B 收尾 update 的已发送前缀不被改写",
+      updB.get("text") == "done @muse tail",
+      repr(updB)[:300])
+check("R4g A 自身收尾正常（尾段无提及、前缀不动）",
+      updA.get("text") == "done @alice tail",
+      repr(updA)[:300])
+
+
+# —— R4-2 对照：不同 ts 的无关编辑（非流目标）照常解析 ——
+async def different_ts_finalize():
+    # 对照组用 seal 门闩（收尾停在 stopStream，无关编辑的 chat_update 自由）：
+    # 同一客户端上 update 门闩会把无关编辑一起挡住，测的就是「编辑不被跳过」。
+    clA = GatedClient([{"members": MEM_A4, "next_cursor": ""}], gate_seal=True)
+    ad = make_adapter({"TA": clA})
+    await mod._name_table(ad, team_id="TA")
+    md = {"team_id": "TA", "thread_id": "3333"}
+    task = asyncio.create_task(ad._commit_stream(
+        ("TA", "CA", "3333"), {"ts": "3333", "sent": "keep @alice"},
+        "keep @alice tail", md, delta=" tail", replace=False))
+    await _settle()
+    await ad.edit_message("CA", "4444", "other @alice msg", metadata=md)
+    upd_other = clA.updates[-1] if clA.updates else {}
+    clA.seal_gate.set()
+    await task
+    upd_final = clA.updates[-1] if clA.updates else {}
+    return upd_other, upd_final
+
+
+upd_other, upd_final = run_async(different_ts_finalize())
+check("R4h 不同 ts 无关编辑照常解析（对照）",
+      upd_other.get("text") == "other <@U9> msg",
+      repr(upd_other)[:300])
+check("R4i 流收尾自身照常：尾段无提及时前缀原文直达（对照）",
+      upd_final.get("text") == "keep @alice tail",
+      repr(upd_final)[:300])
 
 
 print()
