@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -92,6 +93,11 @@ def _live_matches(root: Path) -> list[tuple[str, list[str]]]:
     return found
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "requires Linux (/proc, Bash mapfile, util-linux flock); "
+    "skipped on non-Linux (not ported to macOS)",
+)
 class KeepaliveTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -105,19 +111,71 @@ class KeepaliveTests(unittest.TestCase):
         _kill_recorded(self.root)
         self.tmp.cleanup()
 
-    def _run(self, *, real_proc: bool = False) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        *,
+        real_proc: bool = False,
+        extra_env: dict | None = None,
+        path: str | None = None,
+    ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["KEEPALIVE_ROOT"] = str(self.root)
         if not real_proc:
             env["KEEPALIVE_PROC"] = str(self.proc)
+        if extra_env:
+            env.update(extra_env)
+        if path is not None:
+            env["PATH"] = path
+        # Absolute bash: tests that strip PATH must not hide the interpreter.
+        bash = shutil.which("bash")
+        if not bash:
+            self.fail("host missing bash")
         return subprocess.run(
-            ["bash", str(SCRIPT)],
+            [bash, str(SCRIPT)],
             env=env,
             text=True,
             capture_output=True,
             timeout=30,
             check=False,
         )
+
+    def _flock_mock_path(self) -> str:
+        """flock stand-in ahead of the real PATH.
+
+        FLOCK_MOCK_RC=busy exits with the script's flock -E code (contention).
+        Any other FLOCK_MOCK_RC is returned as-is (usage, I/O, …).
+        """
+        bindir = Path(self.tmp.name) / "flock-mock-bin"
+        bindir.mkdir(exist_ok=True)
+        mock = bindir / "flock"
+        mock.write_text(
+            "#!/bin/sh\n"
+            "mode=${FLOCK_MOCK_RC:-}\n"
+            "if [ \"$mode\" = busy ]; then\n"
+            "  prev=\n"
+            "  for a in \"$@\"; do\n"
+            "    if [ \"$prev\" = -E ]; then\n"
+            "      exit \"$a\"\n"
+            "    fi\n"
+            "    prev=$a\n"
+            "  done\n"
+            "  echo \"mock flock: missing -E\" >&2\n"
+            "  exit 64\n"
+            "fi\n"
+            "exit \"$mode\"\n"
+        )
+        mock.chmod(0o755)
+        return str(bindir) + os.pathsep + os.environ.get("PATH", "")
+
+    def _path_without_flock(self) -> str:
+        bindir = Path(self.tmp.name) / "no-flock-bin"
+        bindir.mkdir(exist_ok=True)
+        for name in ("date", "readlink", "sleep", "nohup"):
+            src = shutil.which(name)
+            if not src:
+                self.fail(f"host missing {name}")
+            os.symlink(src, bindir / name)
+        return str(bindir)
 
     def test_starts_when_absent(self):
         # Real /proc so started children are visible. cwd is the temp root,
@@ -219,6 +277,61 @@ class KeepaliveTests(unittest.TestCase):
         proc = self._run()
         self.assertIn("python not executable", proc.stdout)
         self.assertNotIn("not running, starting", proc.stdout)
+        self.assertFalse((self.root / "starts.txt").exists())
+
+    def test_flock_exit_64_is_not_contention(self):
+        # Isolated mock: usage/sysexits 64 must not look like a 20s wait.
+        proc = self._run(
+            extra_env={"FLOCK_MOCK_RC": "64"},
+            path=self._flock_mock_path(),
+        )
+        self.assertEqual(proc.returncode, 64, proc.stderr + proc.stdout)
+        self.assertIn("flock failed rc=64", proc.stdout)
+        self.assertIn("cannot keep alive", proc.stdout)
+        self.assertNotIn("within 20s", proc.stdout)
+        self.assertNotIn("not running, starting", proc.stdout)
+        self.assertFalse((self.root / "starts.txt").exists())
+
+    def test_flock_io_error_is_not_contention(self):
+        proc = self._run(
+            extra_env={"FLOCK_MOCK_RC": "74"},
+            path=self._flock_mock_path(),
+        )
+        self.assertEqual(proc.returncode, 74, proc.stderr + proc.stdout)
+        self.assertIn("flock failed rc=74", proc.stdout)
+        self.assertNotIn("within 20s", proc.stdout)
+        self.assertFalse((self.root / "starts.txt").exists())
+
+    def test_flock_missing_exits_nonzero(self):
+        proc = self._run(path=self._path_without_flock())
+        self.assertEqual(proc.returncode, 127, proc.stderr + proc.stdout)
+        self.assertIn("flock not found", proc.stdout)
+        self.assertIn("cannot keep alive", proc.stdout)
+        self.assertNotIn("within 20s", proc.stdout)
+        self.assertNotIn("not running, starting", proc.stdout)
+        self.assertFalse((self.root / "starts.txt").exists())
+
+    def test_lock_file_cannot_be_opened(self):
+        (self.root / "keepalive.lock").mkdir()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+        self.assertIn("cannot open", proc.stdout)
+        self.assertIn("keepalive.lock", proc.stdout)
+        self.assertIn("cannot keep alive", proc.stdout)
+        self.assertNotIn("within 20s", proc.stdout)
+        self.assertNotIn("not running, starting", proc.stdout)
+        self.assertFalse((self.root / "starts.txt").exists())
+
+    def test_contention_exit_waits_and_exits_zero(self):
+        # Mock returns whatever -E the script passed, without sleeping 20s.
+        proc = self._run(
+            extra_env={"FLOCK_MOCK_RC": "busy"},
+            path=self._flock_mock_path(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("within 20s", proc.stdout)
+        self.assertIn("not starting", proc.stdout)
+        self.assertNotIn("cannot keep alive", proc.stdout)
         self.assertFalse((self.root / "starts.txt").exists())
 
 

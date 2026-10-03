@@ -5,7 +5,12 @@
 #   while true; do /workspace/slack-bridge-grokbot/keepalive.sh >> keepalive.log 2>&1; sleep 30; done
 # A 5-minute agent should invoke this same script (not start python itself).
 # There is no in-script sleep and no exponential backoff: the next caller tick
-# (30s or 5m) is the retry. A lock timeout logs and exits 0 without starting.
+# (30s or 5m) is the retry. Both callers run this same script.
+# A lock timeout logs and exits 0 without starting.
+# flock -E makes that timeout a dedicated status. A missing flock binary,
+# a lock file that cannot be opened, and any other flock status (usage,
+# I/O, exit 64, …) log the real reason and exit non-zero. They must not
+# look like a 20s wait.
 #
 # Double-start:
 #   Exclusive flock on $ROOT/keepalive.lock around the check and the start.
@@ -63,10 +68,27 @@ wait_visible() {
   return 1
 }
 
-exec 9>>"$ROOT/keepalive.lock"
-if ! flock -w 20 9; then
+# 11 is only the contended/timeout status (flock -E). util-linux uses
+# sysexits 64+ for usage and I/O, and the shell uses 127 when flock is
+# absent. Do not treat those as "busy lock".
+LOCK_BUSY=11
+if ! command -v flock >/dev/null 2>&1; then
+  echo "$(ts) keepalive: flock not found; cannot keep alive"
+  exit 127
+fi
+exec 9>>"$ROOT/keepalive.lock" || {
+  echo "$(ts) keepalive: cannot open $ROOT/keepalive.lock; cannot keep alive"
+  exit 1
+}
+flock -w 20 -E "$LOCK_BUSY" 9
+lock_rc=$?
+if [ "$lock_rc" -eq "$LOCK_BUSY" ]; then
   echo "$(ts) keepalive: could not lock keepalive.lock within 20s; not starting"
   exit 0
+fi
+if [ "$lock_rc" -ne 0 ]; then
+  echo "$(ts) keepalive: flock failed rc=${lock_rc}; cannot keep alive"
+  exit "$lock_rc"
 fi
 
 if proc_matches "bridge.py"; then
