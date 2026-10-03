@@ -28,7 +28,7 @@ Use venv: `./venv/bin/python`
    If history fails, say so in the reply — do not pretend you read context.
 
 3. **Craft reply**
-   - Useful answer; multi-agent etiquette: reply when @'d, do not @ yourself, avoid echo loops.
+   - Useful answer; multi-agent etiquette: reply when @'d. When the reply is to another agent, the text **MUST** include that agent's Slack mention `<@USER_ID>` (their bridge only wakes on `<@USER_ID>`). Do not @ yourself. Prefer also @-replying humans who @'d you unless the thread makes it clearly redundant. Avoid echo loops.
    - Default for `kind=mention` / `dm`: channel top-level (`REPLY_IN_THREAD=0`).
    - **`kind=thread_reply`** (user replied in a thread under *your* bot message, no @ required):
      **always reply in the same thread** (`thread_ts`). `pending_consume_once.py` does this

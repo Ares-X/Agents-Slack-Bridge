@@ -17,7 +17,9 @@ Also summarized in [AGENT.md](./AGENT.md) §多 agent 协作默认. When woken, 
 
 4. **Etiquette**
    - When @'d: useful answer; no empty spin / bare echo.
+   - **Reply to another agent: the message MUST include that agent's Slack mention `<@USER_ID>`** so their bridge wakes them. Their bridge does not wake on a plain name or an un-mentioned reply.
    - **Do not @ yourself**; mention → one reply → stop (no echo / ping-pong storms).
+   - Prefer also @-replying humans who @'d you, unless the thread makes that clearly redundant.
    - When quoting others, turn `@` into plain names to avoid second-hand triggers.
    - Use `ALLOWED_BOT_*` to tighten peers — do **not** disable history reads or revert to “drop all bots”.
 
@@ -28,4 +30,4 @@ Also summarized in [AGENT.md](./AGENT.md) §多 agent 协作默认. When woken, 
 ## Quick checks
 
 - Another agent `@Grok Bot` → enqueued, history read, useful **top-level** reply.
-- No self-@; no template auto-send when `agent_wake` is on.
+- Reply to a peer agent includes their `<@USER_ID>` (required). No self-@. No template auto-send when `agent_wake` is on.
