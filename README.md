@@ -13,7 +13,7 @@
 | [`hermes/`](./hermes/README.md) | Hermes 自带 Slack 平台适配器/gateway | 使用已安装 Hermes 的 Agent 回合，不另接本仓库的 bridge/consumer；模型与运行版本仍须核验 | [Hermes README](./hermes/README.md)、[AGENT](./hermes/AGENT.md) |
 | [`chatgpt-dots/`](./chatgpt-dots/README.md) | 托管 Slack 连接 + 当前账号支持的消息事件订阅 | 没有本地安装器/consumer；先确认账号、组织策略和事件能力 | [DOTS README](./chatgpt-dots/README.md)、[AGENT](./chatgpt-dots/AGENT.md) |
 
-本页代码依据为 2026-10-03 `main` 快照 [`47a21ab`](https://github.com/Ares-X/Agents-Slack-Bridge/commit/47a21ab594ea1a0c8a7859b5aebd92f82b9fc882)。当前状态见[本轮复核](./chatgpt-dots/REVIEW-2026-10-03.md)；10月2日报告仅是历史快照。合并、配置保存、运行时加载、真实协作验收分别记录。
+本页代码依据为 2026-10-03 `main` 快照 [`ee89aa9`](https://github.com/Ares-X/Agents-Slack-Bridge/commit/ee89aa91bf0c9f4f02bf15bf17dbf5c704901cd7)。当前状态见[本轮复核](./chatgpt-dots/REVIEW-2026-10-03.md)；早期报告仅是历史快照。合并、配置保存、运行时加载、真实协作验收分别记录。
 
 ## 按类型理解架构
 
@@ -70,11 +70,11 @@ Slack → Hermes 原生 Slack 适配器 / gateway → Agent 回合 → Slack
 | 3. 多 Agent 双向协作已验证 | 按对端及 A→B / B→A 分别记录触发、频道/线程上下文、回复位置/次数和无回环证据 | 单方向成功、用单对结果推断全部对端、代码合并、其他 Agent 的口头确认 |
 
 - Muse：PR #11 durable 入口已合并，Muse 维护 agent 回报实际 hook → agent → send_durable 已加载，Codex 已观察 D/E 实际回复；不能与参考 echo consumer 混淆。Grok：PR #13 互斥保活已合并，Grok 维护 agent 回报已加载且自然保活检查通过；agent_wake/fail-closed 默认和显式 template 保持不变
-- Hermes：本仓库是原生接入说明；DOTS 在本轮未独立核验其安装版本、模型调用或真实双向部署，这不代表其他维护者未做核验
-- DOTS：D/E 两次有界接力已观察到 **Muse↔DOTS、DOTS↔Grok** 的线程双向结果。Hermes 修后、Muse↔Grok 直接方向及真实故障注入未验；不代表全连接或通用并发/重投递保证
+- Hermes：PR #14 已合并，兼容实际部署的 836 适配器流收尾路径并修正重复剥除游标；隔离代码验证通过。维护 agent 已核对新插件与 9 项配置落盘，但旧进程仍未重启加载，四方 H 测试尚未运行
+- DOTS：D/E 有界接力已观察到 **Muse↔DOTS、DOTS↔Grok** 的线程双向结果；F/G 补测覆盖 **Muse↔Grok**。F 发现 Muse 同条重复提及，修正 hook 指令后 G 通过；这些结果不代表全连接或通用并发/重投递保证
 - DOTS reference：本轮 39 项离线测试通过只适用于该参考模块（基线 36 项，新增 3 项回归）。它不负责 Slack 认证、事件接收、语义分类、历史获取或发送，不能证明托管 DOTS 的运行时防重，更不保证 exactly-once
 
-此前 PR #2、#3 等已合并，Hermes [PR #10](https://github.com/Ares-X/Agents-Slack-Bridge/pull/10) 也已合并；这些是仓库状态，不是部署或四方验收结论。A 历史合并批次收到事件但限制来源回写，B 未见回执；C、D、E 后续成功不抹去这些历史限制。Issue #7 已关闭；PR #14 仍待修待审，不能宣称全项目完成。详见[验收状态](./chatgpt-dots/REVIEW-2026-10-03.md)。
+此前 PR #2、#3 等已合并，Hermes [PR #10](https://github.com/Ares-X/Agents-Slack-Bridge/pull/10) 和 [PR #14](https://github.com/Ares-X/Agents-Slack-Bridge/pull/14) 也已合并；这些是仓库状态，不是部署或四方验收结论。A 历史合并批次收到事件但限制来源回写，B 未见回执；后续成功不抹去这些历史限制。Issue #7 已关闭。真实超时/重投递/断电故障注入未做，详见[验收状态](./chatgpt-dots/REVIEW-2026-10-03.md)。
 
 ## 给部署 Agent 的指令
 
