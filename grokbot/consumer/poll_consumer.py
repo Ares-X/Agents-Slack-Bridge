@@ -46,10 +46,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from inbox_store import (  # noqa: E402
-    ack_keys,
     escalate_stale_sending,
     is_send_ready,
     msg_key,
+    resolve_without_reply,
 )
 from reply_pipeline import (  # noqa: E402
     classify_send_result,
@@ -175,8 +175,11 @@ def save_sessions(s):
     os.replace(tmp, SESSIONS_PATH)
 
 
-def channel_history(channel, limit=15):
-    r = sh(sys.executable, "channel_history.py", channel, str(limit))
+def channel_history(channel, limit=15, thread_ts=None):
+    args = [sys.executable, "channel_history.py", channel, str(limit)]
+    if thread_ts:
+        args.extend(["--thread-ts", thread_ts, "--all"])
+    r = sh(*args)
     out = []
     err = None
     if r.returncode != 0:
@@ -191,6 +194,11 @@ def channel_history(channel, limit=15):
             continue
         if "error" in m:
             err = str(m.get("error") or "history error")
+            continue
+        if "pagination" in m:
+            # A page is useful recent channel context; it is not a message or
+            # proof that older task context has been read. Expose continuation.
+            print(f"history has more context: {m['pagination']}", file=sys.stderr)
             continue
         out.append(m)
     if err and not out:
@@ -298,8 +306,11 @@ def handle_ack_and_skips(m, *, runner=None):
       ("claimable", False) — ready for agent wake (or template send)
     """
     if ME and m.get("user") == ME:
-        ack_keys(INBOX_PATH, {msg_key(m)})
-        return "done", False
+        resolve_without_reply(INBOX_PATH, msg_key(m), "self-authored message; no reply")
+        # Confirmed sends still use the ack-only path below; protected states
+        # remain visible. Resolve never clears an in-flight/uncertain send.
+        if m.get("reply_status") != "sent":
+            return "done", False
 
     ch = m.get("channel") or ""
     ts = m.get("ts") or ""
@@ -358,7 +369,10 @@ def handle_one_template(m, sessions, *, runner=None):
     label = m.get("channel_name") or ch
 
     sess = sessions.setdefault(ch, [])
-    hist, hist_err = channel_history(ch)
+    if is_in_thread(m) or m.get("kind") == "thread_reply":
+        hist, hist_err = channel_history(ch, thread_ts=thread_target(m))
+    else:
+        hist, hist_err = channel_history(ch)
     if hist_err:
         print(f"history degrade for {ch}: {hist_err}", file=sys.stderr)
 

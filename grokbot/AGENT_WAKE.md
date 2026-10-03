@@ -1,7 +1,7 @@
 # AGENT_WAKE.md — Grok Bot Slack reply (woken by webhook)
 
 You were woken because the Slack bridge deploy has **claimable** inbox rows.
-Do **not** use the template consumer path. Craft a real reply, then send via the durable pipeline.
+Do **not** use the template consumer path. Read current context, then choose a useful reply through the durable pipeline or a quiet resolution with a recorded reason.
 
 Short entrypoint: [wakeup.md](./wakeup.md) · Peer rules: [PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)
 
@@ -19,21 +19,42 @@ Use venv: `./venv/bin/python`
    ./venv/bin/python pending_consume_once.py --list
    cat pending.json                       # claimable / waiting_rate_limit / blocked
    ```
-   Only process **claimable** (and **sent** = ack-only). Skip `sending` / `uncertain` (no blind resend). Honor `rate_limited` until `retry_after_until`.
+   Read related pending rows **together by channel/thread**, including new work
+   received while you were asleep. Identify the current authorized task and its
+   later constraints before deciding what to send. Do not drain old rows as a
+   series of independent mandatory replies. Do not discard a task just for age.
+   Only send **claimable** (and **sent** = ack-only). Skip `sending` / `uncertain`
+   (no blind resend). Honor `rate_limited` until `retry_after_until`.
 
 2. **Channel history (required before reply)**
    ```bash
    ./venv/bin/python channel_history.py <channel_id> 15
+   ./venv/bin/python channel_history.py <channel_id> 15 --thread-ts <ROOT_TS> --all
    ```
-   If history fails, say so in the reply — do not pretend you read context.
+   `--thread` aliases `--thread-ts`. Bodies are complete; if a page has more
+   messages, its pagination row gives `next_cursor`. Use `--all` or `--cursor`
+   as needed to read the originating task, subsequent constraints and relevant
+   discussion. Read the relevant thread, even if its parent belongs to a peer.
+   If history fails, record the limitation; do not pretend you read context or
+   turn missing context into a speculative reply/quiet resolution.
 
 3. **Craft reply**
-   - Useful answer; multi-agent etiquette: reply when @'d. When the reply is to another agent, the text **MUST** include that agent's Slack mention `<@USER_ID>` (their bridge only wakes on `<@USER_ID>`). Do not @ yourself. Prefer also @-replying humans who @'d you unless the thread makes it clearly redundant. Avoid echo loops.
+   - Reply when it advances the authorized task: an answer, evidence, a useful
+     question or a concrete handoff. Notifications, pure acknowledgements,
+     approval reminders and instructions superseded by the current task may be
+     resolved quietly with a recorded reason. Do not echo old control messages.
+   - Mention a peer with `<@USER_ID>` **only when requesting their concrete next
+     action**. Plain names suffice for references and acknowledgements. Do not
+     @ yourself or trigger peers through quoted mentions. Authorized discussion
+     can continue across multiple substantive turns; there is no one-turn cap
+     for an entire task and no obligation to reply to every inbound row.
    - Default for `kind=mention` / `dm`: channel top-level (`REPLY_IN_THREAD=0`).
    - **`kind=thread_reply`** (user replied in a thread under *your* bot message, no @ required):
      **always reply in the same thread** (`thread_ts`). `pending_consume_once.py` does this
-     automatically; if you call `send.py` yourself, pass `--thread-ts <thread_ts>`.
-   - **One reply per (channel, ts).** Different channels / questions need different texts.
+     automatically. Use the durable pipeline for replies; do not bypass its claim and receipt handling with `send.py`.
+   - **At most one reply per (channel, ts).** Decide separately for each identity;
+     one current useful answer may make older related control rows quiet. Do not
+     apply that decision to unrelated channels, threads or questions.
 
 4. **Send ONE message via pipeline (channel + ts required)**
 
@@ -57,7 +78,18 @@ Use venv: `./venv/bin/python`
      ```bash
      ./venv/bin/python pending_consume_once.py --channel C012 --ts 1.0
      ```
-   - Or: `reply_pipeline.process_one` / claim → `send.py` → `inbox_ack.py <channel> <ts>`.
+   - Quiet resolution of one **unsent claimable** row:
+     ```bash
+     ./venv/bin/python pending_consume_once.py --channel C012 --ts 1.0 \
+       --no-reply --reason 'Notification already incorporated into the current task'
+     ```
+     The original row stays in `inbox.jsonl`, with `reply_status=no_reply`,
+     `resolution_reason` and `resolved_at`. This durable decision competes with
+     send under the same lock; it never clears `sending`, `sent`, `uncertain` or
+     `rate_limited` (even after the wait). Inspect the retained row to review a
+     mistaken decision; do not blindly replay or delete it.
+   - Or: `reply_pipeline.process_one` for sending. `inbox_ack.py` only completes
+     rows already marked `sent`; it is not a shortcut to discard unsent work.
    - On rate limit: wait; do not hammer.
 
 5. **Verify**

@@ -3,7 +3,7 @@
 请 DOTS 在更新仓库根 `README.md` 的 grokbot 行/段时对齐下列事实：
 
 1. **可靠性**：先 durable 写入 `inbox.jsonl`（sidecar lock + fsync；dir fsync 失败不吞），再 Socket Mode ACK；ack 用 temp + `os.replace`。
-2. **Ack 身份**：`(channel, ts)`；CLI：`inbox_ack.py <channel> <ts>`。
+2. **Ack 身份**：`(channel, ts)`；CLI：`inbox_ack.py <channel> <ts>`，仅 ACK `sent`。
 3. **Claim→send→ack**：发送前先 durable `reply_status=sending`；仅 `not_sent:` / `sent ok: False` 可重试；其余 → `uncertain`；`sending` 重启 escalate 为 `uncertain`，永不盲发。
 4. **DM**：过滤 edit/delete 等 subtype。
 5. **`REPLY_IN_THREAD=1`**：`thread_ts` 否则消息 `ts`；默认 `0`。
@@ -14,3 +14,9 @@
 10. **测试**：`grokbot/tests/`；live Slack **NOT_EXERCISED**；无新第三方依赖。
 11. **Corrupt-tail repair** 用 temp+fsync+replace，崩溃不丢旧队列；Slack `internal_error`/`fatal_error` → uncertain；WebClient `retry_handlers=[]`；pending actionable 含 sent ack-only。
 12. **Rate limit**: HTTP 429 / ratelimited → `rate_limited` + `retry_after_until`; wait then retry; no hammer; internal_error 仍 uncertain。
+13. **真实 wake 协作**：先整体读相关 pending 与最新授权任务，读相关线程；每源最多一次
+    回复或带原因静默，通知/确认不强制回复；仅请求具体下一步才 @ peer，授权讨论可多轮。
+14. **Quiet**：`pending_consume_once.py --channel C --ts T --no-reply --reason '…'` 与发送
+    共用锁，只允许未发送 claimable；保存原文、原因、时间，不消费 uncertain/rate_limited。
+15. **历史**：兼容旧参数；`--thread-ts` / `--thread` + `--all` / `--cursor` 分页，完整正文
+    和 thread_ts；历史错误显式失败。单次消费不再升级并发 sending；启动恢复仍保留。

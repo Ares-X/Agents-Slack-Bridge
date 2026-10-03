@@ -1,4 +1,7 @@
-"""Mark inbox messages delivered by (channel, ts). 处理成功后调用，避免丢消息。
+"""Mark confirmed-sent inbox messages delivered by (channel, ts).
+
+Unsent work requires pending_consume_once.py --no-reply --reason. ACK never
+clears sending, uncertain or rate_limited rows.
 
 Ack identity matches dedupe: channel + ts (NOT ts alone — same ts can appear
 in different channels).
@@ -35,7 +38,7 @@ def main(argv=None):
         return 1
     n, missing = ack_keys(INBOX_PATH, want)
     if n == 0:
-        print("acked: none (no matching channel+ts)", file=sys.stderr)
+        print("acked: none (no matching confirmed-sent channel+ts)", file=sys.stderr)
         return 1
     shown = sorted(f"{c}:{t}" for c, t in want if (c, t) not in missing)
     print("acked:", shown)

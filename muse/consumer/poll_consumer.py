@@ -145,10 +145,13 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
-def channel_history(channel, limit=15):
+def channel_history(channel, limit=15, thread_ts=""):
     """返回 (messages, error)。error 非空时调用方必须走降级/延迟策略，
     不可当成空历史静默处理。"""
-    r = sh(sys.executable, "channel_history.py", channel, str(limit))
+    cmd = [sys.executable, "channel_history.py", channel, str(limit)]
+    if thread_ts:
+        cmd += ["--thread-ts", thread_ts, "--all"]
+    r = sh(*cmd)
     msgs, err = [], None
     for line in r.stdout.splitlines():
         try:
@@ -290,7 +293,7 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
     本次尝试没有 client_msg_id（旧版本条目）时同样无法证明，
     返回 False。
     """
-    msgs, err = channel_history(channel, limit=limit)
+    msgs, err = channel_history(channel, limit=limit, thread_ts=thread_ts)
     if err:
         return None
     if not thash:
@@ -479,7 +482,7 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
         return r
 
     # --- history 降级策略：失败先延迟，3 轮后降级进行并留可见标记 ---
-    hist, herr = channel_history(ch)
+    hist, herr = channel_history(ch, thread_ts=m.get("thread_ts") or "")
     if herr:
         n = state.get_hist_deferred(mid) + 1
         state.set_hist_deferred(mid, n)

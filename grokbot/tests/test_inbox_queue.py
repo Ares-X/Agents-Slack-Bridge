@@ -57,7 +57,7 @@ class TestAckIdentity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
             ts = "1710000000.000100"
-            self.assertTrue(append_record(path, _rec("Caaa", ts, "a")))
+            self.assertTrue(append_record(path, _rec("Caaa", ts, "a", reply_status="sent")))
             self.assertTrue(append_record(path, _rec("Cbbb", ts, "b")))
             n, missing = ack_keys(path, {("Caaa", ts)})
             self.assertEqual(n, 1)
@@ -70,7 +70,7 @@ class TestAckIdentity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
             ts = "1710000000.000200"
-            append_record(path, _rec("C1", ts))
+            append_record(path, _rec("C1", ts, reply_status="sent"))
             append_record(path, _rec("C2", ts))
             n, missing = ack_keys(path, {("C1", ts)})
             self.assertEqual(n, 1)
@@ -83,7 +83,7 @@ class TestDurableAckRewrite(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
             for i in range(5):
-                append_record(path, _rec("C", f"1.{i}", text=str(i)))
+                append_record(path, _rec("C", f"1.{i}", text=str(i), reply_status="sent"))
             ack_keys(path, {("C", "1.2")})
             with open(path) as f:
                 lines = [json.loads(l) for l in f if l.strip()]
@@ -116,7 +116,7 @@ class TestConcurrentWrites(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
             for i in range(10):
-                append_record(path, _rec("Cseed", f"0.{i:03d}"))
+                append_record(path, _rec("Cseed", f"0.{i:03d}", reply_status="sent"))
 
             errors = []
 
@@ -340,7 +340,7 @@ class TestAckDurabilityConfirm(unittest.TestCase):
     def test_idempotent_ack_still_fsyncs(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "inbox.jsonl")
-            append_record(path, _rec("C", "1.0"))
+            append_record(path, _rec("C", "1.0", reply_status="sent"))
             ack_keys(path, {("C", "1.0")})  # dirty rewrite
             # Second ack: dirty=False but must still confirm durability
             with mock.patch.object(

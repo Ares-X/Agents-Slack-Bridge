@@ -73,6 +73,9 @@ Message: ``{"msg_id": ..., "channel": ..., "user": ..., "text": ...,
 "kind": "dm"|"mention", "ts": ..., "thread_ts": ..., "received_at": ...}``
 
 Ack tombstone: ``{"type": "ack", "msg_id": ..., "at": ...}``
+Deliberate quiet tombstones additionally retain ``disposition="no-reply"``,
+``reason`` and ``source`` (original text, identity, thread and text hash).
+Compaction retains the complete tombstone for the same retention window.
 Schema marker: ``{"type": "schema", "v": 2}``
 Name resolution (channel/user display names) is intentionally NOT done here;
 see ``resolve.py``.  The hot path must stay free of slow API calls.
@@ -448,6 +451,56 @@ def ack(msg_ids):
         if created:
             # 新文件：目录项也必须落盘，否则崩溃后 tombstone 可能丢失。
             _fsync_dir()
+
+
+def complete_no_reply(msg_id, reason):
+    """Append a quiet completion with source evidence; caller holds send EX.
+
+    This is deliberately separate from raw ack: unknown sources are refused,
+    and repeated completion confirms file AND directory durability before
+    returning success. The original tombstone/reason is never overwritten.
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("no-reply requires a reason")
+    if not os.path.exists(INBOX_PATH):
+        raise ValueError("no-reply source inbox is missing")
+    _ensure_migrated()
+    with _locked(exclusive=True):
+        _quarantine_torn_tail()
+        source, completed = None, None
+        for line in _read_all_lines():
+            record = _parse(line)
+            if not isinstance(record, dict):
+                raise ValueError("no-reply source inbox contains an invalid record")
+            if record.get("type") == "ack" and record.get("msg_id") == msg_id:
+                completed = completed or record
+            elif _classify(record) in ("msg", "legacy") \
+                    and _identity(record) == msg_id:
+                source = source or record
+        if completed:
+            _fsync_data_file()
+            return ("no-reply" if completed.get("disposition") == "no-reply"
+                    else "already-acked")
+        if source is None:
+            raise ValueError("no-reply source message is unknown: " + msg_id)
+        channel, ts = msg_id.rsplit(":", 1)
+        if any(key in source and str(source[key]) != expected
+               for key, expected in (("channel", channel), ("ts", ts))):
+            raise ValueError("no-reply source identity conflicts with msg_id: " + msg_id)
+        evidence = {key: source[key] for key in (
+            "msg_id", "channel", "ts", "thread_ts", "user", "bot_id", "kind",
+            "text", "received_at", "client_msg_id") if key in source}
+        evidence["text_sha256"] = hashlib.sha256(
+            (source.get("text") or "").encode("utf-8")).hexdigest()
+        tombstone = {"type": "ack", "msg_id": msg_id, "at": time.time(),
+                     "disposition": "no-reply", "reason": reason.strip(),
+                     "source": evidence}
+        with open(INBOX_PATH, "a") as f:
+            f.write(json.dumps(tombstone, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir()
+        return "no-reply"
 
 
 def compact(now=None):

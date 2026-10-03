@@ -115,7 +115,8 @@ def _parse_file(path):
 
 
 class SendState:
-    def __init__(self, path, inbox_path=None, inbox_lock_path=None):
+    def __init__(self, path, inbox_path=None, inbox_lock_path=None,
+                 recover_sending=True):
         self.path = path
         self.lock_path = path + ".lock"
         self.tmp_path = path + ".tmp"
@@ -131,7 +132,8 @@ class SendState:
             changed = False
             # Restart rule: in-flight sends become uncertain, never sendable.
             for mid, e in data["sends"].items():
-                if isinstance(e, dict) and e.get("status") == STATUS_SENDING:
+                if (recover_sending and isinstance(e, dict)
+                        and e.get("status") == STATUS_SENDING):
                     e["status"] = STATUS_UNCERTAIN
                     e["attempts"] = max(1, int(e.get("attempts") or 0))
                     e["note"] = ("recovered after restart: send may have "
@@ -341,6 +343,23 @@ class SendState:
             data = self._load_locked()
             e = data["sends"].get(msg_id)
             return dict(e) if isinstance(e, dict) else None
+
+    def complete_no_reply(self, msg_id, reason, complete_inbox):
+        """Complete a deliberate quiet decision without hiding a send attempt.
+
+        The inbox callback writes durable reason/evidence under its EX lock.
+        Holding send-state EX across it preserves the claim lock order and
+        prevents a concurrent sender from claiming between check and completion.
+        No existing send entry, even an expired retry_wait, may be discarded.
+        """
+        if not reason.strip():
+            raise ValueError("no-reply requires a reason")
+        with _locked(self.lock_path, True):
+            data = self._load_locked()
+            entry = data["sends"].get(msg_id)
+            if entry:
+                return "held-" + entry["status"]
+            return complete_inbox(msg_id, reason)
 
     def claim(self, msg_id, channel, thread_ts, text_hash,
               client_msg_id=None):
