@@ -449,7 +449,9 @@ def _wrap_adapter(adapter):
     orig_maybe_blocks = adapter._maybe_blocks
     orig_post_chunks = adapter._post_chunks
     orig_edit_message = adapter.edit_message
-    orig_commit_stream = adapter._commit_stream
+    # 新契约（b3059921bc 起）才有 _commit_stream；老树（如 836b5f8 之前）没有。
+    # 取不到就不包这个出口（wrap 其余部分照常），绝不让整个包装炸掉下线。
+    orig_commit_stream = getattr(adapter, "_commit_stream", None)
 
     # 目标工作区 id 的单一解析链：显式 team_id > metadata keys > chat 映射。
     def _target_team_id(chat_id=None, team_id=None, metadata=None):
@@ -531,7 +533,8 @@ def _wrap_adapter(adapter):
     adapter._maybe_blocks = _maybe_blocks_patched
     adapter._post_chunks = _post_chunks_patched
     adapter.edit_message = _edit_message_patched
-    adapter._commit_stream = _commit_stream_patched
+    if orig_commit_stream is not None:
+        adapter._commit_stream = _commit_stream_patched
     LOG.info("[Slack] mention plugin v1.3: adapter wrapped (instance-level)")
     print("[slack-mention-plugin] adapter wrapped v1.3", flush=True)
 
