@@ -6,6 +6,8 @@ Usage (from grokbot/) — **single message only** (channel + ts required):
   python pending_consume_once.py --channel C012 --ts 1234.5 --text 'reply'
   # or positional: python pending_consume_once.py C012 1234.5 --text 'reply'
   # ack-only for already-sent: omit --text (or pass empty)
+  # explicitly resolve unsent work without a Slack message (reason retained):
+  python pending_consume_once.py C012 1234.5 --no-reply --reason 'notification only'
 
 NEVER pass --text alone: that used to blast the same body to every actionable
 row (cross-channel wrong send + mass ACK). Targeting is mandatory.
@@ -19,7 +21,7 @@ import argparse
 import os
 import sys
 
-from inbox_store import escalate_stale_sending, msg_key, peek_actionable, peek_undelivered
+from inbox_store import msg_key, peek_actionable, peek_undelivered, resolve_without_reply
 from reply_pipeline import process_one
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -43,8 +45,17 @@ def consume_one(
     reply_in_thread: bool = False,
     root: str = BASE,
     runner=None,
+    no_reply: bool = False,
+    reason: str = "",
 ) -> dict:
     """Process exactly one (channel, ts) row. Raises ValueError if missing."""
+    if no_reply:
+        if (text or "").strip():
+            raise ValueError("--no-reply cannot be combined with --text")
+        result = resolve_without_reply(inbox, (channel, ts), reason)
+        return dict(result, channel=channel, ts=ts)
+    if reason:
+        raise ValueError("--reason requires --no-reply")
     m = find_target(inbox, channel, ts)
     if m is None:
         raise ValueError(f"no undelivered row for {channel}:{ts}")
@@ -97,11 +108,15 @@ def main(argv=None) -> int:
     ap.add_argument("ts_pos", nargs="?", help="message ts (positional)")
     ap.add_argument("--channel", "-c", help="channel id")
     ap.add_argument("--ts", "-t", help="message ts")
-    ap.add_argument(
+    decision = ap.add_mutually_exclusive_group()
+    decision.add_argument(
         "--text",
         default=None,
         help="reply text for claimable target (required unless row is sent)",
     )
+    decision.add_argument("--no-reply", action="store_true",
+                          help="resolve one unsent claimable row without posting")
+    ap.add_argument("--reason", default="", help="durable reason for --no-reply")
     ap.add_argument("--reply-in-thread", action="store_true")
     ap.add_argument(
         "--list",
@@ -110,11 +125,9 @@ def main(argv=None) -> int:
     )
     args = ap.parse_args(argv)
 
-    n = escalate_stale_sending(INBOX)
-    if n:
-        print(f"escalated {n} stale sending → uncertain", file=sys.stderr)
-
     if args.list:
+        if args.text is not None or args.no_reply or args.reason:
+            ap.error("--list cannot be combined with a reply decision")
         rows = peek_actionable(INBOX)
         for r in rows:
             print(f"{r.get('channel')}:{r.get('ts')}\t{r.get('reply_status')!r}")
@@ -135,14 +148,15 @@ def main(argv=None) -> int:
     text = args.text if args.text is not None else ""
     try:
         r = consume_one(
-            INBOX, channel, ts, text, reply_in_thread=args.reply_in_thread
+            INBOX, channel, ts, text, reply_in_thread=args.reply_in_thread,
+            no_reply=args.no_reply, reason=args.reason,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
     print(f"{channel}:{ts} → {r.get('outcome')}")
-    if r.get("outcome") in ("sent_acked", "sent_ack_pending", "acked"):
+    if r.get("outcome") in ("sent_acked", "sent_ack_pending", "acked", "resolved_no_reply"):
         print(1)
         return 0
     print(0)

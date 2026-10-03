@@ -21,8 +21,10 @@
    需要收紧时再设 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（逗号分隔）；任一非空 = 白名单模式。
 
 2. **每次回复前拉频道历史**  
-   处理 inbox 前先跑 `channel_history.py <channel> [N]`（或 consumer 内同等调用）。  
-   失败时必须可见降级（日志 / 回复注明），**不得假装已读上下文**。
+   按频道/线程整体读 pending，核对最新授权任务与后续限制，再跑
+   `channel_history.py <channel> [N]`；相关线程用 `--thread-ts <ROOT_TS> --all`
+   （`--thread` 同义）。正文完整保留，必要时用 `--all` / `--cursor` 翻页。
+   失败时记录上下文缺口，**不得假装已读或据此猜测回复/静默决定**。
 
 3. **默认频道顶层回复**  
    `REPLY_IN_THREAD=0`（`.env.example` 默认）。  
@@ -30,10 +32,11 @@
    **例外**：`kind=thread_reply`（用户在本 bot 消息下跟帖、无需 @）**始终同线程回复**。
 
 4. **协作礼仪**  
-   - 被其他 agent `@` 你时：结合上下文给出有用回答，不要空转或只 echo。  
-   - **回复另一个 agent 时，正文必须包含对方的 Slack mention `<@USER_ID>`**，对方 bridge 只认这个才会被唤醒；纯名字或不带 mention 的回复不会叫醒他们。
-   - **不要 @ 自己**；点名 → 单回 → 停，避免互相 @ 造成的 echo / 回环风暴。  
-   - 人类 @ 了你时，优先也 `@` 回去，除非该线程里明显多余。
+   - 被其他 agent `@` 时，先判断是否有助于当前授权任务；通知、纯确认、审批提示、
+     已被当前任务吸收的旧控制消息可以带原因静默完成，不要求每源各发一条。
+   - **仅在请求对方具体下一步动作时**使用 `<@USER_ID>`；引用、致谢、确认、
+     状态报告用普通名字，避免这些消息再次叫醒对方。
+   - **不要 @ 自己**；允许授权任务的实质讨论持续多轮，不给整场任务设单轮上限。
    - 引用对方旧消息时，把 `@` 转成纯文本名字，降低二手触发。  
    - 需要收紧对端时用 `ALLOWED_BOT_*`，不要关掉「读历史」或改回「丢弃全部 bot」。
 
@@ -103,6 +106,10 @@
 8. **Optional slower fallback（无本地 LLM）**
    - 不跑 consumer；用 cron/`@every 5m` 调 `python pending_notify.py`
    - Agent 读 `pending.json` → **先** `channel_history.py` → 生成回复 → 经 `reply_pipeline` / `pending_consume_once.py`（禁止 raw send→ack）
+   - 真实 `agent_wake` 由外部 Agent 依据当前上下文决定回复或静默，模板测试不能证明
+     其语义行为。`pending_consume_once.py --channel C --ts T --no-reply --reason '原因'`
+     只消费未发送 claimable，保留原文、`resolution_reason`、`resolved_at`；发送、ACK
+     与静默共用队列锁。ACK 只允许 `sent`，不能清掉 `sending/uncertain/rate_limited`。
    - 比 5s consumer 慢，适合纯 agent 例程；协作规则同上
 
 ## 验收：模板回复 ≠ Agent 集成

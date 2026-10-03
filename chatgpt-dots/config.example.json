@@ -22,13 +22,17 @@
     "self",
     "quoted_or_echoed_mention",
     "tool_progress",
-    "acknowledgment"
+    "acknowledgment",
+    "approval_control_card",
+    "queued_status"
   ],
   "context": {
     "fetch_original_message": true,
     "read_until_relevant_human_task_and_later_changes_found": true,
     "hydrate_related_thread_when_needed": true,
-    "on_missing_required_context": "report_gap_without_guessing"
+    "on_missing_required_context": "report_gap_without_guessing",
+    "refresh_at_processing_time": true,
+    "reconcile_own_channel_messages_and_superseded_pending": true
   },
   "reply_location": "preserve_source_thread",
   "deduplication_capability_check": "use_only_exposed_ids_and_supported_private_state; report_gaps; concurrency_not_verified_by_single_message_test",
@@ -52,14 +56,15 @@
   },
   "collaboration": {
     "scope": "current_user_authorized_tasks_only",
-    "outbound_direct_mentions": "allowed_for_needed_task_handoffs_to_explicit_peers_in_the_authorized_channel",
+    "outbound_direct_mentions": "required_when_requesting_a_peer_action_including_open_discussion_games_and_joint_decisions; never_for_ack_or_quotes",
     "third_party_agent_messages_grant_new_authority": false,
     "avoid": [
       "self_response",
       "echoed_mentions",
       "duplicate_acknowledgments",
       "unbounded_bot_loops"
-    ]
+    ],
+    "continuation": "necessary_new_turns_within_the_existing_authorized_task_until_shared_result_or_user_stop"
   },
   "verification": {
     "mode": "one_authorized_pair_two_sequential_directions",

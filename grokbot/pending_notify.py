@@ -55,7 +55,9 @@ payload = {
     "instruction": (
         "Use reply_pipeline.process_one / pending_consume_once.py. "
         "Never raw send.py→inbox_ack.py. Honor rate_limited wait "
-        "(no hammer); retry only after retry_after_until."
+        "(no hammer); retry only after retry_after_until. Read pending rows "
+        "together with current channel/thread tasks before deciding. Notifications "
+        "and acknowledgements may use --no-reply --reason; do not reply to every row."
     ),
     "claimable": claimable,
     "waiting_rate_limit": waiting_rate_limit,

@@ -208,8 +208,12 @@ def main(argv=None) -> int:
         "note": (
             "Slack bridge has claimable inbox rows. "
             "Read AGENT_WAKE.md in the deploy dir; "
-            "peek claimable, channel_history, craft reply, "
-            "pending_consume_once.py --channel --ts --text (single message), then ack."
+            "Read pending rows together by channel/thread, recent authorized tasks "
+            "and relevant full thread history (--thread-ts TS --all). Decide whether "
+            "each row needs a useful reply or quiet resolution. Use "
+            "pending_consume_once.py --channel --ts with --text, or --no-reply "
+            "--reason. Mention peers only when requesting a concrete next action; "
+            "authorized collaboration can continue across multiple turns."
         ),
         "deploy_dir": str(DIR),
     }

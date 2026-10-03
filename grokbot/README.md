@@ -6,7 +6,7 @@
 - **默认允许其他 bot 的 @mention**（多 agent 频道友好；仅丢弃自己）
 - **~5s 本地 consumer**（或可选 `pending.json` + agent `@every 5m` fallback）
 - **默认频道顶层回复**（`REPLY_IN_THREAD=0`），同伴 agent 看得见；本 bot 线程跟帖（`message.channels`，无需 @）强制同线程回
-- **每次回复前拉 `channel_history`** 作上下文（失败可见降级，不假装已读）
+- **先整体核对相关 pending 与当前任务，再拉频道/线程完整正文**（失败记录缺口，不假装已读）
 
 > 给另一个 agent 的完整配置清单见 **[AGENT.md](./AGENT.md)**（默认按多 agent 协作配置）。
 > 唤醒：[wakeup.md](./wakeup.md) / [AGENT_WAKE.md](./AGENT_WAKE.md)；@-peer 常驻规则：[PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)。
@@ -18,7 +18,7 @@
 | 其他 bot @ 本 bot | **允许**（仅丢弃自己） | 勿改回「丢弃全部 bot」；收紧用 `ALLOWED_BOT_*` |
 | 回复前读上下文 | **是** | `channel_history.py` / consumer 内置；失败要可见 |
 | 回复位置 | **频道顶层**（`REPLY_IN_THREAD=0`） | `1` = 跟帖；`kind=thread_reply` 始终同线程 |
-| 协作礼仪 | 有用单回；回 agent **必须**带 `<@USER_ID>`；不 @ 自己；防回环 | 对方 bridge 只在 `<@USER_ID>` 上醒；人类 @ 你时优先回 @，除非明显多余；点名→回→停 |
+| 协作礼仪 | 有用回复或带原因静默完成；仅具体请求下一步才 @ peer；不 @ 自己 | 允许已授权任务多轮讨论，通知/确认不必继续唤醒；每源最多一次回复，不是强制各回一次 |
 
 ## 快速开始
 
@@ -94,6 +94,28 @@ grokbot/
    - `reply_status=uncertain` → **不盲发**
    - ack：`python inbox_ack.py <channel> <ts>`（与去重同一身份）
 2. **Agent 例程 fallback**：`pending_notify.py`（只导出 claimable）→ `pending_consume_once.py` / `reply_pipeline.process_one`（**禁止** raw `send.py`→`inbox_ack.py`）
+
+真实 `agent_wake` 只唤醒外部 Agent，不调用模板的上下文/回复逻辑。外部 Agent 应先
+核对同频道/线程 pending、最新授权任务与后来限制，决定哪些消息需要回答。
+通知、纯确认、审批提示、已被新任务吸收的控制消息可以逐条静默完成：
+
+```bash
+./venv/bin/python channel_history.py C012 15 --thread-ts ROOT_TS --all
+./venv/bin/python pending_consume_once.py --channel C012 --ts MESSAGE_TS \
+  --no-reply --reason '通知已纳入当前授权任务，没有新动作请求'
+```
+
+`--thread` 兼容 `--thread-ts`；`[limit]` 是页大小，`--all` 跟随分页；单页输出的
+`pagination.next_cursor` 可用于 `--cursor` 继续读取。正文无 500 字截断，输出保留
+`thread_ts`。权限不足或读取失败如实返回错误，不能当作完整上下文。
+
+静默完成与发送认领共用队列锁，只接受未发送 claimable，不消费 `sending/sent/uncertain`
+或 `rate_limited`（即使等待已过）。原始行留在 `inbox.jsonl`，标记 `reply_status=no_reply`
+并持久记录 `resolution_reason` / `resolved_at`，便于核查和恢复证据。重复相同目标确认
+持久性而不覆盖初始原因。`inbox_ack.py` 只 ACK 已确认 `sent`，未发送任务须使用上述
+带原因的决定。单次消费/列举不会把并发 `sending` 当重启；consumer 启动恢复仍将旧
+`sending` 标为 `uncertain`。确认发送解除旧的不确定原因时，原因保留为
+`resolved_uncertain_reason`。这些离线边界测试不代表外部 Agent 的真实协作已验收。
 
 ## Keepalive
 

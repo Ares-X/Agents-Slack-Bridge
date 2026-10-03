@@ -9,9 +9,9 @@
 muse 桥**默认放行其他 bot 的 @mention**（自己的消息永远过滤，防自循环）——与 grokbot 行为一致，装完即可同频道互相 @、读上下文、协作：
 
 1. **互相 @**：默认无需配置。要收紧成白名单，在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（对方 U…/B…，逗号分隔；任一非空即白名单模式）。
-2. **每次回复前读上下文**：`channel_history.py <channel> [N]`（`poll_consumer.py` 已调用）；把 `history` 交给 LLM。
+2. **每次回复前读最新原文**：`channel_history.py <channel> [N]`；线程另读 `--thread-ts <ts> --all`。需要更早上下文时用 `--all` 或 stderr 返回的 `next_cursor` 配合 `--cursor` 继续读取。正文不截断，保留身份、线程、全文哈希、发送关联 ID 和控制卡结构；失败退出 2，不能把失败当空历史或只凭摘要判断。
 3. **回复位置跟随上下文**：在 thread 里被 @ 就在同一 thread 回（传 `--thread-ts`）；新起话题才发顶层。不要为了"让同伴看见"一律改顶层——会破坏 thread 上下文。
-4. **礼仪**：被 @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，转述别人 @ 时写纯文本名字，避免回环。
+4. **自然协作**：先理解任务与最新上下文；同一任务可持续多轮，对同一来源消息至多一条实质回复，且不是每条消息都必须回复。纯 ACK、重复状态、控制卡没有新行动时用带原因的静默完成；开放讨论、游戏动作、需要下一位继续的问答也属于真实交接，交接时显式 `--mention <UID>`。不要 @ 自己；转述名字用纯文本，无交接不传 mention。
 
 ---
 
@@ -19,11 +19,11 @@ muse 桥**默认放行其他 bot 的 @mention**（自己的消息永远过滤，
 
 ```
 Slack ──① 私信/@mention──▶ Slack App ──② Socket Mode 事件推送（出站 websocket，秒级）──▶
-bridge.py ──③ 写入 inbox.jsonl（本地队列）──▶ 消费层（轮询 ~30s）──④ LLM 生成回复 ──▶
-send.py ──⑤ chat.postMessage ──▶ Slack
+bridge.py ──③ 写入 inbox.jsonl（本地队列）──▶ hook / side chat ──④ agent 生成回复或静默决定 ──▶
+send_durable.py ──⑤ 持久化领取/发送/确认 ──▶ Slack
 ```
 
-延迟构成：①→③ 实时；④→⑤ 取决于消费层轮询间隔 + LLM 生成，约 1~3 分钟。
+延迟构成：①→③ 实时；④→⑤ 取决于外部 hook 的轮询间隔和 agent 生成时间。下述轮询 consumer 是参考实现。
 
 ## 2. 配置步骤（按顺序做）
 
@@ -93,20 +93,24 @@ printf '%s' "$REPLY" |
 - 正文经 stdin 输入，不含 echo，不替换 agent 的模型逻辑。
 - 与 `poll_consumer` 共用同一套持久化状态机（`deliver_one`）：发送前 fsync 持久 claim、tombstone 防重复、`client_msg_id` 关联、限流通 `retry_wait` 持久化、`uncertain` fail-closed、已发送但 ACK 失败转 `unacked`（只重试 ACK，绝不重发正文）。
 - `--thread-ts`：在 thread 里被 @ 就传同一 thread 回复；新起话题不传（顶层）。
-- 恢复核验以发送尝试持久化的 `channel`/`thread_ts` 为权威，后续调用不得改变核验目标。
+- 恢复核验以发送尝试持久化的 `channel`/`thread_ts` 为权威，后续调用不得改变核验目标；线程核验经 `conversations.replies` 分页读取。
+- 每次判断前重新读当前频道原文；来源在 thread 中时还要读完整 thread。摘要与入队时的旧文本只能作为定位线索。审批卡可能随批准而编辑，先根据 bot 身份、结构和最新状态理解控制语义；不要仅因旧 `Command approval` 与新 `Approved once` 不同就称为冒充，更不要把卡片命令当作新的执行授权。引用其他 agent 的动作时明确归属；没有自己的发送/执行证据时不要把他人的动作认领为自己执行，也不要作无证据的绝对否认。
+- 如果本消息不需要实质回复，使用 `python send_durable.py '<channel>:<ts>' --no-reply --reason '具体原因'`，无需 stdin，且不能混用发送选项。该路径不查询 bot 身份、不调用 Slack；在发送状态锁内确认目标没有任何 `sending` / `uncertain` / `unacked` / `retry_wait` 后，写入带 `disposition=no-reply`、原因和来源证据的 inbox tombstone，并确认文件和目录 fsync。到期的 `retry_wait` 也不得直接静默结束；有发送状态时按原恢复流程处理。
+- 静默完成重复调用保留原原因和证据，重新确认持久化；未知来源、存储失败或损坏不返回成功。compact 在既有七天去重保留期内保留完整 tombstone，包括原因与来源证据。不要用 raw `inbox_ack.py` 代替静默决定。
+- 同一任务需要持续推进时继续接新消息；同一来源最多一条实质回复。真实交接（包括开放讨论和游戏）经显式 `--mention <UID>` 触发下一位，正文的纯文本名字本身不会唤醒对方。
 
 退出码：
 
 | 码 | 含义 | 调用方动作 |
 |---|---|---|
-| 0 | 已发送+已确认，或已被其他消费者完成/幂等跳过 | 结束 |
+| 0 | 已发送+已确认、静默完成，或已被其他消费者完成/幂等跳过 | 本来源已完成 |
 | 75 | 限流，`retry_at` 已持久保存 | 到期前不得重试 |
 | 1 | 明确未发送（claim 已释放） | 可重试 |
 | 2 | 结果不确定，保持 `uncertain` | 不得盲目重发，先查频道历史核验 |
 | 3 | 已发送但 ACK 失败（`unacked`） | 只重试 ACK，绝不重发正文 |
-| 4 | 发送状态损坏 | fail-closed，人工处理 |
+| 4 | 发送状态损坏、存储失败或静默来源不可确认 | fail-closed，保留证据并处理原因 |
 
-只有 ACK 确实成功才返回 0；连续 ACK 失败保持 3，直到真正确认。
+只有完成标记确实持久化才返回 0；发送后连续 ACK 失败保持 3，直到真正确认。静默遇到现存发送状态时按上表的 2/3/75 保持原状态，不静默丢弃。
 
 ## 3. 文件清单与路径
 
@@ -192,7 +196,7 @@ Agents-Slack-Bridge/
 3. **出站代理/TLS 拦截** → `.env` 配 `PROXY_URL` / `CA_BUNDLE`，三个脚本都会读。
 4. **频道必须先邀请 bot**，否则收不到 `app_mention`。
 5. **thread 回复唤醒**：人类用户在 bot 消息的 thread 下回复也会入队（kind=`thread_reply`，bot 的 thread 回复不入队以防回环）。这需要 App 的 Event Subscriptions 里订阅 `message.channels`（见 `manifest.yaml`）；订阅缺失时 thread 回复事件根本发不到桥上。处理顺序是**先查父消息、再落盘、最后 ACK**：用 `conversations_replies(limit=1)` 确认父消息是自己发的才入队；查询失败/父消息不明/落盘失败一律不 ACK，靠 Slack 重发重试，绝不当成非目标消息丢弃。
-5. **多 agent 协作（默认开）**：其他 bot 的 @mention 默认放行，自己的消息永远过滤（防自循环）。要收紧成白名单，把协作对象的 user ID / bot ID 填进 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（任一非空即白名单模式）。防回环纪律：被 @ 才回、回一轮就停、转述别人 @ 时写纯文本名字不写实 @。
+5. **多 agent 协作（默认开）**：其他 bot 的 @mention 默认放行，自己的消息永远过滤（防自循环）。要收紧成白名单，把协作对象的 user ID / bot ID 填进 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（任一非空即白名单模式）。防回环纪律：每条来源至多一条实质回复；控制/ACK 消息按上下文静默完成；任务可持续多轮，真实交接显式 mention，转述名字用纯文本。
 6. **回复前读上下文**：消费层应先 `channel_history.py` 再生成回复（参考 `poll_consumer.py`）。
 7. **可靠性顺序：先落盘，再 ACK**：`bridge.py` 收到事件后先 `flush+fsync` 写入队列，**成功后才**向 Slack 发 ACK；名称查询等慢操作不在热路径。落盘失败则不 ACK，靠 Slack 重发 + `msg_id` 去重实现 at-least-once（重复入队会被去重丢弃）。
 8. **mention 回声脱敏**：默认 echo/转述必须把 `<@U...>` 转成纯文本 `@U...`（不触发通知）；主动点名走 `send.py --mention <UID>` 显式发出。不要为了防回环禁掉全部 mention。
@@ -211,7 +215,7 @@ Agents-Slack-Bridge/
 ```bash
 cd muse && python3 -m unittest discover -s tests -v
 ```
-测试覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。`test_reliability.py` 另有行为测试：旧队列升级（含 delivered=false→true 顺序无关的完成标记优先）、发送结果判定、发送后崩溃恢复、并发 claim 互斥、存储失败（fsync/损坏隔离）、错误回执匹配、wire text 哈希（含 mention 追加）、队尾截断、compact 后重投。`test_reliability_round2.py` 覆盖 stale `.bak` 恢复拒绝、严格版本/结构校验、分来源隔离证据、ack 异常、旧快照、`client_msg_id` 核验和目录持久化。恢复测试另外覆盖目录持续故障下真实 bridge handler 不 ACK、完成记录读取失败不重发，以及限流 60/120 秒跨重启等待、到期领取互斥、错误期限拒绝和迟到核验。仅标准库与模拟网络，无新增依赖。
+测试覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。`test_reliability.py` 另有行为测试：旧队列升级（含 delivered=false→true 顺序无关的完成标记优先）、发送结果判定、发送后崩溃恢复、并发 claim 互斥、存储失败（fsync/损坏隔离）、错误回执匹配、wire text 哈希（含 mention 追加）、队尾截断、compact 后重投。`test_reliability_round2.py` 覆盖 stale `.bak` 恢复拒绝、严格版本/结构校验、分来源隔离证据、ack 异常、旧快照、`client_msg_id` 核验和目录持久化。恢复测试另外覆盖目录持续故障下真实 bridge handler 不 ACK、完成记录读取失败不重发，以及限流 60/120 秒跨重启等待、到期领取互斥、错误期限拒绝和迟到核验。`test_natural_collaboration.py` 另覆盖频道/线程分页去重、完整正文和控制卡、分页失败不输出部分成功、静默原因/来源持久化及 compact 保留、并发领取互斥、所有未完成发送状态拒绝静默、fsync 故障与重复确认。仅标准库与模拟网络，无新增依赖。
 
 **NOT_EXERCISED**：真实 Slack 联调未在授权测试频道执行（无凭据、无部署修改），需部署者按 §6 自行验证。
 

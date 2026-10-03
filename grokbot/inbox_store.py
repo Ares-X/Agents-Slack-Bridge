@@ -27,6 +27,7 @@ AckKey = Tuple[str, str]  # (channel, ts)
 #   "sending"           — durable in-flight claim (never blind-resend on restart)
 #   "sent"              — Slack send confirmed; ack only
 #   "uncertain"         — send outcome unknown; never blind-resend
+#   "no_reply"          — explicitly resolved without sending; reason retained
 STATUS_CLAIMABLE = frozenset({None, "", "retryable"})
 STATUS_NO_RESEND = frozenset({"sending", "sent", "uncertain"})
 
@@ -391,6 +392,12 @@ def update_records(
             if reply_status is not None and r.get("reply_status") != reply_status:
                 r["reply_status"] = reply_status
                 dirty = True
+            if reply_status == "sent" and "uncertain_reason" in r:
+                # A confirmed Slack result resolves an intervening uncertainty
+                # (e.g. an older one-shot CLI mistook a live send for restart).
+                # Retain the incident cause without presenting it as current.
+                r["resolved_uncertain_reason"] = r.pop("uncertain_reason")
+                dirty = True
             if extra_fields:
                 for ek, ev in extra_fields.items():
                     if r.get(ek) != ev:
@@ -462,7 +469,51 @@ def set_reply_status(
 
 
 def ack_keys(path: str, keys: Iterable[AckKey]) -> Tuple[int, Set[AckKey]]:
-    return update_records(path, keys, delivered=True)
+    """Ack confirmed sends only; recheck status under the queue lock.
+
+    Unsent work needs resolve_without_reply(reason), not an unreasoned ACK.
+    In-flight, uncertain and rate-limited rows must remain visible.
+    """
+    return update_records(path, keys, delivered=True, only_if_status_in={"sent"})
+
+
+def resolve_without_reply(path: str, key: AckKey, reason: str) -> Dict[str, Any]:
+    """Durably resolve one unsent claimable row, competing with send on its lock.
+
+    Keep the original event and decision in the queue for inspection/recovery.
+    Rate-limited rows (even after expiry), sending, sent and uncertain are never
+    consumed here. A repeated successful decision confirms durability without
+    overwriting its original reason/time.
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("--no-reply requires a non-empty --reason")
+    key = (str(key[0]), str(key[1]))
+    lf = _acquire_lock(path, exclusive=True)
+    try:
+        if not os.path.exists(path):
+            return {"action": "skip", "outcome": "not_found"}
+        rows, _ = read_records_repair_tail(path)
+        hit = next((r for r in rows if msg_key(r) == key), None)
+        if hit is None:
+            return {"action": "skip", "outcome": "not_found"}
+        if hit.get("delivered"):
+            if hit.get("reply_status") == "no_reply":
+                fsync_file_and_dir(path)
+                return {"action": "no_reply", "outcome": "resolved_no_reply",
+                        "reason": hit["resolution_reason"]}
+            return {"action": "skip", "outcome": "already_delivered"}
+        if not is_claimable(hit.get("reply_status")):
+            return {"action": "skip", "outcome": "not_claimable",
+                    "detail": hit.get("reply_status")}
+        hit["reply_status"] = "no_reply"
+        hit["resolution_reason"] = reason
+        hit["resolved_at"] = time.time()
+        hit["delivered"] = True
+        _atomic_rewrite(path, rows)
+        return {"action": "no_reply", "outcome": "resolved_no_reply", "reason": reason}
+    finally:
+        _release_lock(lf)
 
 
 def escalate_stale_sending(path: str) -> int:

@@ -9,25 +9,37 @@ Also summarized in [AGENT.md](./AGENT.md) §多 agent 协作默认. When woken, 
    Bridge must **not** drop all bot messages. Only discard **your own** `user_id` (anti self-loop).  
    Tighten with `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS` (comma-separated whitelist) if needed.
 
-2. **Read channel history before every reply**  
-   `channel_history.py <channel> [N]` (or equivalent). On failure: visible degrade in log/reply — **never pretend** you had context.
+2. **Read pending work and current task context before deciding**
+   Read related pending rows together by channel/thread, the latest authorized
+   task, and later constraints. Use `channel_history.py <channel> [N]` and
+   `--thread-ts <ROOT_TS> --all` for relevant threads; `--thread` is an alias.
+   Follow pagination with `--all` / `--cursor` when needed. On failure: record
+   the limitation — **never pretend** you had context or infer a quiet decision.
 
 3. **Reply in channel top-level by default**  
    `REPLY_IN_THREAD=0`. If `1`: use existing `thread_ts`, else message `ts`.
 
 4. **Etiquette**
-   - When @'d: useful answer; no empty spin / bare echo.
-   - **Reply to another agent: the message MUST include that agent's Slack mention `<@USER_ID>`** so their bridge wakes them. Their bridge does not wake on a plain name or an un-mentioned reply.
-   - **Do not @ yourself**; mention → one reply → stop (no echo / ping-pong storms).
-   - Prefer also @-replying humans who @'d you, unless the thread makes that clearly redundant.
+   - Reply if it advances the authorized task. Notifications, pure confirmations,
+     approval reminders and superseded control messages may be resolved quietly
+     with a durable reason. Do not send a confirmation of every confirmation.
+   - Include `<@USER_ID>` **only to request a peer's concrete next action**.
+     Use plain names for references, acknowledgements and status reports.
+   - **Do not @ yourself**. Continue useful authorized discussion across turns;
+     stop echo/control loops, not an entire task after its first substantive reply.
    - When quoting others, turn `@` into plain names to avoid second-hand triggers.
    - Use `ALLOWED_BOT_*` to tighten peers — do **not** disable history reads or revert to “drop all bots”.
 
-5. **One (channel, ts) → one crafted reply**  
-   Different peers / channels / questions get different texts. Use  
-   `pending_consume_once.py --channel … --ts … --text '…'` — never `--text` alone.
+5. **One (channel, ts) → at most one reply, or a reasoned quiet decision**
+   Use `pending_consume_once.py --channel … --ts … --text '…'`, or
+   `--no-reply --reason '…'`. Never broadcast one text/decision across rows.
+   Quiet resolution retains the original row, reason and time; it only accepts
+   unsent claimable rows. ACK is restricted to `sent`; no decision clears an
+   in-flight, uncertain or rate-limited send.
 
 ## Quick checks
 
-- Another agent `@Grok Bot` → enqueued, history read, useful **top-level** reply.
-- Reply to a peer agent includes their `<@USER_ID>` (required). No self-@. No template auto-send when `agent_wake` is on.
+- Another agent `@Grok Bot` → enqueued, related pending/task/thread context read,
+  then useful reply in the correct location or durable quiet resolution.
+- Concrete peer handoff includes `<@USER_ID>`; a confirmation does not wake them.
+  No self-@. No template auto-send when `agent_wake` is on.
