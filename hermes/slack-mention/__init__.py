@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slack mention 插件 v1.3 r5（2026-10-03，PR #10 四轮复核 P2 回归修复）
+"""Slack mention 插件 v1.4（2026-10-03，部署树 836b5f8 契约对齐）
 
 官方面（不变）：
 - ``ctx.register_platform_handler("slack", factory)`` — SlackAdapter.connect() 时把
@@ -8,34 +8,36 @@
      凌晨血坑：async 化会被同步调用点拿到 coroutine）。
   2. ``adapter._post_chunks`` — 兜底路径预热成员表。
   3. ``adapter.edit_message`` — 编辑路径同样解析（v1.0 漏）。
-  4. ``adapter._commit_stream`` — 原生流收尾解析（v1.3 换位：v1.2 包的
-     ``_seal_stream`` 是旧上游契约，新上游文本收尾全部走 ``_commit_stream``）。
+  4. ``adapter._commit_stream`` — 新上游（b3059921bc 起）原生流收尾解析。
+  5. ``adapter._try_finalize_stream`` — **旧上游（836b5f8 部署树）**的等价收尾
+     出口（v1.4 新增）：老树无 _commit_stream，文本收尾全走
+     ``send() → _try_finalize_stream(chat_id, content) → _seal_stream``，
+     且在 send() 顶部**先于** _post_chunks 执行——v1.3 的 async 预热出口在该
+     路径永不触发，收尾 stopStream 的未流出尾段与 finalize chat.update 的
+     blocks 全是生文本（冷缓存下 mention 不解析）。
 
-v1.3 r4 修的三件事（评审第三轮复核）：
-① 无上下文同步渲染不再信「唯一缓存表」：A/B 双工作区只预热 B 时，上游
-   ``_get_client`` 的 primary fallback 把无 metadata 消息发去 A 的客户端——
-   唯一幸存的 B 表不能证明目标工作区（text 留 @name、blocks 换 B 的用户
-   ID = 同一条消息两处指人不一致）。现在要求「缓存唯一键 == primary
-   fallback 实际路由的工作区」（``_app.client.team_id``）才解析；否则 text
-   与 blocks 都保留原文。
-② 流收尾直通状态从适配器级全局 ``set(ts)``/计数改为 **contextvar + 流身份
-   (team, channel, ts)**：直通/抑制窗口只对当前调用上下文（task 及其 await
-   子树）可见。不同工作区的同 ts 流并发收尾互不干扰（A 完成不再撤销 B 的
-   保护）；A 等待期间 B 的同 ts 无关普通编辑照常解析（不再被错误跳过）。
-   嵌套同步出口（``_commit_stream`` 内 ``_maybe_blocks`` 探测）同 task 天然
-   继承上下文。直通 edit **原样送达**包装已构造的载荷：纯文本部署
-   （rich_blocks=False）下渲染器恒 None，「没有 blocks」不等于「text 缺解
-   析」，再补偿解析会把已发送前缀二次改写（r5 撤销 r4 的 final_blocks
-   探测，回归见 round 5 P2）。
-③ （评审 #3 为测试夹具修正，见 test_slack_mention_v13_r3.py：R1 场景加载
-   MEM_A 而非 Muse/U1。）
+v1.4（836 兼容层）：
+- 仅当 ``_commit_stream`` 取不到（老树档）才包 ``_try_finalize_stream``——
+  新树上 send() 经 _try_finalize → _commit_stream（已包），绝不双包。
+- 老树流身份 = ``_active_streams`` 的 **chat_id 索引**（非三元组 key）；extends
+  判定用老树自己的字节前缀语义（sent 非空且 text.startswith(sent)），delta =
+  text[len(sent):]，floor = len(sent)——已发送前缀字节不动，只解析尾段提及
+  （与 v1.3 round 3 #2 同一条铁律）。
+- 解析后的整篇 final_text 递给 orig：orig 内部自切 stopStream 的 append delta
+  （final_text[len(sent):] = 已解析尾段），finalize blocks 由 orig 的
+  ``self._maybe_blocks`` 渲染——那是**包装后**的同步出口，靠 contextvar 直通
+  窗口跳过它的全文再解析（前缀 @name 已上屏，二次解析 = text/blocks 不一致）。
+- orig 签名两档自适应：老树 ``(chat_id, content)``，带 metadata 的变体照传。
+- 建表路由与 async 出口同链：metadata team > chat 映射 > 唯一认证工作区；
+  解析不出目标且多工作区时保留原文（宁可不解析，绝不拿 A 表猜 B）。
 
-v1.3 r3 保留：``_commit_stream`` 真实契约（key/delta/replace）、尾段解析的
-floor 限定与完整终稿判界、``_stream_relation`` 两档 extends 委托、
-SlackResponse 鸭子型取值。
-v1.2 保留：真实 renderer 的 ``style.code`` 代码保护、「查无」与「歧义」分离、
-成员表严格绑定目标 team、edit 路径 metadata 工作区路由。
-v1.1 保留：短名回退、句末标点、围栏/内联代码片段的文本级保护。
+v1.3 r5 保留：直通 edit 原样送达已构造载荷（纯文本部署下「没有 blocks」≠
+「text 缺解析」，final_blocks 探测已撤销）。
+v1.3 r4 保留：contextvar 流身份 (team, channel, ts)、primary-team 证明、
+跨工作区并发收尾互不干扰。
+v1.3 r3 保留：_commit_stream 真实契约（key/delta/replace）、尾段解析的
+floor 限定与完整终稿判界、_stream_relation 两档 extends 委托。
+v1.2/v1.1 保留：代码切片保护、「查无/歧义」分离、成员表严格绑定目标 team。
 """
 
 import asyncio
@@ -616,9 +618,11 @@ def _wrap_adapter(adapter):
     orig_maybe_blocks = adapter._maybe_blocks
     orig_post_chunks = adapter._post_chunks
     orig_edit_message = adapter.edit_message
-    # 新契约（b3059921bc 起）才有 _commit_stream；老树（如 836b5f8 之前）没有。
+    # 新契约（b3059921bc 起）才有 _commit_stream；老树（如 836b5f8 部署档）没有。
     # 取不到就不包这个出口（wrap 其余部分照常），绝不让整个包装炸掉下线。
     orig_commit_stream = getattr(adapter, "_commit_stream", None)
+    # 老树的收尾出口（836 档）；_wrap_836_finalize 在尾部按需接线。
+    _try_finalize_stream_orig = getattr(adapter, "_try_finalize_stream", None)
 
     # 目标工作区 id 的单一解析链：显式 team_id > metadata keys > chat 映射。
     def _target_team_id(chat_id=None, team_id=None, metadata=None):
@@ -647,7 +651,8 @@ def _wrap_adapter(adapter):
         except Exception:
             return blocks
 
-    async def _resolve_async_outlet(content, chat_id=None, team_id=None, metadata=None):
+    async def _resolve_async_outlet(content, chat_id=None, team_id=None,
+                                    metadata=None, floor=None):
         """async 出口统一解析：先确保表就绪（冷启动首条也解析），再替换。
 
         team 路由与树内出站一致：显式 team_id（_post_chunks 自带）>
@@ -656,6 +661,10 @@ def _wrap_adapter(adapter):
         `_get_client` 的「取第一个 client」fallback 对发消息无害，对
         名字→ID 是拿 A 的表猜 B（round 3 #1 的 async 侧同型洞）。
         单工作区（len==1）用该 team 建表（表键与同步路径一致）。
+
+        ``floor`` 非空时是流式收尾的已发送前缀长度：只改写 floor 之后
+        **开始**的提及（_resolve_tail_mentions），前缀字节原样——与
+        _commit_stream_patched 同一条铁律（round 3 #2）。
         """
         tid = _target_team_id(chat_id, team_id, metadata)
         if not tid:
@@ -666,6 +675,8 @@ def _wrap_adapter(adapter):
                 tid = next(iter(team_clients))
         try:
             table = await _name_table(adapter, chat_id=chat_id, team_id=tid)
+            if floor is not None:
+                return _resolve_tail_mentions(content, table, floor)
             return _build_repl_string(content, table)
         except Exception:
             return content
@@ -749,11 +760,12 @@ def _wrap_adapter(adapter):
                 key, stream, new_text, metadata, delta=new_delta, replace=replace))
 
     async def _pass_through_edit(stream, key, awaitable):
-        """_commit_stream 收尾的 finalize edit 用我们构造好的精确载荷直通。
+        """流收尾的 finalize edit 用我们构造好的精确载荷直通。
 
-        orig 内部 edit_message(chat_id, ts, shown, finalize=True) 会再进
-        edit_message 包装 → 全文解析 → 已发送前缀里的 @name 被二次改写 =
-        Slack 上同一条消息 text 与 blocks 不一致（round 3 #2 的复现形状）。
+        orig 内部 edit_message(chat_id, ts, shown, finalize=True)（新树）或
+        ``self._maybe_blocks(text)`` + chat_update（老树 836）都会再进包装的
+        同步出口 → 全文解析 → 已发送前缀里的 @name 被二次改写 = Slack 上
+        同一条消息 text 与 blocks 不一致（round 3 #2 的复现形状）。
 
         v1.3 r4（评审 #2）：流身份 = (team, channel, ts)，登记进 contextvar
         ——只对当前调用上下文（task 及其 await 子树）可见，作用域即 orig 调
@@ -778,13 +790,82 @@ def _wrap_adapter(adapter):
         finally:
             _stream_edit_ctx.reset(token)
 
+    async def _try_finalize_stream_patched(chat_id, content, *args, **kwargs):
+        """老树（836b5f8 部署档）的 send() 顶部收尾出口（v1.4）。
+
+        上游真身（部署树 adapter.py）：
+          ``async def _try_finalize_stream(self, chat_id, content)``
+          - 在 send() **最前**执行，先于 _post_chunks——v1.3 的 async 预热
+            出口在这条路径永不触发，冷表下收尾全是生文本；
+          - 仅当 ``text.startswith(sent)`` 且 sent 非空才认领（claim），认领即
+            ``_active_streams.pop(chat_id)``，delta 自切 = final_text[len(sent):]；
+          - seal 后用 ``self._maybe_blocks(text)`` 渲染 finalize blocks 再
+            chat_update——那是包装后的同步出口，需 contextvar 直通保护。
+
+        包装策略（与 _commit_stream_patched 同铁律）：
+        1. 不改变认领判定——text 先用 orig 同款 ``_strip_stream_cursor``
+           剥游标再比对（只读复刻，不猜格式）；
+        2. 认领成立 → 先 await 建表，floor = len(sent) 只解析未流出尾段，
+           把解析后的**整篇** final_text 递给 orig：orig 自切的
+           markdown_text delta（= final_text[len(sent):]）天然带上已解析尾段；
+        3. 全程打 (team, channel, ts) 直通标记：orig 内部的 finalize
+           ``self._maybe_blocks``（同步包装）按精确流身份命中，不再全文
+           二次解析——纯文本部署下渲染器恒 None，「没有 blocks」≠「text
+           缺解析」（round 5 P2），已发送前缀字节绝不重写；
+        4. 未认领（interim commentary / 前缀断裂）→ 原样透传，表都不建——
+           这条路径上游直接 return None 走 _post_chunks，预热由它负责；
+        5. 任何异常兜底：透传 orig 原参数，绝不让收尾炸掉（best-effort 契约）。
+        """
+        streams = getattr(adapter, "_active_streams", None) or {}
+        stream = streams.get(chat_id)
+        if stream is None:
+            return await _try_finalize_stream_orig(chat_id, content, *args, **kwargs)
+        sent = stream.get("sent", "")
+        strip = getattr(adapter, "_strip_stream_cursor", None)
+        text = strip(content) if callable(strip) else content
+        # 认领判定与上游逐字对齐：sent 空 / 前缀不匹配 = interim，不归我们管。
+        if not sent or not isinstance(text, str) or not text.startswith(sent):
+            return await _try_finalize_stream_orig(chat_id, content, *args, **kwargs)
+        ts = stream.get("ts")
+        ident = _stream_identity(adapter, chat_id, ts)
+        try:
+            new_text = await _resolve_async_outlet(
+                text, chat_id=chat_id, floor=len(sent))
+        except Exception:
+            new_text = text
+        prior = _stream_edit_ctx.get()
+        active = set(prior) if prior else set()
+        nested = ident is not None and ident in active
+        if not nested and ident is not None:
+            active.add(ident)
+            token = _stream_edit_ctx.set(frozenset(active))
+        else:
+            token = None
+        try:
+            return await _try_finalize_stream_orig(chat_id, new_text, *args, **kwargs)
+        finally:
+            if token is not None:
+                _stream_edit_ctx.reset(token)
+
+    def _wrap_836_finalize():
+        """老树档接线（仅在无 _commit_stream 时调用，见 _wrap_adapter 尾部）。"""
+        if callable(_try_finalize_stream_orig):
+            adapter._try_finalize_stream = _try_finalize_stream_patched
+
     adapter._maybe_blocks = _maybe_blocks_patched
     adapter._post_chunks = _post_chunks_patched
     adapter.edit_message = _edit_message_patched
     if orig_commit_stream is not None:
         adapter._commit_stream = _commit_stream_patched
-    LOG.info("[Slack] mention plugin v1.3 r5: adapter wrapped (instance-level)")
-    print("[slack-mention-plugin] adapter wrapped v1.3 r5", flush=True)
+    else:
+        # 老树档（836b5f8 部署树）：无 _commit_stream，send() 的收尾走
+        # _try_finalize_stream。新树上 send() 经 _try_finalize →
+        # _commit_stream（已包）——此时**绝不**再包 _try_finalize，否则
+        # 尾段被解析两次（_try_finalize 包装先解析一遍，进 orig 后
+        # _commit_stream 包装又按 floor 解析一遍，幂等性全靠查表不撞）。
+        _wrap_836_finalize()
+    LOG.info("[Slack] mention plugin v1.4: adapter wrapped (instance-level)")
+    print("[slack-mention-plugin] adapter wrapped v1.4", flush=True)
 
 
 def _factory(native, adapter):

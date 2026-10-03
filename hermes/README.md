@@ -201,6 +201,23 @@ delta 本身；`replace=True` 走 chat.update 整篇解析）。`users_list` 响
 37 断言（契约/分页/全链路 send_draft→send→_commit_stream/多工作区隔离/歧义）
 ——`HERMES_ROOT` 环境变量指 checkout，可选 argv 传 repo/commit。
 
+**v1.4（部署树 836b5f8 契约对齐）**：部署树**没有** `_commit_stream/_stream_key/
+_stream_relation`——文本收尾走 `send() → _try_finalize_stream(chat_id, content) →
+_seal_stream(chat_id, stream, final_text=, blocks=)`，且在 `send()` 顶部**先于**
+`_post_chunks` 执行，流身份是 `_active_streams` 的 **chat_id 索引**（非三元组
+key）。v1.3 在该树上收尾出口全空转：stopStream 的未流出尾段与 finalize
+chat.update 的 blocks 全是生文本（冷缓存 mention 不解析）。v1.4 在
+`_commit_stream` 取不到时改包 `_try_finalize_stream`（新树绝不双包）：认领判定
+逐字对齐上游（`_strip_stream_cursor` + `startswith(sent)`），floor=len(sent) 只
+解析未流出尾段，解析后的整篇 final_text 递给 orig（orig 自切 markdown_text
+delta），contextvar 直通窗口保护 orig 内部 `self._maybe_blocks` 的 finalize
+渲染不二次全文解析（已发送前缀字节绝不重写）。老树 extends = 字节前缀语义
+（`len(final_text) > len(sent)` 才带 markdown_text，相等 = 纯封口）。
+测试 `slack-mention/test_slack_mention_v14.py`：同款真实上游方法（固定
+836b5f8253 worktree），13 断言（契约 A1-A5 / 冷缓存全链路 T1 / 富文本收尾
+T2 / 片段切换 T3 / 前缀断裂 T4 / edit 普通路径 T5 / 幂等+team 隔离 T6）；
+v13 双套件（37+39 断言）在新树 a5e7df27c7 上回归全绿。
+
 ## 读取历史
 
 Hermes 在会话内自动带 thread 上下文（adapter 内置 `conversations.replies` 水位缓存），一般不需要手动读。需要补频道级上下文（多 agent 对账、审计）时用本目录 CLI：
