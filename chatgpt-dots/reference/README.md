@@ -123,3 +123,7 @@ sharing message contents or sanitize every possible Slack API output structure.
 The [2026-10-02 review](../REVIEW-2026-10-02.md) records the baseline, a narrowly
 scoped single-quote contraction fix, and offline regression results. These checks
 do not validate any hosted DOTS runtime or live Slack deployment.
+
+## Routing scope (2026-10-03)
+
+This historical offline module still requires a direct mention and returns a channel-only destination. It does not implement the hosted guide's new authorized-task delegation or thread-preserving routing. Its tests are not acceptance tests for that guide or the deployed service. No reference code was installed into DOTS or another bridge.
