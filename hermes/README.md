@@ -201,6 +201,61 @@ delta 本身；`replace=True` 走 chat.update 整篇解析）。`users_list` 响
 37 断言（契约/分页/全链路 send_draft→send→_commit_stream/多工作区隔离/歧义）
 ——`HERMES_ROOT` 环境变量指 checkout，可选 argv 传 repo/commit。
 
+**v1.4（部署树 836b5f8 契约对齐）**：部署树**没有** `_commit_stream/_stream_key/
+_stream_relation`——文本收尾走 `send() → _try_finalize_stream(chat_id, content) →
+_seal_stream(chat_id, stream, final_text=, blocks=)`，且在 `send()` 顶部**先于**
+`_post_chunks` 执行，流身份是 `_active_streams` 的 **chat_id 索引**（非三元组
+key）。v1.3 在该树上收尾出口全空转：stopStream 的未流出尾段与 finalize
+chat.update 的 blocks 全是生文本（冷缓存 mention 不解析）。v1.4 在
+`_commit_stream` 取不到时改包 `_try_finalize_stream`（新树绝不双包）：认领判定
+逐字对齐上游（`_strip_stream_cursor` + `startswith(sent)`），floor=len(sent) 只
+解析未流出尾段，解析后的整篇 final_text 递给 orig（orig 自切 markdown_text
+delta）。传入 orig 前加回原始游标/空白后缀，由 orig 去掉原游标一次；避免正文
+末尾省略号被二次剥除、claim 翻转而另发整篇。contextvar 直通窗口保护 orig 内部 `self._maybe_blocks` 的 finalize
+渲染不二次全文解析（已发送前缀字节绝不重写）。老树 extends = 字节前缀语义
+（`len(final_text) > len(sent)` 才带 markdown_text，相等 = 纯封口）。
+测试 `slack-mention/test_slack_mention_v14.py`：同款真实上游方法（固定
+836b5f8253 worktree），19 断言（契约 A1-A5 / 冷缓存全链路 T1 / 富文本收尾
+T2 / 片段切换 T3 / 前缀断裂 T4 / edit 普通路径 T5 / 幂等+team 隔离 T6 /
+游标与正文省略号、空白、claim 保持和单流封口 T7）；
+v13 双套件（37+39 断言）在新树 a5e7df27c7 上回归全绿。
+
+启动日志会给出实际流出口 `commit_stream` 或 `try_finalize_stream_836`；
+两者均缺失时明确警告 `MISSING`，只说明普通发送/编辑包装可用，不声称流收尾就绪。
+
+### 有界协作的 Slack 展示配置（836b5f8）
+
+如果需要同线程单次终稿、避免工具进度刷屏，可在备份现有配置后合并以下字段：
+
+```yaml
+display:
+  platforms:
+    slack:
+      streaming: false
+      interim_assistant_messages: false
+      thinking_progress: false
+      tool_progress: "off"
+      live_status: "off"
+      long_running_notifications: false
+      show_reasoning: false
+platforms:
+  slack:
+    typing_indicator: false
+    extra:
+      reply_in_thread: true
+```
+
+这些显示字段只覆盖 Slack；不覆盖现有 `allow_bots`、作者/频道授权或其他平台。
+显式 `tool_progress: "off"` 也关闭 native task cards。审批仍走独立
+`send_exec_approval` 路径，不能为了静默输出关闭审批。依据固定上游
+[展示解析](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/display_config.py)、
+[回合显示](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/run_turn.py)与
+[回合执行/审批](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/run_turn_runner.py)。
+
+使用 adapter 自动终稿作为正文的唯一发送入口；同一回复不要再经 curl 或发送工具另发。
+这些设置不屏蔽所有诊断和 memory 更新，也不改变超长文本切块行为，不能当作 exactly-once
+保证。普通短回复的条数、线程和完成即停止仍须真实验收；磁盘文件更新后还须核对新进程加载。
+
 ## 读取历史
 
 Hermes 在会话内自动带 thread 上下文（adapter 内置 `conversations.replies` 水位缓存），一般不需要手动读。需要补频道级上下文（多 agent 对账、审计）时用本目录 CLI：
