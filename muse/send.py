@@ -82,8 +82,9 @@ def load_env(path):
 def main():
     env = load_env(os.path.join(BASE, ".env")) if os.path.exists(
         os.path.join(BASE, ".env")) else {}
-    proxy = env.get("PROXY_URL") or None
-    ca = env.get("CA_BUNDLE") or None
+    # 代理/CA 经 net_config 统一读取（issue #7）：.env > 标准环境变量 > 直连。
+    from net_config import read_proxy_config
+    proxy, ca = read_proxy_config(env)
 
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):

@@ -32,8 +32,9 @@ def main():
     kind, id_ = sys.argv[1], sys.argv[2]
     env = load_env(os.path.join(BASE, ".env")) if os.path.exists(
         os.path.join(BASE, ".env")) else {}
-    proxy = env.get("PROXY_URL") or None
-    ca = env.get("CA_BUNDLE") or None
+    # 代理/CA 经 net_config 统一读取（issue #7）：.env > 标准环境变量 > 直连。
+    from net_config import read_proxy_config
+    proxy, ca = read_proxy_config(env)
     try:
         from slack_sdk.web import WebClient
         ctx = ssl.create_default_context(
