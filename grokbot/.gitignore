@@ -12,3 +12,4 @@ __pycache__/
 inbox.jsonl.corrupt
 webhook.env
 bot_sent_ts.json
+keepalive.lock

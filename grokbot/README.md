@@ -30,8 +30,17 @@ cp .env.example .env && chmod 600 .env   # 填 token；保持 REPLY_IN_THREAD=0�
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 
 ./venv/bin/python bridge.py &            # Socket Mode：durable 入队后再 ACK
-./venv/bin/python consumer/poll_consumer.py   # ~5s 消费；模板 stub（≠ 模型已接线）
+./venv/bin/python consumer/poll_consumer.py   # ~5s；模式见下，不是默认模板
 ```
+
+consumer **不是**默认模板 stub（fail-closed）：
+
+| 条件 | 模式 |
+|---|---|
+| 有 `webhook.env`，且未设置 `REPLY_MODE` | **`agent_wake`**（唤醒，不发模板） |
+| 显式 `REPLY_MODE=agent_wake` | **`agent_wake`** |
+| 显式 `REPLY_MODE=template` | 模板 stub（**只有**这一档） |
+| 没有 `webhook.env`，且 `REPLY_MODE` 未设或非法 | **拒绝启动**，inbox 保留，不会悄悄退回模板 |
 
 用 `manifest.yaml` 在 https://api.slack.com/apps 建 App → 拿 `xoxb-` / `xapp-` → 邀请 bot 进频道。 **已有 App 更新 manifest 后须在 api.slack.com 重新 Apply / 重装**，否则 `message.channels` 事件不到。
 
@@ -40,7 +49,7 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 | 通过项 | 含义 | **不等于** |
 |---|---|---|
 | 私信 / @mention 出现在 `inbox.jsonl` | 桥接收正常 | Agent 集成完成 |
-| consumer 打出 `replied in …` | **模板 stub** 回过一次 | 已接线 Grok / LLM |
+| consumer 在显式 `REPLY_MODE=template` 时打出 `replied in …` | **模板 stub** 回过一次 | 默认模式；已接线 Grok / LLM |
 | `channel_history` 有真实行 | 上下文可读 | — |
 | 换成真实 `generate_reply()` / wake agent 且仍用 `history` | **Agent 集成完成** | — |
 
@@ -60,6 +69,7 @@ grokbot/
 ├── send.py / inbox_peek.py / inbox_ack.py / channel_history.py
 ├── pending_notify.py         # 未处理 → pending.json（ack 用 channel+ts）
 ├── slack-bridge.service / slack-consumer.service
+├── keepalive.sh              # 只重启缺失进程；flock；30s 与 5min 共用
 ├── consumer/poll_consumer.py # send/ack 状态机；REPLY_IN_THREAD；历史降级
 └── tests/                    # 无 live Slack 的单元测试
 ```
@@ -85,7 +95,32 @@ grokbot/
    - ack：`python inbox_ack.py <channel> <ts>`（与去重同一身份）
 2. **Agent 例程 fallback**：`pending_notify.py`（只导出 claimable）→ `pending_consume_once.py` / `reply_pipeline.process_one`（**禁止** raw `send.py`→`inbox_ack.py`）
 
+## Keepalive
+
+`keepalive.sh` 只在 bridge / consumer 不在时拉起它们。不截断日志，不碰队列。脚本里没有 sleep。
+
+**30 秒循环**和 **5 分钟 agent 例程**调用的是同一个脚本，不要在例程里自己起 python：
+
+```bash
+while true; do /workspace/slack-bridge-grokbot/keepalive.sh >> keepalive.log 2>&1; sleep 30; done
+```
+
+锁被别人拿着时，`flock -w 20 -E 11` 最多等 20 秒，打一行日志并以 **0** 退出（下一拍再试）。`flock` 不在 `PATH`、锁文件打不开、或 `flock` 返回别的状态（用法错误 / I/O，例如 **64**）会写明原因并以 **非 0** 退出，不会假装「已经等了 20 秒」。
+
+进程算「已在跑」必须同时满足：`argv0` 以 `/venv/bin/python` 结尾、某个参数等于该脚本、cwd 是部署根。不是 `pgrep -f`。shell 命令行里只是提到 `bridge.py` 不算。
+
+### 本分支 vs 正在跑的进程
+
+| | 代码 | flock |
+|---|---|---|
+| 本 PR（`fix/grokbot-keepalive` 的 `grokbot/keepalive.sh`） | cwd 身份 + `flock -E` | 有 |
+| 正在跑的 `/workspace/slack-bridge-grokbot/keepalive.sh` | 旧脚本（cmdline 匹配，无 cwd 锁） | **没有** |
+
+30 秒循环现在执行的是部署目录里的**旧脚本**。本 PR **还没有**换到运行中的进程上；合并或拷贝之前，跑着的 keepalive 不会因为这支分支而改变。
+
 ## 测试
+
+keepalive 用例依赖 **Linux**：`/proc`、Bash（`mapfile`）、util-linux `flock`。非 Linux（例如 macOS）这些用例**显式 skip**，不移植；其余测试不依赖它们。
 
 ```bash
 cd grokbot
