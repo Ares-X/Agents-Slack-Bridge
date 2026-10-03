@@ -290,6 +290,29 @@ check("T6b team 严格绑定：向 B 发送不引用 A 的 U9、@muse 用 B 的 
       "U9" not in postedB.get("text", "") and "<@U1>" in postedB.get("text", ""),
       repr(postedB)[:300])
 
+# T7 真正文末尾也可能是游标字形；orig 只能剥掉原来那一枚。
+# 第二项同时保护 claim：重复剥除会让正文短于 sent，另发整篇且遗留旧流。
+for index, (draft, final, expected) in enumerate([
+    ("Wait", "Wait……", "Wait…"),
+    ("Wait…▌", "Wait……", "Wait…"),
+    ("Wait", "Wait… ▌  ", "Wait…"),
+    ("Wait", "Wait  ▌\n", "Wait"),
+    ("Wait", "Wait  ", "Wait  "),
+    ("Wait", "Wait @Muse …\n", "Wait <@U1>"),
+]):
+    ad, client = fresh()
+    metadata = {"team_id": "T1", "thread_id": "7000"}
+    run_async(ad.send_draft("C7", 1, draft, metadata=metadata))
+    sent = ad._active_streams["C7"]["sent"]
+    result = run_async(ad.send("C7", final, metadata=metadata))
+    check(f"T7.{index} 原游标只剥一次，单流正确封口",
+          getattr(result, "success", False)
+          and len(client.starts) == len(client.stops) == 1
+          and client.stops[0].get("markdown_text", "") == expected[len(sent):]
+          and [u.get("text") for u in client.updates] == [expected]
+          and not client.posts and not ad._active_streams,
+          repr((client.stops, client.updates, client.posts))[:400])
+
 print()
 print(f"checks={CHECKS} fails={len(FAILS)}")
 if FAILS:

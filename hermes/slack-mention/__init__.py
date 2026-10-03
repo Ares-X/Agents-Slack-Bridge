@@ -806,7 +806,7 @@ def _wrap_adapter(adapter):
         1. 不改变认领判定——text 先用 orig 同款 ``_strip_stream_cursor``
            剥游标再比对（只读复刻，不猜格式）；
         2. 认领成立 → 先 await 建表，floor = len(sent) 只解析未流出尾段，
-           把解析后的**整篇** final_text 递给 orig：orig 自切的
+           把解析后的**整篇** final_text 加回原游标后缀递给 orig：orig 自切的
            markdown_text delta（= final_text[len(sent):]）天然带上已解析尾段；
         3. 全程打 (team, channel, ts) 直通标记：orig 内部的 finalize
            ``self._maybe_blocks``（同步包装）按精确流身份命中，不再全文
@@ -826,6 +826,10 @@ def _wrap_adapter(adapter):
         # 认领判定与上游逐字对齐：sent 空 / 前缀不匹配 = interim，不归我们管。
         if not sent or not isinstance(text, str) or not text.startswith(sent):
             return await _try_finalize_stream_orig(chat_id, content, *args, **kwargs)
+        # orig 自己会去掉一次游标。保留原始剥除后缀（含空白），使它处理
+        # 相同的原游标，而不是误删解析后正文末尾的省略号。无游标时后缀为空。
+        # 不改 adapter 的 strip 方法，其他并发 draft/edit 仍沿用上游行为。
+        cursor_suffix = content[len(text):]
         ts = stream.get("ts")
         ident = _stream_identity(adapter, chat_id, ts)
         try:
@@ -842,30 +846,32 @@ def _wrap_adapter(adapter):
         else:
             token = None
         try:
-            return await _try_finalize_stream_orig(chat_id, new_text, *args, **kwargs)
+            return await _try_finalize_stream_orig(
+                chat_id, new_text + cursor_suffix, *args, **kwargs)
         finally:
             if token is not None:
                 _stream_edit_ctx.reset(token)
 
-    def _wrap_836_finalize():
-        """老树档接线（仅在无 _commit_stream 时调用，见 _wrap_adapter 尾部）。"""
-        if callable(_try_finalize_stream_orig):
-            adapter._try_finalize_stream = _try_finalize_stream_patched
-
     adapter._maybe_blocks = _maybe_blocks_patched
     adapter._post_chunks = _post_chunks_patched
     adapter.edit_message = _edit_message_patched
-    if orig_commit_stream is not None:
+    if callable(orig_commit_stream):
         adapter._commit_stream = _commit_stream_patched
-    else:
+        stream_outlet = "commit_stream"
+    elif callable(_try_finalize_stream_orig):
         # 老树档（836b5f8 部署树）：无 _commit_stream，send() 的收尾走
         # _try_finalize_stream。新树上 send() 经 _try_finalize →
         # _commit_stream（已包）——此时**绝不**再包 _try_finalize，否则
         # 尾段被解析两次（_try_finalize 包装先解析一遍，进 orig 后
         # _commit_stream 包装又按 floor 解析一遍，幂等性全靠查表不撞）。
-        _wrap_836_finalize()
-    LOG.info("[Slack] mention plugin v1.4: adapter wrapped (instance-level)")
-    print("[slack-mention-plugin] adapter wrapped v1.4", flush=True)
+        adapter._try_finalize_stream = _try_finalize_stream_patched
+        stream_outlet = "try_finalize_stream_836"
+    else:
+        stream_outlet = "MISSING"
+        LOG.warning("[Slack] mention plugin: no supported stream finalize outlet; "
+                    "ordinary send/edit only")
+    LOG.info("[Slack] mention plugin v1.4: adapter wrapped; stream=%s", stream_outlet)
+    print(f"[slack-mention-plugin] adapter wrapped v1.4; stream={stream_outlet}", flush=True)
 
 
 def _factory(native, adapter):
