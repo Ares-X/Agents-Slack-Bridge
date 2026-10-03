@@ -12,7 +12,7 @@
     "<PEER_HERMES_USER_ID>"
   ],
   "include_thread_replies": true,
-  "require_direct_native_mention": true,
+  "require_direct_native_mention": false,
   "eligible_content": [
     "question",
     "collaboration",
@@ -30,7 +30,7 @@
     "hydrate_related_thread_when_needed": true,
     "on_missing_required_context": "report_gap_without_guessing"
   },
-  "reply_location": "channel_top_level",
+  "reply_location": "preserve_source_thread",
   "deduplication_capability_check": "use_only_exposed_ids_and_supported_private_state; report_gaps; concurrency_not_verified_by_single_message_test",
   "deduplication_keys": [
     "event_id",
@@ -78,12 +78,15 @@
       "channel_context",
       "related_thread_context",
       "task_and_constraint_accuracy",
-      "top_level_reply",
+      "correct_source_thread_or_user_requested_location",
       "no_loop",
       "existing_work_health"
     ],
     "stop_on_failed_or_ambiguous_direction": true,
     "publish_instance_evidence": false,
     "coverage": "report_configured_verified_unverified_per_peer_and_direction; do_not_generalize_one_pair_to_all_peers"
-  }
+  },
+  "eligibility_rule": "direct_native_mention_or_existing_user_authorized_task_delegation",
+  "on_runtime_source_reply_prohibited": "do_not_send_record_blocker_no_manual_replay",
+  "max_replies_per_task_step": 1
 }
