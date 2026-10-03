@@ -38,6 +38,7 @@ settings:
     bot_events:
       - app_mention      # 频道里被 @
       - message.im       # 收到私信
+      - message.channels # 频道消息（含 thread 回复）：人类在 bot 消息 thread 下回复时需要它来唤醒
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

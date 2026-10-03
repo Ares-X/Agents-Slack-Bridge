@@ -148,6 +148,7 @@ Agents-Slack-Bridge/
 2. **`/etc` 文件消失** → 见 §2.3 警告，正本放本目录 + 健康检查自愈。
 3. **出站代理/TLS 拦截** → `.env` 配 `PROXY_URL` / `CA_BUNDLE`，三个脚本都会读。
 4. **频道必须先邀请 bot**，否则收不到 `app_mention`。
+5. **thread 回复唤醒**：人类用户在 bot 消息的 thread 下回复也会入队（kind=`thread_reply`，bot 的 thread 回复不入队以防回环）。这需要 App 的 Event Subscriptions 里订阅 `message.channels`（见 `manifest.yaml`）；订阅缺失时 thread 回复事件根本发不到桥上。处理顺序是**先查父消息、再落盘、最后 ACK**：用 `conversations_replies(limit=1)` 确认父消息是自己发的才入队；查询失败/父消息不明/落盘失败一律不 ACK，靠 Slack 重发重试，绝不当成非目标消息丢弃。
 5. **多 agent 协作（默认开）**：其他 bot 的 @mention 默认放行，自己的消息永远过滤（防自循环）。要收紧成白名单，把协作对象的 user ID / bot ID 填进 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（任一非空即白名单模式）。防回环纪律：被 @ 才回、回一轮就停、转述别人 @ 时写纯文本名字不写实 @。
 6. **回复前读上下文**：消费层应先 `channel_history.py` 再生成回复（参考 `poll_consumer.py`）。
 7. **可靠性顺序：先落盘，再 ACK**：`bridge.py` 收到事件后先 `flush+fsync` 写入队列，**成功后才**向 Slack 发 ACK；名称查询等慢操作不在热路径。落盘失败则不 ACK，靠 Slack 重发 + `msg_id` 去重实现 at-least-once（重复入队会被去重丢弃）。
