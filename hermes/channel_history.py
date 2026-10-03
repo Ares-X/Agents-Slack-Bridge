@@ -8,6 +8,7 @@
   python3 channel_history.py <channel_id> --thread <ts> [limit]  # 某条消息的 thread
   python3 channel_history.py <channel_id> [limit] --thread <ts>  # 同上（limit 前后都可）
   python3 channel_history.py <channel_id> --resolve              # 顺带把 user ID 解析成名字
+  python3 channel_history.py <channel_id> --before-ts <ts> 100    # 补读更早的频道消息
 
 排序说明（以官方文档为准）:
   conversations.history  返回最新在前（倒序）→ 本脚本反转后输出（旧→新）
@@ -134,7 +135,11 @@ def main():
     ap.add_argument("limit", nargs="?", type=int, default=20)
     ap.add_argument("--thread", dest="thread_ts", default=None, help="读这个 ts 的 thread")
     ap.add_argument("--resolve", action="store_true", help="解析 user/bot ID 为显示名")
+    ap.add_argument("--before-ts", default=None, help="只读这个 ts 之前的频道消息（不含该条；不能与 --thread 同用）")
+    ap.add_argument("--page-info", action="store_true", help="末尾追加分页元数据，明确是否还有更早消息")
     args = ap.parse_intermixed_args()
+    if args.thread_ts and args.before_ts:
+        fail("invalid_arguments", "--before-ts is for channel history; do not combine it with --thread")
 
     token = load_token()
     if not token or not token.startswith("xoxb-"):
@@ -164,7 +169,10 @@ def main():
         # conversations.history: 最新在前（倒序）→ 反转成正序（旧→新）
         method, reverse_output = "conversations.history", True
 
-    data = call(method, token, channel=args.channel, limit=min(max(args.limit, 1), 200), ts=args.thread_ts)
+    params = {"channel": args.channel, "limit": min(max(args.limit, 1), 200), "ts": args.thread_ts}
+    if args.before_ts:
+        params.update(latest=args.before_ts, inclusive="false")
+    data = call(method, token, **params)
 
     msgs = data.get("messages") or []
     out = []
@@ -184,6 +192,13 @@ def main():
         out.reverse()
     for row in out:  # 统一正序输出（旧→新）
         print(json.dumps(row, ensure_ascii=False))
+    if args.page_info:
+        print(json.dumps({"page_info": {
+            "has_more": bool(data.get("has_more")),
+            "next_cursor": (data.get("response_metadata") or {}).get("next_cursor", ""),
+            "oldest_ts": out[0]["ts"] if out else "",
+            "before_ts": args.before_ts,
+        }}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

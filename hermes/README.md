@@ -115,7 +115,7 @@ platforms:
 
 配合顶层 `slack.strict_mention: true` 更严。铁律：
 
-- `mentions` 是协作起点——**每回合都要明确点名**，点名 → 单回 → 停
+- `mentions` 是协作起点；需要对方接手时明确点名。每一步最多一条实质终稿，发完结束该回合等新事件，必要接手与结果返回可以继续有界多轮。
 - 避免 `allow_bots: all`（两个互相全收的 bot 会无限对话）
 - Hermes 永远忽略自己的消息（防自回环，无法关闭）；网关另有 bot loop guard（每会话滑动窗口超额冷却）兜底
 - 对方 bot 引用旧消息时把 @ 转纯文本名字，防二手点名触发回环
@@ -261,6 +261,10 @@ platforms:
 [回合执行/审批](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/run_turn_runner.py)。
 
 使用 adapter 自动终稿作为正文的唯一发送入口；同一回复不要再经 curl 或发送工具另发。
+普通协作每一步最多发送一条实质终稿，发送后立即结束该回合，等待新的 Slack 事件回来。
+需要接手、澄清或结果返回时可继续下一步骤的有界回合；不要在 terminal 中 `sleep` 长轮询等待其他 agent，
+也不要用 raw curl `chat.postMessage` 中途另发正文。这样后续事件能在正常回合里读取新状态，
+每一步的实质发言都有对应的 assistant 历史和原生发送记录。安全审批继续使用原入口。
 这些设置不屏蔽所有诊断和 memory 更新，也不改变超长文本切块行为，不能当作 exactly-once
 保证。普通短回复的条数、线程和完成即停止仍须真实验收；磁盘文件更新后还须核对新进程加载。
 需要加载配置时，可由已授权用户通过 Hermes 原生 `/restart` 请求正常重启；固定 836
@@ -304,7 +308,13 @@ python3 hermes/test_memory_notifications_platform.py /path/to/patched/hermes-age
 
 ## 读取历史
 
-Hermes 在会话内自动带 thread 上下文（adapter 内置 `conversations.replies` 水位缓存），一般不需要手动读。需要补频道级上下文（多 agent 对账、审计）时用本目录 CLI：
+固定 836 在真实 thread 回复里自动补 `conversations.replies` 上下文；频道顶层不会自动补频道历史。
+`reply_in_thread: false` 的默认会话键为
+`agent:main:slack:group:<team>:<channel>:<sender>`，不同作者的对话历史隔离。
+真实 thread 默认不追加 sender，仍由 `thread_sessions_per_user` 控制。消息可以进入 Hermes，
+却不因此拥有其他作者的开局、报名或自己经 raw curl 发出的正文；不能把触发成功当作协作连续性。
+
+需要补频道级上下文（多 agent 对账、审计）时用本目录 CLI：
 
 ```bash
 # 频道最近 20 条（正序 JSON lines；token 自动从 env 或 ~/.hermes/.env 取）
@@ -314,7 +324,84 @@ python3 channel_history.py C01234567890 --thread 1234567890.123456
 python3 channel_history.py C01234567890 --thread 1234567890.123456 10
 # 顺带把 user ID 解析成显示名
 python3 channel_history.py C01234567890 20 --resolve
+# 补读当前观察窗口之前的频道消息；不含边界消息，末尾显示 has_more/next_cursor
+python3 channel_history.py C01234567890 100 --before-ts 1234567890.123456 --page-info
 ```
+
+`--before-ts` 仅用于频道，不能与 `--thread` 同用；`--page-info` 是可选元数据，默认仍只输出消息行。
+对 `has_more`、上下文 gap、未读取的 thread 或已省略消息，先补查再断言谁没有报名/是否开过局。
+脚本凭据必须属于目标 workspace；多 workspace 自动观察则由候选补丁使用精确 team 客户端路由。
+
+### 836 的自然频道协作候选
+
+[候选补丁](./patches/natural-collaboration-836.patch) 基于固定
+`836b5f8253d27fee79b4f833bc43624f06a890b3`，在上述 memory-notifications 补丁之后顺序应用。
+增加现有 Slack adapter 的观察方法、在普通/排队回合共用的 `run_inbound.py`
+预处理末尾调用它、为现有 busy ACK 显示判断增加平台键，并在 `run_turn.py` 共用静默权限判定。
+没有新服务、依赖或共享会话。
+补丁、配置和离线检查是候选交付，尚不代表运行进程已加载或真实多轮协作通过。
+
+```yaml
+platforms:
+  slack:
+    extra:
+      collaboration_channels:
+        "T01234567890:C01234567890":
+          max_messages: 100
+          max_chars: 40000
+display:
+  platforms:
+    slack:
+      busy_ack_enabled: false
+```
+
+使用明确的 `team_id:channel_id` 白名单，无需为每个新任务配置根消息时间戳。
+每个实际准备的频道顶层回合读取一次最新公共频道窗口；排队的旧消息也读取执行时的新状态。
+一次 `conversations.history` 调用最多请求 `max_messages + 1` 条，15 秒超时，不自动重试或无限翻页。
+`max_messages` 范围 1–200，`max_chars` 范围 1–100000；默认分别 100 和 40000。
+使用已有 workspace 客户端和缓存名字，每条标注作者 ID、名字、ts、自身身份及信任标记。
+名字和正文压成安全的单行，正文按整条保留；不增加用户/频道权限，也不把历史内容当作新指令。
+观察在 `@file` 引用解析之后注入，历史引用不会触发本地文件读取。
+
+窗口注明 `fetched_at`、触发作者和消息 ts，时间可晚于触发消息；真实 thread 继续走原水位补史。
+频道窗口列出根消息的 `thread_replies` 数量，thread 正文须另读。
+API 失败、分页未读完、无效配置、消息数或体积上限都会显示 `[Context gap]`，列出省略的消息 ts、
+最早读取 ts 和继续读取参数；原请求仍交给 agent。窗口不是完整频道档案，历史较长时根任务可能在窗口外。
+不能根据窗口缺失宣称没有开局或没有报名；重要状态结论发前补查最新消息及必要旧页/thread。
+
+`busy_ack_enabled: false` 只关闭 Slack 忙碌回显；同一分支之前的输入授权、审批、排队、steer 和 interrupt
+仍运行，其他平台继承 enabled 默认。既有全局 `HERMES_GATEWAY_BUSY_ACK_ENABLED=false` 仍优先禁止回显；
+此键不关闭网关重启/失败诊断或审批提示。
+
+固定 836 原来只允许 machinery 回合的成功 `[SILENT]`；普通 peer bot 的静默也会被替换成可见警告。
+候选额外允许：明确配置的 `team_id:channel_id` 内、经过既有用户授权、`source.is_bot=true` 的 Slack group
+成功回合，可在没有实质工作时选择精确 `[SILENT]`，结束该回合而不发送正文。
+普通和 queued 首段共用同一判定，链末使用实际 terminal 作者，不能借 bot 开局隐藏人类的后续请求。
+人类、DM、其他平台、未配置范围和失败回合保持原可见行为；空回复不等于静默。
+它不把 peer event 改成 internal，不绕过授权，不迁移审批入口；成功 marker 仍保存到 transcript，
+只抑制出站正文，不伪造已完成的发送记录。
+
+正常终稿由 adapter 自动发送并写入当前作者的历史。固定版本的 `send_message` 在发送成功后会尝试
+`mirror_to_session`，带当前 `HERMES_SESSION_USER_ID`；这是尽力而为的发送工具镜像，不能保证每个作者都获得它。
+raw curl 完全绕过该镜像，自己的 Slack 入站消息又被防回环过滤，不能作为连续 assistant 历史来源。
+
+应用前核对版本和脏改，备份五个目标文件及配置；保留其他既有脏改，不重置或覆盖。
+先检查，再顺序应用，冲突即停。现有 PR17 修改已在部署时，
+仅检查/应用第二个补丁，不重复应用第一个：
+
+```bash
+git apply --check /path/to/hermes/patches/natural-collaboration-836.patch
+git apply /path/to/hermes/patches/natural-collaboration-836.patch
+python3 /path/to/hermes/test_natural_collaboration.py /path/to/patched/hermes-agent
+python3 /path/to/hermes/test_memory_notifications_platform.py /path/to/patched/hermes-agent
+```
+
+新回归只读已补丁的五个真实源文件，编译并执行 AST 提取的完整方法，覆盖跨作者开局/报名/自己的既有发言、
+workspace 白名单、回合执行时刷新、历史引用隔离、失败/截断、thread、会话键和 busy ACK/审批/输入行为。
+另外执行真实静默、queued 首段和递归 terminal 作者路径，验证限定 bot 静默、失败/人类回退和静默记录的持久化。
+可传 `--baseline-turn /path/to/original-836/gateway/run_turn.py` 对照原版两个可见 fallback。
+传输、媒体和运行时 owner 使用隔离替身，不是完整 gateway 测试。部署及重启须另由已授权 owner 执行，
+核对真实加载，再用无需预先配置根 ts 的新任务验收多轮协作；当前状态为 `NOT_EXERCISED`。
 
 排序依据（Slack 官方文档）：`conversations.history` 最新在前，脚本反转为旧→新；
 `conversations.replies` 本身旧→新（父消息开头），脚本不再二次反转——两种模式输出统一为时间正序。
@@ -328,7 +415,7 @@ bot ID 返回 `user_not_found`、网络错）只降级保留原 ID，绝不中�
 `bots.info`，`U…/W…` 走 `users.info`。需要更深的历史回放/搜索走 Hermes 的 `session_search` 工具或
 Slack SDK。
 
-回归测试：`python3 test_channel_history.py`（29 项断言，无网络、无真实 token、无真实 `~/.hermes`）；
+回归测试：`python3 test_channel_history.py`（35 项断言，无网络、无真实 token、无真实 `~/.hermes`）；
 授权顺序声明的源码核验：`./verify_authz_order.sh [repo] [commit]`（默认 `b3059921bc`，需本地
 hermes-agent checkout，不联网）。
 
@@ -379,10 +466,11 @@ hermes/
 ├── config.example.yaml          # ~/.hermes/config.yaml 的 platforms.slack 片段
 ├── .env.example                 # token 模板（真实值永不进仓）
 ├── channel_history.py           # 频道/线程历史 CLI（stdlib-only，零依赖）
-├── test_channel_history.py      # channel_history 回归测试（runpy 进程内，29 项断言，零网络）
+├── test_channel_history.py      # channel_history 回归测试（runpy 进程内，35 项断言，零网络）
 ├── test_authz_matrix.py         # 授权矩阵回归（临时 worktree @b3059921bc，12 项断言）
 ├── test_memory_notifications_platform.py # 已补丁上游的只读平台通知回归
-├── patches/                    # 固定 836 的 memory_notifications 平台覆盖补丁
+├── test_natural_collaboration.py # 已补丁 836 的频道上下文/忙碌回显隔离回归
+├── patches/                    # 固定 836 的平台通知补丁和自然协作候选补丁
 ├── verify_authz_order.sh        # 授权模型源码顺序核验（固定 commit，零网络）
 └── slack-mention/               # 出站 @提及 插件（本机 owner 自建，见下节）
 ```
