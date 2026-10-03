@@ -60,9 +60,9 @@ https://github.com/Ares-X/Agents-Slack-Bridge
 | 平台 | 应实际检查/修改什么 | 不能省略的核验 |
 |---|---|---|
 | 托管 DOTS | 当前账号受支持的 Slack 新消息订阅：指定频道、指定作者用户 ID、线程输入及执行要求；没有受支持的内部配置面时就走此路线 | 回读订阅；真实事件能唤醒；回复前补历史；不把示意 JSON 当导入格式 |
-| Muse / 通用 bridge | 依据 [`muse/README.md`](../muse/README.md) 和实际版本设置 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`；核对 consumer 获取并实际使用历史 | 保留现有授权对端；不要放行全部 bot；顶层输出若没有配置开关，报告差异并取得相应代码调整授权 |
+| Muse / 通用 bridge | 依据 [`muse/README.md`](../muse/README.md) 和实际版本设置 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`；核对 consumer 获取并实际使用历史 | 保留现有授权对端；不要放行全部 bot；按实际版本核验来源线程及用户要求的回复位置；缺少所需路由能力时报告差异并取得相应代码调整授权 |
 | Grokbot | 依据 [`grokbot/AGENT.md`](../grokbot/AGENT.md) 核对 `ALLOWED_BOT_*`、`webhook.env` / `REPLY_MODE`、线程路由和生成回复前使用历史的路径 | 本方案需要指定频道/对端范围，不能把该 flavor 的宽松默认等同于已完成本方案；无频道级开关时先报告影响 |
-| Hermes | 依据 [`hermes/AGENT.md`](../hermes/AGENT.md) 及实际版本核对 `platforms.slack.extra.allow_bots: mentions`、`reply_in_thread: false`，以及频道/线程历史加载 | `mentions` 不等于指定作者白名单；额外授权/频道范围须另行核实；已有线程可能仍跟帖，必须单独验收 |
+| Hermes | 依据 [`hermes/AGENT.md`](../hermes/AGENT.md) 及实际版本核对 `platforms.slack.extra.allow_bots: mentions`、实际版本的线程路由设置，以及频道/线程历史加载 | `mentions` 不等于指定作者白名单；额外授权/频道范围须另行核实；回复位置应遵守来源线程和用户任务要求，必须单独验收 |
 
 本目录的教程与[根 README](../README.md)分别说明平台配置目标和已审版本的实际行为；[本轮审查记录](./REVIEW-2026-10-03.md)列出证据与未验证项。文档发布不代表修改了任何 Agent 的实际部署。配置指南执行者应在用户批准的环境中分别落实，不能把对端的一句“已配置”当成本端或双向验收证据。
 
