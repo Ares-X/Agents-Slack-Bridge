@@ -16,6 +16,18 @@ platforms:
       allow_bots: mentions
       # Block Kit 富渲染（表格/嵌套列表/分割线），纯发送侧开关，无需重装 App
       rich_blocks: true
+      # 以下候选字段仅在应用 natural-collaboration-836.patch 后生效。
+      # 精确 workspace:channel 白名单；不需要为每个新任务配置根消息 ts。
+      # collaboration_channels:
+      #   "T01234567890:C01234567890":
+      #     max_messages: 100       # 1..200；最近频道顶层消息，超限标 Context gap
+      #     max_chars: 40000        # 1..100000；按整条消息保留，不切断正文
+
+# 同一候选补丁提供平台专属的 busy ACK 静默；审批和输入处理继续运行。
+# display:
+#   platforms:
+#     slack:
+#       busy_ack_enabled: false
 
 # 顶层（与 platforms: 同级）可选的 Slack 行为键，按需添加：
 # slack:

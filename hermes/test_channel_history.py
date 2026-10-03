@@ -22,6 +22,7 @@ import socket
 import runpy
 import sys
 import urllib.error
+import urllib.parse
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -298,6 +299,26 @@ def main():
     lines = [l for l in out.splitlines() if l.strip()]
     e = json.loads(lines[0]) if lines else {"error": {}}
     check("invalid json", rc == 1 and e["error"]["kind"] == "invalid_json", (rc, e))
+
+    # T4 bounded continuation: the API gets an exclusive time bound; pagination
+    # evidence is opt-in so existing JSONL consumers keep their message-only shape.
+    params_seen = []
+
+    def older_page(req, timeout=30):
+        params_seen.append(urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query))
+        return ok_resp({"ok": True, "messages": HISTORY_PAGE, "has_more": True,
+                        "response_metadata": {"next_cursor": "next-test-page"}})
+
+    rc, out = run([CHANNEL, "100", "--before-ts", "1001.0000", "--page-info"], older_page)
+    rows = [json.loads(line) for line in out.splitlines() if line]
+    check("before-ts reads older page", rc == 0 and params_seen[0].get("latest") == ["1001.0000"], (rc, params_seen))
+    check("before-ts excludes boundary message", params_seen[0].get("inclusive") == ["false"], params_seen)
+    check("bounded page messages remain chronological", rows[0]["ts"] == "1000.0001" and rows[1]["ts"] == "1000.0002", rows)
+    check("page metadata exposes truncation", rows[-1]["page_info"]["has_more"] and rows[-1]["page_info"]["next_cursor"] == "next-test-page", rows)
+    check("page metadata exposes next older boundary", rows[-1]["page_info"]["oldest_ts"] == "1000.0001", rows)
+    params_seen.clear()
+    rc, out = run([CHANNEL, "--thread", "1000.0001", "--before-ts", "1001.0000"], older_page)
+    check("thread/before conflict fails before network", rc == 1 and not params_seen and json.loads(out)["error"]["kind"] == "invalid_arguments", (rc, out))
 
     # ---------- 汇总 ----------
     print(f"\n{passed} passed, {len(failed)} failed")
