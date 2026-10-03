@@ -330,17 +330,24 @@ def serialize_user(blocks):
     return found
 
 
-# C6 富文本：列表语境逼出 rich_text blocks；chat.update 带解析后的 user 元素
+# C6 富文本收尾（round 3 语义更新）：列表语境逼出 rich_text blocks。
+# 已发送前缀「answer @Grok Bot partial」不许被 finalize edit 二次解析
+# （round 3 #2），尾段新增的 @Muse 才解析成 <@U1>（U2 在前缀内保持原文）。
 ad6, cl6 = fresh_adapter(team="T2")
 md6 = {"team_id": "T2", "thread_id": "2000"}
 run_async(ad6.send_draft("C2", 1, "- answer @Grok Bot partial", metadata=md6))
 run_async(ad6.send("C2", "- answer @Grok Bot partial\n- tag @Muse too", metadata=md6))
 upds6 = [u for u in cl6.updates]
-blk_ok = any(u.get("blocks") and serialize_user(u["blocks"]).get("U1")
-             and serialize_user(u["blocks"]).get("U2") for u in upds6)
-txt_ok = all("tag <@U1>" in u.get("text", "") or not u.get("text") for u in upds6)
-check("C6 富文本收尾：chat.update 带解析后的 user 元素 blocks（rich_text）",
-      upds6 and blk_ok and txt_ok,
+blk_ok = upds6 and all(u.get("blocks") for u in upds6) and all(
+    serialize_user(u["blocks"]).get("U1")        # 尾段 @Muse → <@U1>
+    and not serialize_user(u["blocks"]).get("U2")  # 前缀 @Grok Bot 原样
+    for u in upds6)
+txt_ok = upds6 and all(
+    "answer @Grok Bot partial" in u.get("text", "")    # 前缀字节不动
+    and "tag <@U1> too" in u.get("text", "")           # 尾段已解析
+    for u in upds6)
+check("C6 富文本收尾：前缀原文保留 + 尾段 user 元素解析（rich_text）",
+      blk_ok and txt_ok,
       repr(upds6)[:400])
 
 

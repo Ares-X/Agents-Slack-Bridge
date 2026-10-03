@@ -54,6 +54,15 @@ _TABLE_TTL = 600.0
 
 _WRAP_ATTR = "_mention_wrap_done"
 _TABLES_ATTR = "_mention_team_tables"  # {team_id|"": (table, mono_ts)}
+# 流收尾期间的原位 finalize edit 标记（ts 集合）：_commit_stream 包装构造好
+# 精确载荷（floor 限定解析/整篇 replace 解析）后，把 stream ts 放进集合；
+# edit_message 包装看到 message_id 在集合里就直通原载荷——否则会把已发送
+# 前缀里的 @name 二次改写成实体（round 3 #2）。集合支持并发流不互踩。
+_STREAM_EDIT_ATTR = "_mention_stream_edits"
+# 收尾直通窗口计数：窗口内 _maybe_blocks 的同步解析被抑制（载荷已由
+# _commit_stream 包装精确构造，再解析会把已发送前缀写进 blocks）。计数而非
+# 布尔——多条流并发收尾时，先完成者不会把别人还开着的窗口关掉。
+_SUPPRESS_ATTR = "_mention_suppress_blocks_resolve"
 
 # <@U…> / <#C…> / <!subteam^S…> / <!here|<!channel|<!everyone>
 _ENTITY_RE = re.compile(
@@ -65,11 +74,15 @@ _ENTITY_RE = re.compile(
 # 原样保留分隔串，解析后原位拼回（保序，不重排）。
 # ---------------------------------------------------------------------------
 
-_FENCE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+_FENCE_RE = re.compile(r"```.*?```|```.*|`[^`\n]*`", re.S)
 
 
 def _split_code(text):
-    """→ [(fragment, is_code)]，片段拼接还原原文。"""
+    """→ [(fragment, is_code)]，片段拼接还原原文。
+
+    未闭合的 ``` 围栏视为代码到 EOF（与 Slack 渲染一致）——跨流式边界时
+    draft 开了栏、final 还没合栏是常态，此时围栏内的 @ 不是提及（round 3 #2）。
+    """
     out, pos = [], 0
     for m in _FENCE_RE.finditer(text):
         if m.start() > pos:
@@ -408,10 +421,14 @@ def _sync_table_if_ready(adapter, chat_id=None, team_id=None, metadata=None):
 
     工作区上下文解析（与 async 出口同一条链）：
       显式 team_id > metadata 工作区 keys > chat 映射（_channel_team）。
-    - 有上下文 → 只认该 team 的表；未就绪/未过期不存在 → 宁可不解析。
-    - 无任何上下文（``_maybe_blocks(content)`` 只有正文）→ 仅当缓存里恰好
-      **只有一个** team 键时用它（单工作区主场景的既有多数行为）；
-      多个 team 键 = 目标工作区无法确定 → 保留原文。
+    - 有上下文 → 只认该 team 的表；未就绪/过期不存在 → 宁可不解析。
+    - 无任何上下文（``_maybe_blocks(content)`` 只有正文）→ 仅当缓存里
+      **只见过一个工作区**时用它（单工作区主场景）；见过两个及以上 =
+      目标工作区无法确定 → 保留原文。
+    「见过」按缓存键全集计（含空表/失败表/过期表）——空表和失败表同样是
+    「第二个工作区存在」的证据；若只数新鲜非空表，B 建表失败会把 A 变成
+    「唯一幸存者」，等于拿 A 的表猜 B（round 3 #1：预热 A、B 的
+    users.list 空或失败，随后向 B 发/编富文本，blocks 引用 A 的用户 ID）。
     绝不「任取第一个表」——那是拿 A 工作区的名字表解析 B 工作区的消息 = 指错人。
     _maybe_blocks 是同步签名（树内同步调用点），这里不能阻塞/返回 coroutine；
     async 出口（send/_post_chunks/edit/commit）都会先 await 建表，正常会话首条
@@ -429,15 +446,78 @@ def _sync_table_if_ready(adapter, chat_id=None, team_id=None, metadata=None):
         if st and st[0] and now - st[1] < _TABLE_TTL:
             return tid, st[0]
         return None, None
-    fresh = [(k, st[0]) for k, st in tables.items() if st[0] and now - st[1] < _TABLE_TTL]
-    if len(fresh) == 1:
-        return fresh[0]
+    if len(tables) == 1:
+        # 唯一见过的 team 键且表就绪才用；表本身还得新鲜非空。
+        k, st = next(iter(tables.items()))
+        if st[0] and now - st[1] < _TABLE_TTL:
+            return k, st[0]
     return None, None
+
+
+def _stream_extends(adapter, stream, text, delta):
+    """终稿 ``text`` 与已发送 ``sent`` 的 extends 关系判定（round 3 #3）。
+
+    优先用上游真身 ``_stream_relation``——delta 本来就是它切出来的，权威且
+    免猜：它认两档 extends（字节前缀；或去除前导空白后对齐 ``sent.strip()``）。
+    包装此前自己要求 ``text.startswith(sent)``，把上游合法的第二档（终稿剥了
+    sent 的尾部空白，如 sent="Done @Muse  " / final="Done @Muse and @Muse"）
+    误判为断裂，导致尾段提及漏解析。老树取不到该方法时退回字节前缀判定
+    （老树的 delta 就是按字节前缀切的，退回即精确），不会比 v1.3 更严。
+    """
+    sent = (stream or {}).get("sent", "")
+    relation = getattr(adapter, "_stream_relation", None)
+    if callable(relation):
+        try:
+            rel = relation(sent, text)
+        except Exception:
+            rel = None
+        if isinstance(rel, tuple) and len(rel) == 2:
+            kind, rel_delta = rel
+            if kind == "extends":
+                return rel_delta == delta
+            if kind == "equal":
+                return not delta.strip()
+        return False
+    if not sent:
+        return False
+    if not text.startswith(sent):
+        return False
+    return text[len(sent):] == delta
 
 
 # ---------------------------------------------------------------------------
 # 实例级包装
 # ---------------------------------------------------------------------------
+
+
+def _resolve_tail_mentions(text, table, floor):
+    """只改写 ``floor`` 之后**开始**的提及，其余字节原样（round 3 #2）。
+
+    为什么不能只解析 delta：提及的合法性依赖前文字节——``support`` 已发送、
+    尾段是 ``@Muse`` 时是词内 @，不是提及；draft 以反引号收尾、终稿在代码里
+    补出 ``@Muse`` 时是代码。所以代码围栏与词边界都在**完整终稿**上判定
+    （_MENTION_SPAN_RE 的 lookbehind 直接吃全文上下文）；但改写面限定在
+    未发送尾段——已发送前缀的字节已经出现在 Slack 上，动了就重复/错写。
+
+    规则：span 起点 >= floor 且不在代码区才可改写；起点 < floor 的（含被
+    边界切开的半个提及，如已发送 ``@Mu`` + 尾段 ``se``）原样保留。
+    """
+    if not table or "@" not in text or floor >= len(text):
+        return text
+    code_ranges = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+
+    def in_code(i):
+        return any(a <= i < b for a, b in code_ranges)
+
+    out, pos = [], 0
+    for m in _MENTION_SPAN_RE.finditer(text):
+        if m.start() < floor or in_code(m.start()):
+            continue
+        out.append(text[pos:m.start()])
+        out.append(_resolve_fragment(m.group(0), table))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _wrap_adapter(adapter):
@@ -461,10 +541,12 @@ def _wrap_adapter(adapter):
         # 必须保持同步签名（树内调用点同步取值）。解析只用现成缓存表。
         # 树内 _maybe_blocks(content) 只有正文、无工作区上下文——按
         # _sync_table_if_ready 的「唯一 team 键或保留原文」规则取表。
+        # 收尾直通窗口内抑制：载荷已精确构造，再解析会改写已发送前缀。
         try:
-            _, table = _sync_table_if_ready(adapter)
-            if table:
-                content = _build_repl_string(content, table)
+            if not (getattr(adapter, _SUPPRESS_ATTR, 0) or 0):
+                _, table = _sync_table_if_ready(adapter)
+                if table:
+                    content = _build_repl_string(content, table)
         except Exception:
             pass
         blocks = orig_maybe_blocks(content)
@@ -478,8 +560,18 @@ def _wrap_adapter(adapter):
 
         team 路由与树内出站一致：显式 team_id（_post_chunks 自带）>
         metadata 工作区（edit 的 _client_for 同源 keys）> chat 映射 > ""。
+        链路解析不出 team 且适配器认证了**多个**工作区时保留原文——
+        `_get_client` 的「取第一个 client」fallback 对发消息无害，对
+        名字→ID 是拿 A 的表猜 B（round 3 #1 的 async 侧同型洞）。
+        单工作区（len==1）用该 team 建表（表键与同步路径一致）。
         """
         tid = _target_team_id(chat_id, team_id, metadata)
+        if not tid:
+            team_clients = getattr(adapter, "_team_clients", None) or {}
+            if len(team_clients) > 1:
+                return content  # 目标工作区无法确定 → 保留原文
+            if len(team_clients) == 1:
+                tid = next(iter(team_clients))
         try:
             table = await _name_table(adapter, chat_id=chat_id, team_id=tid)
             return _build_repl_string(content, table)
@@ -493,6 +585,11 @@ def _wrap_adapter(adapter):
 
     async def _edit_message_patched(chat_id, message_id, content, *,
                                     finalize=False, metadata=None):
+        # 收尾直通：_commit_stream 包装已构造好精确载荷（floor 限定或 replace
+        # 整篇），这里再全文解析会把已发送前缀二次改写（round 3 #2）。
+        if message_id in (getattr(adapter, _STREAM_EDIT_ATTR, None) or ()):
+            return await orig_edit_message(chat_id, message_id, content,
+                                           finalize=finalize, metadata=metadata)
         content = await _resolve_async_outlet(content, chat_id=chat_id, metadata=metadata)
         return await orig_edit_message(chat_id, message_id, content,
                                        finalize=finalize, metadata=metadata)
@@ -509,26 +606,66 @@ def _wrap_adapter(adapter):
         #   尾段必须**同时**改写 text 尾部与 delta 本身，两者保持一致；
         # - replace=True：终稿被改写（不与 sent 前缀对齐），走 chat.update 整篇
         #   替换——纯 update 载荷，无 append 约束，可整篇解析；
-        # - delta=""：纯封口（片段切换/清理），无文本可解析，原样透传；
-        # - extends 不变量被打破的防御形状：原样透传，宁可不解析（整篇解析会
-        #   让 stopStream 追加一段与 sent 不接续的文本 = 重复内容）。
+        # - delta=""：纯封口（片段切换/清理），无文本可解析，原样透传。
+        #   但 blocks 渲染（finalize edit）仍会发生——用 stream ts 打直通标记，
+        #   防止 edit_message 包装二次解析全文（round 3 #2 已发送前缀保护）。
+        # - extends 不变量：以**上游真身** _stream_relation 为准（round 3 #3），
+        #   认「字节前缀」和「去前导空白后对齐 sent.strip()」两档——包装此前
+        #   自作主张 text.startswith(sent) 把合法第二档误判断裂。
         team_id = key[0] if isinstance(key, (tuple, list)) and key else None
-        if not text or (not delta and not replace):
+        if not text:
             return await orig_commit_stream(
                 key, stream, text, metadata, delta=delta, replace=replace)
         if replace:
             new_text = await _resolve_async_outlet(text, team_id=team_id)
-            return await orig_commit_stream(
-                key, stream, new_text, metadata, delta=delta, replace=replace)
+            return await _pass_through_edit(
+                stream, orig_commit_stream(
+                    key, stream, new_text, metadata, delta=delta, replace=replace))
         sent = (stream or {}).get("sent", "")
-        if not text.endswith(delta) or not text.startswith(sent):
-            return await orig_commit_stream(
-                key, stream, text, metadata, delta=delta, replace=replace)
-        head = text[:len(text) - len(delta)]  # == sent（extends 不变量），原样
-        resolved_tail = await _resolve_async_outlet(delta, team_id=team_id)
-        new_text = head + resolved_tail
-        return await orig_commit_stream(
-            key, stream, new_text, metadata, delta=resolved_tail, replace=replace)
+        if not _stream_extends(adapter, stream, text, delta):
+            return await _pass_through_edit(
+                stream, orig_commit_stream(
+                    key, stream, text, metadata, delta=delta, replace=replace))
+        # extends 确认：head 字节不动（已发送），只解析 floor 之后开始的提及；
+        # 判定（代码围栏/词边界）基于完整终稿（round 3 #2）。
+        floor = len(text) - len(delta)
+        try:
+            table = await _name_table(adapter, team_id=team_id)
+            new_text = _resolve_tail_mentions(text, table, floor)
+        except Exception:
+            new_text = text
+        new_delta = new_text[floor:] if (len(new_text) >= floor
+                                         and new_text[:floor] == text[:floor]) else delta
+        return await _pass_through_edit(
+            stream, orig_commit_stream(
+                key, stream, new_text, metadata, delta=new_delta, replace=replace))
+
+    async def _pass_through_edit(stream, awaitable):
+        """_commit_stream 收尾的 finalize edit 用我们构造好的精确载荷直通。
+
+        orig 内部 edit_message(chat_id, ts, shown, finalize=True) 会再进
+        edit_message 包装 → 全文解析 → 已发送前缀里的 @name 被二次改写 =
+        Slack 上同一条消息 text 与 blocks 不一致（round 3 #2 的复现形状）。
+        以 stream ts 集合标记在飞收尾：edit 包装看到 message_id 命中即跳过解析。
+        """
+        ts = (stream or {}).get("ts")
+        if ts is None:
+            return await awaitable
+        active = getattr(adapter, _STREAM_EDIT_ATTR, None)
+        if active is None:
+            active = set()
+            setattr(adapter, _STREAM_EDIT_ATTR, active)
+        active.add(ts)
+        try:
+            prior = getattr(adapter, _SUPPRESS_ATTR, 0) or 0
+            setattr(adapter, _SUPPRESS_ATTR, prior + 1)
+            try:
+                return await awaitable
+            finally:
+                cur = getattr(adapter, _SUPPRESS_ATTR, 1) or 1
+                setattr(adapter, _SUPPRESS_ATTR, max(0, cur - 1))
+        finally:
+            active.discard(ts)
 
     adapter._maybe_blocks = _maybe_blocks_patched
     adapter._post_chunks = _post_chunks_patched
