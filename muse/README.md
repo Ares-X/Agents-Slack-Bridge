@@ -10,7 +10,7 @@ muse 桥**默认放行其他 bot 的 @mention**（自己的消息永远过滤，
 
 1. **互相 @**：默认无需配置。要收紧成白名单，在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（对方 U…/B…，逗号分隔；任一非空即白名单模式）。
 2. **每次回复前读上下文**：`channel_history.py <channel> [N]`（`poll_consumer.py` 已调用）；把 `history` 交给 LLM。
-3. **尽量顶层回复**：跟帖会藏住回复，其他 agent 不易看到。consumer 默认在有 `thread_ts` 时跟帖——多 agent 协作时可改成不传 `--thread-ts`（与 grokbot 的 `REPLY_IN_THREAD=0` 对齐）。
+3. **回复位置跟随上下文**：在 thread 里被 @ 就在同一 thread 回（传 `--thread-ts`）；新起话题才发顶层。不要为了"让同伴看见"一律改顶层——会破坏 thread 上下文。
 4. **礼仪**：被 @ 时结合上下文有用回答；不要 @ 自己；点名→单回→停，转述别人 @ 时写纯文本名字，避免回环。
 
 ---
@@ -75,11 +75,38 @@ tail -f bridge.log                          # → "socket mode connected, listen
 
 > ⚠️ 方案 A 的 `generate_reply()` **默认只是 echo 示例**（`收到：…`，mention 已脱敏），**不是真实回复**。生产使用必须换成你的模型调用：把函数体替换为 LLM 请求，返回 `str`（正文）或 `(str, [uid...])`（正文 + 显式点名，经 `send.py --mention` 发出真实 @）。
 >
-> 真实回复位置：`send.py <channel>` 发到频道顶层；带 `--thread-ts` 则跟帖。多 agent 协作想让同伴看见时用顶层（不传 `--thread-ts`）。
+> 真实回复位置：跟随上下文——在 thread 里被 @ 就在同一 thread 回（`send_durable.py --thread-ts <ts>` / `send.py --thread-ts`），新起话题才发顶层。不要一律改顶层，会破坏 thread 上下文。
 >
 > 已验证范围：`tests/` 隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤，详见 §8）；**真实 Slack 联调（NOT_EXERCISED）**——未在授权测试频道执行，需部署者按 §6 自行验证。
 
-用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；需要同伴看见回复时不要默认跟帖。
+用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；回复位置跟随上下文（thread 里被 @ 就跟帖）。
+
+### 2.5 真实消费入口：`send_durable.py`（hook → agent 链路）
+
+轮询 consumer（方案 A）是参考实现。生产真实链路是：外部 hook 轮询 `inbox.jsonl` → 唤醒 agent → agent 用真实模型生成回复正文 → 经 `send_durable.py` 单次投递：
+
+```bash
+printf '%s' "$REPLY" |
+  python send_durable.py '<channel>:<ts>' [--thread-ts '<thread_ts>'] [--mention '<UID>']
+```
+
+- 正文经 stdin 输入，不含 echo，不替换 agent 的模型逻辑。
+- 与 `poll_consumer` 共用同一套持久化状态机（`deliver_one`）：发送前 fsync 持久 claim、tombstone 防重复、`client_msg_id` 关联、限流通 `retry_wait` 持久化、`uncertain` fail-closed、已发送但 ACK 失败转 `unacked`（只重试 ACK，绝不重发正文）。
+- `--thread-ts`：在 thread 里被 @ 就传同一 thread 回复；新起话题不传（顶层）。
+- 恢复核验以发送尝试持久化的 `channel`/`thread_ts` 为权威，后续调用不得改变核验目标。
+
+退出码：
+
+| 码 | 含义 | 调用方动作 |
+|---|---|---|
+| 0 | 已发送+已确认，或已被其他消费者完成/幂等跳过 | 结束 |
+| 75 | 限流，`retry_at` 已持久保存 | 到期前不得重试 |
+| 1 | 明确未发送（claim 已释放） | 可重试 |
+| 2 | 结果不确定，保持 `uncertain` | 不得盲目重发，先查频道历史核验 |
+| 3 | 已发送但 ACK 失败（`unacked`） | 只重试 ACK，绝不重发正文 |
+| 4 | 发送状态损坏 | fail-closed，人工处理 |
+
+只有 ACK 确实成功才返回 0；连续 ACK 失败保持 3，直到真正确认。
 
 ## 3. 文件清单与路径
 
@@ -96,6 +123,8 @@ Agents-Slack-Bridge/
     ├── inbox_ack.py              # 按 <channel:ts> 标记已处理（处理成功后调）
     ├── channel_history.py        # 拉频道最近 N 条（python channel_history.py <channel> [N]）
     ├── resolve.py                # ID → 显示名（user|channel）
+    ├── net_config.py             # 代理/CA 统一读取（见 §4c）
+    ├── send_durable.py           # ★ 真实消费入口：hook→side chat→agent 的单次持久发送（见 §2.5）
     ├── slack-bridge.service      # systemd unit（改路径后用，WorkingDirectory=.../muse）
     ├── consumer/
     │   └── poll_consumer.py      # 消费层方案 A 参考实现（~30s 轮询；默认 echo 示例，需接模型）
@@ -142,6 +171,20 @@ Agents-Slack-Bridge/
 - **每次成功入队都确认持久化**：新消息与重复消息返回前都确认文件及目录 fsync。首次创建或 compact 后目录同步失败，即使文件已可见，后续不同消息也不能跳过确认；同步失败则抛异常，调用方不得向 Slack ACK（等重投）。
 - **目录持久化在成功边界确认**：迁移恢复（replace 后）、首次创建文件、重复追加、ack 首次创建文件，成功返回前都要确认目录 fsync；目录同步持续失败时持续抛异常、持续拒绝 ACK，绝不确认一次可能因崩溃丢失的消息。
 
+## 4c. 出站代理 / CA 配置（issue #7）
+
+`bridge.py` / `send.py` / `channel_history.py` / `resolve.py` / `resolve_bot_identity()` 经 `net_config.read_proxy_config()` **统一读取**，顺序为：
+
+1. `.env` 的 `PROXY_URL` / `CA_BUNDLE`（部署本地值）
+2. 标准环境变量 `https_proxy` / `HTTPS_PROXY`、`SSL_CERT_FILE`
+3. 都没有 → 直连（`None`），TLS 验证保持开启（绝不禁用）
+
+如实说明：
+
+- 在 cron / worker 等 stripped env（无代理变量）下真正起作用的是**部署 `.env` 里持久化的 `PROXY_URL`**；`net_config` 本身在两者都空时仍返回直连，**不声称**自动发现不存在的配置。
+- 仓库通用版不硬编码任何内网代理地址或秘密；`.env.example` 只放占位符，`.env` 永不提交。
+- 五个调用方行为一致：同一份 `.env` + 同一进程环境 → 同一代理决策。
+
 ## 5. 踩坑清单（实测）
 
 1. **"向此应用发送消息的功能已关闭"** → manifest 漏了 `messages_tab_enabled: true`，去 App Home 手动开。
@@ -155,7 +198,7 @@ Agents-Slack-Bridge/
 8. **mention 回声脱敏**：默认 echo/转述必须把 `<@U...>` 转成纯文本 `@U...`（不触发通知）；主动点名走 `send.py --mention <UID>` 显式发出。不要为了防回环禁掉全部 mention。
 9. **子类型白名单**：DM 里只有无 subtype 和 `me_message` 被当作新消息；`message_changed` / `message_deleted` 等只 ACK 不入队。
 8. **中断期消息会丢**（Slack 不补发），健康检查把中断窗口压到分钟级。
-9. **回复位置**：默认有 `thread_ts` 则跟帖；多 agent 想让同伴看见时，改成频道顶层（不传 `--thread-ts`）。
+9. **回复位置**：在 thread 里被 @ 就在同一 thread 回（传 `--thread-ts`）；新起话题才发顶层。不要一律改顶层，会破坏 thread 上下文。
 
 ## 6. 最小验证
 

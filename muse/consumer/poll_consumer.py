@@ -192,8 +192,8 @@ def resolve_bot_identity():
         try:
             import ssl as _ssl
             from slack_sdk.web import WebClient
-            proxy = env.get("PROXY_URL") or None
-            ca = env.get("CA_BUNDLE") or None
+            from net_config import read_proxy_config
+            proxy, ca = read_proxy_config(env)
             ctx = _ssl.create_default_context(
                 cafile=ca if ca and os.path.exists(ca) else None)
             c = WebClient(token=token,
@@ -328,8 +328,13 @@ def _verify_hold(m, entry, state, bot_id, bot_user_id, why):
     情况——调用方不确定消息是否已发出时唯一的合法动作。
     """
     mid = m["msg_id"]
-    ch = m["channel"]
-    thread_ts = m.get("thread_ts") or ""
+    # 恢复核验以发送尝试持久化的 channel/thread_ts 为权威：后续 CLI 调用
+    # 不得改变核验目标，否则已存在的正确回执也无法确认（目标漂移）。
+    ch = entry.get("channel") or m["channel"]
+    if "thread_ts" in entry:
+        thread_ts = entry.get("thread_ts") or ""
+    else:
+        thread_ts = m.get("thread_ts") or ""
     if entry.get("attempts", 0) >= VERIFY_LIMIT:
         print(f"MANUAL REVIEW needed: send result uncertain after "
               f"{VERIFY_LIMIT} verifications ({why}), {mid} left pending",
@@ -368,7 +373,9 @@ def _precheck(m, state, bot_id, bot_user_id):
         if _ack_safe([mid]):
             state.resolve(mid)
             print(f"ack recovered for {mid}")
-        return "acked-later"
+            return "acked-later"
+        # ACK 仍失败：保持 unacked，绝不谎报成功（exit 3，经 EXIT 映射）
+        return "sent-unacked"
 
     # --- uncertain / sending：先严格核验，不盲目重发 ---
     # sending 只有两种来源：另一个存活 consumer 正在发送，或上一轮死在
