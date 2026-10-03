@@ -71,7 +71,7 @@ class SendStateMachineTest(unittest.TestCase):
              patch.object(pc, "channel_history", return_value=hist), \
              patch.object(pc, "generate_reply", return_value="reply!"), \
              patch.object(pc, "verify_sent", return_value=False):
-            return pc.handle_one(m, self.sessions, self.state)
+            return pc.handle_one(m, self.sessions, self.state, bot_id="B1")
 
     def test_ok_path_acks(self):
         self.assertEqual(self.run_one(msg()), "replied")
@@ -91,7 +91,7 @@ class SendStateMachineTest(unittest.TestCase):
              patch.object(pc, "generate_reply", return_value="reply!"), \
              patch.object(pc, "verify_sent", return_value=False):
             self.assertEqual(
-                pc.handle_one(msg(), self.sessions, self.state), "acked-later")
+                pc.handle_one(msg(), self.sessions, self.state, bot_id="B1"), "acked-later")
         self.assertEqual(len(self.sent_texts), 1)  # still exactly one send
 
     def test_explicit_mentions_use_flag(self):
@@ -101,7 +101,7 @@ class SendStateMachineTest(unittest.TestCase):
              patch.object(pc, "generate_reply",
                           return_value=("hello", ["U9"])), \
              patch.object(pc, "verify_sent", return_value=False):
-            pc.handle_one(msg(), self.sessions, self.state)
+            pc.handle_one(msg(), self.sessions, self.state, bot_id="B1")
         args, _ = self.sent_texts[0]
         self.assertIn("--mention", args)
         self.assertIn("U9", args)
@@ -127,7 +127,7 @@ class UncertainSendTest(unittest.TestCase):
              patch.object(pc, "channel_history", return_value=([], None)), \
              patch.object(pc, "generate_reply", return_value="reply!"), \
              patch.object(pc, "verify_sent", return_value=False):
-            res = pc.handle_one(m, sessions, state)
+            res = pc.handle_one(m, sessions, state, bot_id="B1")
         self.assertEqual(res, "uncertain-held")
         self.assertEqual(len(sends), 1)
         mack.assert_not_called()  # never acked an unverified send
@@ -137,7 +137,7 @@ class UncertainSendTest(unittest.TestCase):
              patch.object(pc, "channel_history", return_value=([], None)), \
              patch.object(pc, "generate_reply", return_value="reply!"), \
              patch.object(pc, "verify_sent", return_value=None) as mv:
-            res2 = pc.handle_one(m, sessions, state)
+            res2 = pc.handle_one(m, sessions, state, bot_id="B1")
         self.assertEqual(len(sends), 1)
         self.assertTrue(mv.called)
         mack2.assert_not_called()
@@ -151,7 +151,7 @@ class UncertainSendTest(unittest.TestCase):
              patch.object(pc, "generate_reply", return_value="reply!"), \
              patch.object(pc, "verify_sent", return_value=True), \
              patch.object(pc, "ack", return_value=True) as mack:
-            res = pc.handle_one(m, sessions, state)
+            res = pc.handle_one(m, sessions, state, bot_id="B1")
         self.assertEqual(res, "verified-acked")
         mack.assert_called_once_with(["C1:1.1"])
 
@@ -171,7 +171,7 @@ class HistoryDegradationTest(unittest.TestCase):
                 msh.return_value.returncode = 0
                 msh.return_value.stdout = "sent ok: True ts: 1"
                 msh.return_value.stderr = ""
-                results.append(pc.handle_one(m, sessions, state))
+                results.append(pc.handle_one(m, sessions, state, bot_id="B1"))
         # first two rounds defer (leave unacked), third proceeds degraded
         self.assertEqual(results[0], "deferred")
         self.assertEqual(results[1], "deferred")

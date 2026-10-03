@@ -403,6 +403,14 @@ class SendState:
             self._save_locked(data)
             return (dict(e), CLAIM_CLAIMED)
 
+    def record_diagnostic(self, msg_id, attempt_id, diagnostic):
+        """Retain the caller's sanitized evidence for this exact attempt only."""
+        def _do(sends):
+            entry = sends.get(msg_id)
+            if isinstance(entry, dict) and entry.get("client_msg_id") == attempt_id:
+                entry["send_diagnostic"] = dict(diagnostic)
+        self._mutate(_do)
+
     def set_unacked(self, msg_id):
         """Sent ok, inbox ack failed: only the ack may be retried."""
 

@@ -6,9 +6,9 @@ Usage:
 正文走 stdin，避免进 shell 历史。
 --mention 可重复：主动点名某人（显式 <@UID>）。默认正文里的 mention
   原样发送——调用方负责先做 strip_mentions() 脱敏，见 consumer。
---client-msg-id：本次发送尝试的唯一关联证据，随 POST 提交；Slack 会
-  把它存进消息并在 conversations.history 里回显，供调用方核验"这次
-  发送"是否成功（同身份+同正文+时间窗口不能单独证明）。
+--client-msg-id：持久 claim 的尝试 ID，同时写入原生消息 metadata。
+history 回显的 typed metadata 或 legacy client_msg_id 才能关联本次尝试；
+不能假定 Slack 会回显 client_msg_id，同身份+正文+时间不能单独证明。
 
 退出语义（调用方判定"是否已发出"的唯一依据）：
   - stdout 含 "sent ok: True"   -> 已发出（exit 0）
@@ -31,6 +31,7 @@ import os
 import ssl
 import sys
 import time
+from send_receipt import attempt_metadata, correlated, emit_diagnostic
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -126,25 +127,45 @@ def main():
                   # 丢失而被 SDK 重发，会在频道里产生重复消息；这里快速
                   # 失败，由调用方经 history 核验后再决定（绝不盲目重发）。
                   retry_handlers=[])
+    started = time.monotonic()
     try:
         post_kwargs = {"channel": channel, "text": text,
                        "thread_ts": thread_ts}
         if client_msg_id:
-            # 本次发送尝试的唯一关联证据；Slack 存进消息并在 history
-            # 回显，供调用方核验"这次发送"是否成功。
+            # Native metadata preserves text/mentions without a visible nonce.
             post_kwargs["client_msg_id"] = client_msg_id
+            post_kwargs["metadata"] = attempt_metadata(client_msg_id)
         r = c.chat_postMessage(**post_kwargs)
     except Exception as e:
+        response = getattr(e, "response", None)
+        diagnostic = {"elapsed_ms": round((time.monotonic() - started) * 1000),
+                      "exception_type": type(e).__name__,
+                      "http_status": getattr(response, "status_code", None)}
+        if response is not None:
+            try:
+                diagnostic["slack_error"] = response.get("error")
+                diagnostic["request_id"] = (getattr(response, "headers", None) or {}).get("x-slack-req-id")
+            except (AttributeError, TypeError):
+                pass
         if _is_ratelimited(e):
+            emit_diagnostic(dict(diagnostic, result="retry_wait"))
             # 保留服务器给出的完整等待期，由 consumer 持久保存。
             print(json.dumps({"result": "retry_wait",
                               "retry_at": time.time() + _retry_after_seconds(e)}))
             sys.exit(75)
         # 请求可能已被 Slack 接受、只是响应丢失：调用方必须视为不确定，
         # 绝不能当成"未发送"去自动重发。
-        print("RESULT uncertain: %s: %s" % (type(e).__name__, e),
-              file=sys.stderr)
+        emit_diagnostic(dict(diagnostic, result="uncertain"))
+        print("RESULT uncertain", file=sys.stderr)
         sys.exit(2)
+    message = r.get("message") or {}
+    emit_diagnostic({"result": "ok" if r.get("ok") else "fail",
+                     "elapsed_ms": round((time.monotonic() - started) * 1000),
+                     "ts": r.get("ts"), "http_status": getattr(r, "status_code", None),
+                     "metadata_echo": correlated({"metadata": message.get("metadata")}, client_msg_id),
+                     "client_id_echo": bool(client_msg_id and message.get("client_msg_id") == client_msg_id),
+                     "warnings": (r.get("response_metadata") or {}).get("warnings", []),
+                     "slack_error": r.get("error")})
     print("sent ok:", r.get("ok"), "ts:", r.get("ts"))
 
 

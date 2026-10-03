@@ -19,7 +19,8 @@
 - send_reply 只有在"明确证明未发送"时返回 fail（API 明确拒绝 / 死在
   API 调用之前）；其余（超时、连接中断、输出含糊）一律 uncertain。
 - verify_sent 必须同时核对：是我们自己的 bot、目标频道/线程一致、
-  消息时间不早于本次发送尝试、全文精确匹配。证明不了就保持
+  消息时间不早于本次发送尝试、全文精确匹配、typed metadata 或
+  实际回显的 legacy client_msg_id 关联同一尝试。证明不了就保持
   uncertain，绝不猜测成功。
 - send_state.json 损坏绝不静默当成空状态：优先从 .bak/.tmp 恢复；
   都损坏则隔离为 send_state.json.corrupt.* 并抛 StateCorruptError，
@@ -43,6 +44,10 @@ import uuid
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)  # muse/
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from send_receipt import (DIAGNOSTIC_PREFIX, correlated, emit_diagnostic,
+                          safe_diagnostic)
 SESSIONS_PATH = os.path.join(BASE, "channel_sessions.json")
 STATE_PATH = os.path.join(BASE, "send_state.json")
 POLL_INTERVAL = 30          # 秒
@@ -145,13 +150,22 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
-def channel_history(channel, limit=15, thread_ts=""):
+def channel_history(channel, limit=15, thread_ts="", reconcile_after=None):
     """返回 (messages, error)。error 非空时调用方必须走降级/延迟策略，
     不可当成空历史静默处理。"""
     cmd = [sys.executable, "channel_history.py", channel, str(limit)]
     if thread_ts:
         cmd += ["--thread-ts", thread_ts, "--all"]
-    r = sh(*cmd)
+    if reconcile_after is not None:
+        # Page only this attempt's time interval, rather than the latest 30
+        # messages. Capture an upper bound so a busy channel cannot extend it.
+        cmd += ["--all", "--include-all-metadata", "--oldest",
+                str(max(0.0, reconcile_after - VERIFY_SKEW_SECONDS)),
+                "--latest", str(time.time() + VERIFY_SKEW_SECONDS)]
+    try:
+        r = sh(*cmd)
+    except Exception as exc:
+        return [], type(exc).__name__  # No exception body/credentials in logs.
     msgs, err = [], None
     for line in r.stdout.splitlines():
         try:
@@ -203,9 +217,11 @@ def resolve_bot_identity():
                           **({"proxy": proxy} if proxy else {}), ssl=ctx)
             bot_user_id = c.auth_test().get("user_id") or None
         except Exception as e:
-            print(f"bot identity resolve failed: {e}", file=sys.stderr)
-    _bot_identity = (bot_id, bot_user_id)
-    return _bot_identity
+            print(f"bot identity resolve failed: {type(e).__name__}", file=sys.stderr)
+    identity = (bot_id, bot_user_id)
+    if bot_id or bot_user_id:
+        _bot_identity = identity
+    return identity
 
 
 def generate_reply(channel, message, session, history):
@@ -227,7 +243,7 @@ def normalize_reply(ret):
 
 
 def send_reply(channel, text, thread_ts=None, mentions=(),
-               client_msg_id=None):
+               client_msg_id=None, diagnostics=None):
     """返回 "ok" | "fail" | "uncertain" | ("retry_wait", retry_at)。
 
     只有"明确证明未发送"才返回 "fail"（API 明确拒绝 / 死在 API 调用
@@ -242,15 +258,39 @@ def send_reply(channel, text, thread_ts=None, mentions=(),
         cmd += ["--mention", u]
     if client_msg_id:
         cmd += ["--client-msg-id", client_msg_id]
+    started = time.monotonic()
+    detail = {}
+    def finish(result):
+        classification = result[0] if isinstance(result, tuple) else result
+        detail["result"] = classification
+        detail["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+        safe = emit_diagnostic(detail)
+        if diagnostics is not None:
+            diagnostics.update(safe)
+        return result
     try:
         r = sh(*cmd, input_text=text, timeout=SEND_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return "uncertain"
+        detail.update(timeout=True, exception_type="TimeoutExpired")
+        return finish("uncertain")
     except Exception as e:
-        print(f"send subprocess error: {e}", file=sys.stderr)
-        return "uncertain"
+        detail["exception_type"] = type(e).__name__
+        return finish("uncertain")
     out = r.stdout or ""
     err = r.stderr or ""
+    for line in err.splitlines():
+        if line.startswith(DIAGNOSTIC_PREFIX):
+            try:
+                data = json.loads(line[len(DIAGNOSTIC_PREFIX):])
+                if isinstance(data, dict):
+                    child = safe_diagnostic(data)
+                    if "elapsed_ms" in child:
+                        detail["post_elapsed_ms"] = child.pop("elapsed_ms")
+                    detail.update(child)
+            except (TypeError, ValueError):
+                pass
+    detail.update(exit_code=r.returncode, stdout_bytes=len(out.encode()),
+                  stderr_bytes=len(err.encode()))
     if r.returncode == 75:
         # 只接受完整、明确的延期结果；损坏输出不能当成可重试证明。
         try:
@@ -259,18 +299,18 @@ def send_reply(channel, text, thread_ts=None, mentions=(),
             if (result.get("result") == "retry_wait"
                     and type(retry_at) in (int, float)
                     and math.isfinite(retry_at) and retry_at >= 0):
-                return ("retry_wait", retry_at)
+                return finish(("retry_wait", retry_at))
         except (AttributeError, TypeError, ValueError, OverflowError):
             pass
-        return "uncertain"
+        return finish("uncertain")
     if "sent ok: True" in out:
-        return "ok"
+        return finish("ok")
     if "sent ok: False" in out:
-        return "fail"          # API 明确拒绝：证明未发送
+        return finish("fail")  # API 明确拒绝：证明未发送
     if "RESULT not-sent" in out or "RESULT not-sent" in err:
-        return "fail"          # 死在 API 调用之前：证明未发送
+        return finish("fail")  # 死在 API 调用之前：证明未发送
     # 超时、连接中断（RESULT uncertain）、输出含糊：可能已发出
-    return "uncertain"
+    return finish("uncertain")
 
 
 def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
@@ -283,8 +323,8 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
       2. 频道/线程一致（thread_ts 必须相等；顶层回复双方都为空）；
       3. 消息 ts 不早于本次发送尝试（允许 VERIFY_SKEW_SECONDS 时钟偏差）；
       4. 全文精确匹配（sha256，不再是 60 字前缀）；
-      5. 携带与本次发送尝试相同的 client_msg_id——这是唯一能把
-         history 里的一条消息关联到"这一次发送尝试"的证据。
+      5. typed metadata 的 attempt_id 或 legacy client_msg_id 精确命中
+         持久 claim 的尝试 ID；不能假定 Slack 会回显 client_msg_id。
          同身份、同正文和时间窗口不能单独证明成功（例如本 bot 在
          本次尝试前 30 秒发过相同正文，也会命中 1–4）。
     返回 True（已证实发出）/ False（无证据）/ None（历史不可用）。
@@ -293,7 +333,8 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
     本次尝试没有 client_msg_id（旧版本条目）时同样无法证明，
     返回 False。
     """
-    msgs, err = channel_history(channel, limit=limit, thread_ts=thread_ts)
+    msgs, err = channel_history(channel, limit=limit, thread_ts=thread_ts,
+                                reconcile_after=sent_after)
     if err:
         return None
     if not thash:
@@ -302,13 +343,19 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
         # 无法关联本次发送尝试：证明不了，保持 uncertain。
         return False
     for m in msgs:
+        if m.get("channel", channel) != channel:
+            continue
         if not m.get("is_bot"):
             continue
         ident_ok = (bot_id and m.get("bot_id") == bot_id) or \
                    (bot_user_id and m.get("user") == bot_user_id)
         if not ident_ok:
             continue
-        if (m.get("thread_ts") or "") != (thread_ts or ""):
+        actual_thread = m.get("thread_ts") or ""
+        # A root acquires thread_ts == its own ts when somebody replies.
+        if not thread_ts and actual_thread == m.get("ts"):
+            actual_thread = ""
+        if actual_thread != (thread_ts or ""):
             continue
         try:
             mts = float(m.get("ts") or 0)
@@ -318,7 +365,7 @@ def verify_sent(channel, thash, thread_ts="", bot_id=None, bot_user_id=None,
             continue
         if m.get("text_sha256") != thash:
             continue
-        if m.get("client_msg_id") != client_msg_id:
+        if not correlated(m, client_msg_id):
             continue
         return True
     return False
@@ -410,15 +457,18 @@ def deliver_one(m, text, mentions, state, bot_id=None, bot_user_id=None):
     mid = m["msg_id"]
     ch = m["channel"]
     thread_ts = m.get("thread_ts") or ""
+    if not bot_id and not bot_user_id:
+        print("bot identity unavailable; refusing a fresh send claim", file=sys.stderr)
+        return "identity-unavailable"
 
     # --- 领取、发送 ---
     # hash 必须对最终发出的正文计算（含 send.py 追加的显式 mention），
     # 否则核验时全文永远对不上。
     thash = text_hash(wire_text(text, mentions))
-    # 本次发送尝试的唯一关联证据：随 POST 发给 Slack，history 回显后
+    # 本次发送尝试的唯一关联 ID：随 POST metadata 发给 Slack，回显后
     # 用于核验"这次发送"是否成功。同身份+同正文+时间窗口不能单独
     # 证明成功（30 秒前发过相同正文也会命中）。
-    attempt_id = uuid.uuid4().hex
+    attempt_id = str(uuid.uuid4())
     # 先持久化领取（fsync），再 spawn 子进程：崩溃后重启走 uncertain，
     # 绝不直接重发。
     claim_entry, outcome = state.claim(mid, channel=ch, thread_ts=thread_ts,
@@ -438,8 +488,12 @@ def deliver_one(m, text, mentions, state, bot_id=None, bot_user_id=None):
             return "retry-deferred"
         return _verify_hold(m, fresh, state, bot_id, bot_user_id,
                             why="claim lost to concurrent consumer")
+    diagnostics = {}
     result = send_reply(ch, text, thread_ts=thread_ts or None,
-                        mentions=mentions, client_msg_id=attempt_id)
+                        mentions=mentions, client_msg_id=attempt_id,
+                        diagnostics=diagnostics)
+    if diagnostics:
+        state.record_diagnostic(mid, attempt_id, diagnostics)
 
     if isinstance(result, tuple) and result[0] == "retry_wait":
         state.defer_retry(mid, result[1], client_msg_id=attempt_id)
@@ -516,9 +570,7 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
 
 def main():
     print(f"consumer polling every {POLL_INTERVAL}s (ROOT={ROOT}) ...")
-    bot_id, bot_user_id = resolve_bot_identity()
-    print(f"bot identity: bot_id={bot_id or '?'} "
-          f"bot_user_id={bot_user_id or '?'}")
+    bot_id, bot_user_id = None, None
     state = None
     while True:
         try:
@@ -531,6 +583,12 @@ def main():
                                   inbox_lock_path=os.path.join(ROOT,
                                                                "inbox.lock"))
             state.ensure_usable()
+            if not bot_id and not bot_user_id:
+                # A failed startup lookup must recover on a later poll; fresh
+                # sends remain fail-closed until an identity is available.
+                bot_id, bot_user_id = resolve_bot_identity()
+                print(f"bot identity: bot_id={bot_id or '?'} "
+                      f"bot_user_id={bot_user_id or '?'}")
             msgs = peek()
             if msgs:
                 sessions = load_json(SESSIONS_PATH, {})

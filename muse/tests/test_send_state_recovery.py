@@ -51,7 +51,7 @@ class DurableRecoveryTest(unittest.TestCase):
              patch.object(pc, "generate_reply", return_value="reply"), \
              patch.object(pc, "send_reply", return_value="ok") as send, \
              patch.object(pc, "ack", side_effect=ack):
-            self.assertEqual(pc.handle_one(snapshot, {}, a), "replied")
+            self.assertEqual(pc.handle_one(snapshot, {}, a, bot_id="B1"), "replied")
             real_open = builtins.open
             for error in (OSError(errno.EIO, "read failed"),
                           FileNotFoundError(errno.ENOENT, "missing queue")):
@@ -62,9 +62,9 @@ class DurableRecoveryTest(unittest.TestCase):
                 with self.subTest(error=type(error).__name__), \
                      patch("builtins.open", side_effect=unreadable):
                     with self.assertRaises(OSError):
-                        pc.handle_one(snapshot, {}, b)
+                        pc.handle_one(snapshot, {}, b, bot_id="B1")
                 self.assertEqual(send.call_count, 1)
-            self.assertEqual(pc.handle_one(snapshot, {}, b), "already-acked")
+            self.assertEqual(pc.handle_one(snapshot, {}, b, bot_id="B1"), "already-acked")
             self.assertEqual(send.call_count, 1)
 
     def test_deadline_survives_restart_and_expiry_claim_is_exclusive(self):

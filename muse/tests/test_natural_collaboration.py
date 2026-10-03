@@ -111,7 +111,7 @@ class HistoryTest(unittest.TestCase):
     def test_verification_queries_persisted_thread(self):
         with patch.object(pc, "channel_history", return_value=([], None)) as fetch:
             self.assertFalse(pc.verify_sent("C1", "hash", "1.0", client_msg_id="attempt"))
-        fetch.assert_called_once_with("C1", limit=30, thread_ts="1.0")
+        fetch.assert_called_once_with("C1", limit=30, thread_ts="1.0", reconcile_after=0.0)
 
 
 class QuietCompletionTest(unittest.TestCase):

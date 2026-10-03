@@ -1,7 +1,8 @@
 """Print complete Slack messages as chronological JSON lines.
 
 Usage: channel_history.py <channel> [limit] [--thread-ts TS|--thread TS]
-                          [--all] [--cursor CURSOR]
+                          [--all] [--cursor CURSOR] [--oldest TS] [--latest TS]
+                          [--include-all-metadata]
 Without --all, limit is the maximum message count (default 10). With --all,
 it is the page size. An unfinished cursor is reported on stderr; stdout
 contains only messages. Any page failure prints one error and exits 2,
@@ -31,7 +32,7 @@ def load_env(path):
 
 
 def fetch_messages(client, channel, limit=10, thread_ts="", all_pages=False,
-                   cursor=""):
+                   cursor="", oldest="", latest="", include_all_metadata=False):
     """Collect before printing so a later failure cannot look complete."""
     messages, seen_messages, seen_cursors = [], set(), set()
     while True:
@@ -39,6 +40,13 @@ def fetch_messages(client, channel, limit=10, thread_ts="", all_pages=False,
             raise ValueError("history pagination repeated a cursor")
         seen_cursors.add(cursor)
         kwargs = {"channel": channel, "limit": min(limit, 100)}
+        if oldest:
+            kwargs["oldest"] = oldest
+            kwargs["inclusive"] = True
+        if latest:
+            kwargs["latest"] = latest
+        if include_all_metadata:
+            kwargs["include_all_metadata"] = True
         if not all_pages:
             kwargs["limit"] = min(limit - len(messages), 100)
         if cursor:
@@ -93,7 +101,7 @@ def message_record(client, message, channel, names):
               "client_msg_id": message.get("client_msg_id", "")}
     # Structured approval/control cards and edited text remain source evidence.
     for field in ("subtype", "blocks", "attachments", "edited", "bot_profile",
-                  "app_id", "username", "reply_count", "latest_reply"):
+                  "app_id", "username", "reply_count", "latest_reply", "metadata"):
         if field in message:
             record[field] = message[field]
     return record
@@ -106,6 +114,9 @@ def main(argv=None):
     parser.add_argument("--thread-ts", "--thread", dest="thread_ts", default="")
     parser.add_argument("--all", dest="all_pages", action="store_true")
     parser.add_argument("--cursor", default="")
+    parser.add_argument("--oldest", default="")
+    parser.add_argument("--latest", default="")
+    parser.add_argument("--include-all-metadata", action="store_true")
     args = parser.parse_args(argv)
     if args.limit < 1:
         parser.error("limit must be positive")
@@ -119,7 +130,8 @@ def main(argv=None):
         client = WebClient(token=env.get("SLACK_BOT_TOKEN") or os.environ["SLACK_BOT_TOKEN"],
                            **({"proxy": proxy} if proxy else {}), ssl=ctx)
         messages, cursor = fetch_messages(client, args.channel, args.limit,
-                                          args.thread_ts, args.all_pages, args.cursor)
+                                          args.thread_ts, args.all_pages, args.cursor,
+                                          args.oldest, args.latest, args.include_all_metadata)
         names = {}
         records = [message_record(client, m, args.channel, names) for m in messages]
     except Exception as exc:

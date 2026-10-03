@@ -77,7 +77,7 @@ tail -f bridge.log                          # → "socket mode connected, listen
 >
 > 真实回复位置：跟随上下文——在 thread 里被 @ 就在同一 thread 回（`send_durable.py --thread-ts <ts>` / `send.py --thread-ts`），新起话题才发顶层。不要一律改顶层，会破坏 thread 上下文。
 >
-> 已验证范围：`tests/` 隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤，详见 §8）；**真实 Slack 联调（NOT_EXERCISED）**——未在授权测试频道执行，需部署者按 §6 自行验证。
+> 自动化验证范围：`tests/` 隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤，详见 §8），不自行证明真实 Slack 验收。当前部署的一次受控 metadata 读回探针只验证 API 回执字段（见 §4b）；新代码加载后的 hook→agent→durable 完整路线仍需按 §6 验证。
 
 用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；回复位置跟随上下文（thread 里被 @ 就跟帖）。
 
@@ -91,7 +91,7 @@ printf '%s' "$REPLY" |
 ```
 
 - 正文经 stdin 输入，不含 echo，不替换 agent 的模型逻辑。
-- 与 `poll_consumer` 共用同一套持久化状态机（`deliver_one`）：发送前 fsync 持久 claim、tombstone 防重复、`client_msg_id` 关联、限流通 `retry_wait` 持久化、`uncertain` fail-closed、已发送但 ACK 失败转 `unacked`（只重试 ACK，绝不重发正文）。
+- 与 `poll_consumer` 共用同一套持久化状态机（`deliver_one`）：发送前 fsync 持久 claim、tombstone 防重复、原生 metadata 尝试 ID 关联、限流通 `retry_wait` 持久化、`uncertain` fail-closed、已发送但 ACK 失败转 `unacked`（只重试 ACK，绝不重发正文）。
 - `--thread-ts`：在 thread 里被 @ 就传同一 thread 回复；新起话题不传（顶层）。
 - 恢复核验以发送尝试持久化的 `channel`/`thread_ts` 为权威，后续调用不得改变核验目标；线程核验经 `conversations.replies` 分页读取。
 - 每次判断前重新读当前频道原文；来源在 thread 中时还要读完整 thread。摘要与入队时的旧文本只能作为定位线索。审批卡可能随批准而编辑，先根据 bot 身份、结构和最新状态理解控制语义；不要仅因旧 `Command approval` 与新 `Approved once` 不同就称为冒充，更不要把卡片命令当作新的执行授权。引用其他 agent 的动作时明确归属；没有自己的发送/执行证据时不要把他人的动作认领为自己执行，也不要作无证据的绝对否认。
@@ -110,7 +110,7 @@ printf '%s' "$REPLY" |
 | 1 | 明确未发送（claim 已释放） | 可重试 |
 | 2 | 结果不确定，保持 `uncertain` | 不得盲目重发，先查频道历史核验 |
 | 3 | 已发送但 ACK 失败（`unacked`） | 只重试 ACK，绝不重发正文 |
-| 4 | 发送状态损坏、存储失败或静默来源不可确认 | fail-closed，保留证据并处理原因 |
+| 4 | 状态损坏、存储失败、静默来源不可确认或新发送身份未知 | fail-closed；身份未知时不领取、不 POST |
 
 只有完成标记确实持久化才返回 0；发送后连续 ACK 失败保持 3，直到真正确认。静默遇到现存发送状态时按上表的 2/3/75 保持原状态，不静默丢弃。
 
@@ -125,6 +125,7 @@ Agents-Slack-Bridge/
     ├── bridge.py                 # ★ 核心：Socket Mode 监听 → inbox.jsonl（只收不发；先落盘后 ACK）
     ├── inbox_store.py            # 队列存储：append-only + tombstone ack，锁文件并发控制
     ├── send.py                   # 发消息：echo "正文" | python send.py <channel> [--thread-ts <ts>] [--mention <UID>]...
+    ├── send_receipt.py           # 原生尝试回执关联与安全诊断协议字段
     ├── inbox_peek.py             # 打印未处理消息（不标记）
     ├── inbox_ack.py              # 按 <channel:ts> 标记已处理（处理成功后调）
     ├── channel_history.py        # 拉频道最近 N 条（python channel_history.py <channel> [N]）
@@ -167,7 +168,11 @@ Agents-Slack-Bridge/
 - **领取时检查持久完成标记**：`claim()` 在同一临界区（`send_state` EX → `inbox` SH）内检查 inbox 的 ack tombstone；另一个 consumer 已经发送+ack+resolve（删条目）后，拿旧快照的 consumer 再领取会得到 `completed`，直接跳过、绝不发送。已配置的队列缺失或读取失败时拒绝领取，不能把读取失败当作“没有完成记录”。
 - **只有"明确证明未发送"才重试**：`send.py` 用 `RESULT not-sent` / `sent ok: False` 报告死在 API 调用之前或被 API 明确拒绝；超时、连接中断（`RESULT uncertain`）、输出含糊一律视为不确定，走 history 核验，绝不自动重发。
 - **限流持久延期**：`send.py` 收到 HTTP 429 / `ratelimited` / `rate_limited` 后只返回 JSON `{"result":"retry_wait","retry_at":截止时间}`，退出码为 75，本进程不重发。consumer 将该期限持久保存为 `retry_wait`；未到期不发送、不核验、不 ACK，到期后才原子领取新的发送尝试。`Retry-After` 不得因单次进程超时预算被截短；缺失或无效时默认等待 60 秒。重启保留期限，并发只有一个消费者能重新领取，迟到的旧尝试核验不能覆盖延期或新尝试。其他调用 `send.py` 的平台消费层也必须处理退出码 75、保存 `retry_at`，到期前不得重试。连接断开和其他未知结果仍走 uncertain；SDK 自动重试保持关闭。
-- **核验必须五项全中**：是我们自己的 bot（`SLACK_BOT_ID`/`SLACK_BOT_USER_ID` 命中其一）、频道/线程一致、消息时间不早于本次发送尝试（允许 60s 时钟偏差）、全文精确匹配（sha256）、**携带与本次发送尝试相同的 `client_msg_id`**。`client_msg_id` 是每次 claim 生成并随 POST 提交的唯一 id，只有 history 实际回显时才能作本实现的关联证据；不能假定 Slack 每次都会回显。同身份+同正文+时间窗口不能单独证明成功（30 秒前发过相同正文也会命中）。证明不了就保持 uncertain，3 轮无结论转人工日志；旧版本条目或 history 缺少 `client_msg_id` 时都不能自动确认，更不能由 agent 手工清状态替代核验。
+- **核验必须五项全中**：是我们自己的 bot（`SLACK_BOT_ID`/`SLACK_BOT_USER_ID` 命中其一）、频道/线程一致、消息时间不早于本次发送尝试（允许 60s 时钟偏差）、全文精确匹配（sha256）、**精确关联到持久 claim 的尝试 ID**。新 claim 使用标准带连字符 UUID，仍保存在 `client_msg_id` 字段，并随 POST 提交 `metadata={event_type: muse_delivery_attempt, event_payload: {attempt_id: ID}}`。history/replies 核验请求 `include_all_metadata=true`，接受正确 event_type 下的精确 attempt_id，或实际回显的 legacy `client_msg_id`。不能假定 Slack 会回显后者。同身份+正文+时间不能证明成功；旧条目没有 ID、两种回执均缺失或不匹配时保持 uncertain，不能猜测迁移或手工清状态。
+- **核验覆盖本次尝试的完整时间区间**：分页读取 claim 时间减 60s 到本轮固定当前时间加 60s，避免只看最新 30 条漏掉已发送回执；任何分页失败都不输出部分成功，不确认、不重发。顶层消息收到回复后出现 `thread_ts == ts`，仍按顶层核对，真正的 thread 回复必须命中目标 thread。
+- **安全发送诊断**：`send.py` 的 legacy 结果标记保留，另在 stderr 输出 `SEND_DIAGNOSTIC` JSON。consumer 只传递允许的协议字段（耗时、退出码、超时、异常类、HTTP 状态、Slack 错误/请求 ID、回执 echo、warning code），不复制任意异常文本、响应正文、token 或代理 URL。未完成条目按精确尝试 ID 保存 `send_diagnostic`；子进程无明确发送结果时保持 uncertain；缺少诊断不猜测失败原因。身份解析失败不缓存，新 claim 在身份未知时拒绝发送。
+- **部署核对**：metadata 不改变普通正文、格式或 mention。[Slack metadata 文档](https://docs.slack.dev/messaging/message-metadata/)说明原生回执读取方式。当前 Muse app/token 已用一次受控 POST 与自己的 history 读回确认该 event_type 和标准 UUID 回显，无需新增 scope 或 schema；这不能单独区分 metadata 与 UUID 格式对 client ID echo 的影响。其他部署应检查实际响应 warning 和回执，不因文档推测扩大权限。既有缺少回执的 uncertain 记录继续保留。
+- **已知生命周期边界**：独立 CLI 打开 SendState 时执行 sending→uncertain 恢复，尚未区分另一个 sender 是否仍存活。这不会释放发送权；uncertain 状态本身不能证明 owner 已退出，也不能证明传输失败的具体原因。
 - **ack 抛异常按确认失败处理**：发送成功但 `inbox_ack.py` 子进程崩溃/超时抛异常时，条目记为 `unacked`（只重试 ack），绝不卡在 `sending`。
 - **状态文件损坏不静默**：`send_state.json` 加载时按 primary → `.tmp` → `.bak` 顺序尝试，每个候选都要过严格校验（版本号 == 2、`sends` 为 dict、每条 status 合法；未知版本号绝不"迁移"成空状态）。`.tmp` 是崩溃写一半留下的 fsync 过的**更新**版本，恢复安全；`.bak` 是上一次保存**之前**的旧版本——如果 primary 和 `.tmp` 都不可用而只有 `.bak` 可解析，恢复可能是 stale 的（会丢失已持久化的领取记录、把已发送的消息变回可发送），此时**拒绝恢复**：隔离证据并抛 `StateCorruptError`，consumer 在此期间**拒绝发送**（fail-closed），直到人工恢复经证明安全的副本。全部不可用时隔离为 `send_state.json.corrupt.<毫秒>.<primary|tmp|bak>`（每个来源独立后缀、证据不互相覆盖）并留 `.quarantined` 标记，重启也不许静默变空。
 
@@ -219,7 +224,9 @@ cd muse && python3 -m unittest discover -s tests -v
 ```
 测试覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。`test_reliability.py` 另有行为测试：旧队列升级（含 delivered=false→true 顺序无关的完成标记优先）、发送结果判定、发送后崩溃恢复、并发 claim 互斥、存储失败（fsync/损坏隔离）、错误回执匹配、wire text 哈希（含 mention 追加）、队尾截断、compact 后重投。`test_reliability_round2.py` 覆盖 stale `.bak` 恢复拒绝、严格版本/结构校验、分来源隔离证据、ack 异常、旧快照、`client_msg_id` 核验和目录持久化。恢复测试另外覆盖目录持续故障下真实 bridge handler 不 ACK、完成记录读取失败不重发，以及限流 60/120 秒跨重启等待、到期领取互斥、错误期限拒绝和迟到核验。`test_natural_collaboration.py` 另覆盖频道/线程分页去重、完整正文和控制卡、分页失败不输出部分成功、静默原因/来源持久化及 compact 保留、并发领取互斥、所有未完成发送状态拒绝静默、fsync 故障与重复确认。仅标准库与模拟网络，无新增依赖。
 
-**NOT_EXERCISED**：真实 Slack 联调未在授权测试频道执行（无凭据、无部署修改），需部署者按 §6 自行验证。
+`test_receipt_recovery.py` 覆盖：响应丢失后通过第二页原生回执确认且只有一次 POST/ACK，缺失/错误回执与分页故障保持 uncertain，顶层收到回复的 thread 语义，正向时钟偏差，普通长正文/mention 保留，安全诊断字段及身份解析恢复。
+
+**验证边界**：本自动化套件只使用隔离状态与模拟网络；当前受控探针证明 metadata/标准 UUID 在现有 app/token 下回显，并不证明新补丁已加载或真实 hook 协作已完成。部署者应按 §6 验证加载后的完整路线。
 
 ## 7. 安全
 
