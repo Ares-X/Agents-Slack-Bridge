@@ -242,10 +242,18 @@ platforms:
   slack:
     typing_indicator: false
     extra:
-      reply_in_thread: true
+      reply_in_thread: false
 ```
 
 这些显示字段只覆盖 Slack；不覆盖现有 `allow_bots`、作者/频道授权或其他平台。
+`reply_in_thread: false` 避免给普通私聊或频道顶层消息强制新建线程；已有的
+`thread_ts` 仍沿用原线程。836 适配器的此开关不区分私聊与频道，设为 `true`
+也会把普通私聊回复放进线程，不能作为仅控制频道展示的设置。依据固定上游
+[入站线程识别](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/platforms/slack.py#L4148-L4172)与
+[出站线程解析](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/platforms/slack.py#L2757-L2762)。
+这也会让频道顶层消息使用频道级会话，而非每条根消息各建会话；作者隔离仍由
+既有 `group_sessions_per_user` 控制。DM 会话隔离另由
+`dm_top_level_threads_as_sessions` 控制，不随回复展示位置自动改变；本配置不修改这些字段。
 显式 `tool_progress: "off"` 也关闭 native task cards。审批仍走独立
 `send_exec_approval` 路径，不能为了静默输出关闭审批。依据固定上游
 [展示解析](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/display_config.py)、
@@ -255,6 +263,44 @@ platforms:
 使用 adapter 自动终稿作为正文的唯一发送入口；同一回复不要再经 curl 或发送工具另发。
 这些设置不屏蔽所有诊断和 memory 更新，也不改变超长文本切块行为，不能当作 exactly-once
 保证。普通短回复的条数、线程和完成即停止仍须真实验收；磁盘文件更新后还须核对新进程加载。
+需要加载配置时，可由已授权用户通过 Hermes 原生 `/restart` 请求正常重启；固定 836
+[命令处理器](https://github.com/NousResearch/hermes-agent/blob/836b5f8253d27fee79b4f833bc43624f06a890b3/gateway/slash_commands.py#L524-L582)
+会先等待运行中的任务结束。终端工具禁止在 agent 子进程中自行杀死 gateway 的保护，
+不能推广成所有原生重启入口均不可用。重启后仍须核对新启动时间、加载配置和一条真实回复。
+
+### 836 的后台复盘通知
+
+J 实测发现，终稿之后的 `Self-improvement review` 仍会单独发进 Slack。
+固定 836 的 `run_turn_runner.py` 直接读取全局 `display.memory_notifications`，
+上述 Slack 显示开关不控制它。后台复盘可能继续更新记忆或技能；主回合的只读报告
+不能代表整个实例没有写入。学习流程、运行日志与安全审批是不同的控制面。
+
+本仓库提供针对 `836b5f8253d27fee79b4f833bc43624f06a890b3` 的
+[最小补丁](./patches/memory-notifications-platform-836.patch)：为该显示键登记平台覆盖，
+并让真实回合装配通过已有 resolver 读取当前平台值。只改两个上游文件，不改后台学习、
+审批或诊断通知；其他平台继续继承原全局值。加载补丁后可额外设置：
+
+```yaml
+display:
+  platforms:
+    slack:
+      memory_notifications: "off"
+```
+
+不要只在未补丁的 836 配置中添加该键并宣称生效。应用前检查实际上游版本、脏改并备份
+两个目标文件和配置；先 `git apply --check`，出现冲突就停止，不能强制覆盖已有修改。
+正常加载后用实际 Slack 回复验证。上游正式支持这一覆盖后，按实际调用链复核并撤下本地补丁，
+不要跨版本盲目重复应用。
+
+离线回归读取**已应用补丁**的真实上游目录，不写入该目录：
+
+```bash
+python3 hermes/test_memory_notifications_platform.py /path/to/patched/hermes-agent
+```
+
+测试编译两个实际文件并执行原 resolver 与 AST 提取的完整回合装配方法，覆盖 Slack 覆盖、
+其他平台继承、布尔/空值及复用 agent 的下一回合恢复。无关回调使用隔离替身；
+这不等于完整 gateway 或真实 Slack 通知验收，部署后必须另验。
 
 ## 读取历史
 

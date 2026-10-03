@@ -70,7 +70,7 @@ Slack → Hermes 原生 Slack 适配器 / gateway → Agent 回合 → Slack
 | 3. 多 Agent 双向协作已验证 | 按对端及 A→B / B→A 分别记录触发、频道/线程上下文、回复位置/次数和无回环证据 | 单方向成功、用单对结果推断全部对端、代码合并、其他 Agent 的口头确认 |
 
 - Muse：PR #11 durable 入口已合并，Muse 维护 agent 回报实际 hook → agent → send_durable 已加载，Codex 已观察 D/E 实际回复；不能与参考 echo consumer 混淆。Grok：PR #13 互斥保活已合并，Grok 维护 agent 回报已加载且自然保活检查通过；agent_wake/fail-closed 默认和显式 template 保持不变
-- Hermes：PR #14 已合并，兼容实际部署的 836 适配器流收尾路径并修正重复剥除游标；隔离代码验证通过。维护 agent 已核对新插件与 9 项配置落盘，但旧进程仍未重启加载，四方 H 测试尚未运行
+- Hermes：PR #14 已合并并重启加载。H 卡在工具发现，修正实例指引后，H2 中 Muse → Hermes → Grok 自动交棒正确；DOTS 末棒需用户批准后才完成，不能算四方全自动通过。I 的 Grok → Hermes → Muse 不同字段接力全自动通过；随后原生 `/restart` 加载 `reply_in_thread: false`，真实普通私聊已恢复主消息流
 - DOTS：D/E 有界接力已观察到 **Muse↔DOTS、DOTS↔Grok** 的线程双向结果；F/G 补测覆盖 **Muse↔Grok**。F 发现 Muse 同条重复提及，修正 hook 指令后 G 通过；这些结果不代表全连接或通用并发/重投递保证
 - DOTS reference：本轮 39 项离线测试通过只适用于该参考模块（基线 36 项，新增 3 项回归）。它不负责 Slack 认证、事件接收、语义分类、历史获取或发送，不能证明托管 DOTS 的运行时防重，更不保证 exactly-once
 
