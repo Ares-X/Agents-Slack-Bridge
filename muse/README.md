@@ -98,6 +98,8 @@ printf '%s' "$REPLY" |
 - 如果本消息不需要实质回复，使用 `python send_durable.py '<channel>:<ts>' --no-reply --reason '具体原因'`，无需 stdin，且不能混用发送选项。该路径不查询 bot 身份、不调用 Slack；在发送状态锁内确认目标没有任何 `sending` / `uncertain` / `unacked` / `retry_wait` 后，写入带 `disposition=no-reply`、原因和来源证据的 inbox tombstone，并确认文件和目录 fsync。到期的 `retry_wait` 也不得直接静默结束；有发送状态时按原恢复流程处理。
 - 静默完成重复调用保留原原因和证据，重新确认持久化；未知来源、存储失败或损坏不返回成功。compact 在既有七天去重保留期内保留完整 tombstone，包括原因与来源证据。不要用 raw `inbox_ack.py` 代替静默决定。
 - 同一任务需要持续推进时继续接新消息；同一来源最多一条实质回复。真实交接（包括开放讨论和游戏）经显式 `--mention <UID>` 触发下一位，正文的纯文本名字本身不会唤醒对方。
+- 将接收人判断放在实际 hook 的发送步骤开头：本条要求谁回答、审查、合并、修改、决定或反馈，就向谁传一次 `--mention`。对方已被根任务提及或正在讨论，不代表会收到这次交接。只分享信息或最终结果且没有下一步请求时不提及；不要机械地回提原作者。积压消息先按最新任务状态合并判断，已被后续版本处理的旧请求按原因静默完成。
+- `uncertain` 核验缺少关联证据时，agent 不得自行调用 `inbox_store.ack()` / `SendState.resolve()` 或修改状态文件来宣称成功。保留状态与已有证据，在维护入口报告；人工审查是上报边界，不是 agent 自行跳过核验的许可。不要重发正文。
 
 退出码：
 
@@ -165,7 +167,7 @@ Agents-Slack-Bridge/
 - **领取时检查持久完成标记**：`claim()` 在同一临界区（`send_state` EX → `inbox` SH）内检查 inbox 的 ack tombstone；另一个 consumer 已经发送+ack+resolve（删条目）后，拿旧快照的 consumer 再领取会得到 `completed`，直接跳过、绝不发送。已配置的队列缺失或读取失败时拒绝领取，不能把读取失败当作“没有完成记录”。
 - **只有"明确证明未发送"才重试**：`send.py` 用 `RESULT not-sent` / `sent ok: False` 报告死在 API 调用之前或被 API 明确拒绝；超时、连接中断（`RESULT uncertain`）、输出含糊一律视为不确定，走 history 核验，绝不自动重发。
 - **限流持久延期**：`send.py` 收到 HTTP 429 / `ratelimited` / `rate_limited` 后只返回 JSON `{"result":"retry_wait","retry_at":截止时间}`，退出码为 75，本进程不重发。consumer 将该期限持久保存为 `retry_wait`；未到期不发送、不核验、不 ACK，到期后才原子领取新的发送尝试。`Retry-After` 不得因单次进程超时预算被截短；缺失或无效时默认等待 60 秒。重启保留期限，并发只有一个消费者能重新领取，迟到的旧尝试核验不能覆盖延期或新尝试。其他调用 `send.py` 的平台消费层也必须处理退出码 75、保存 `retry_at`，到期前不得重试。连接断开和其他未知结果仍走 uncertain；SDK 自动重试保持关闭。
-- **核验必须五项全中**：是我们自己的 bot（`SLACK_BOT_ID`/`SLACK_BOT_USER_ID` 命中其一）、频道/线程一致、消息时间不早于本次发送尝试（允许 60s 时钟偏差）、全文精确匹配（sha256）、**携带与本次发送尝试相同的 `client_msg_id`**。`client_msg_id` 是每次 claim 生成的唯一 id，随 POST 提交、Slack 在 history 里回显，是唯一能把一条 history 消息关联到"这一次发送尝试"的证据；同身份+同正文+时间窗口不能单独证明成功（30 秒前发过相同正文也会命中）。证明不了就保持 uncertain，3 轮无结论转人工日志；旧版本条目（无 `client_msg_id`）永远无法自动确认。
+- **核验必须五项全中**：是我们自己的 bot（`SLACK_BOT_ID`/`SLACK_BOT_USER_ID` 命中其一）、频道/线程一致、消息时间不早于本次发送尝试（允许 60s 时钟偏差）、全文精确匹配（sha256）、**携带与本次发送尝试相同的 `client_msg_id`**。`client_msg_id` 是每次 claim 生成并随 POST 提交的唯一 id，只有 history 实际回显时才能作本实现的关联证据；不能假定 Slack 每次都会回显。同身份+同正文+时间窗口不能单独证明成功（30 秒前发过相同正文也会命中）。证明不了就保持 uncertain，3 轮无结论转人工日志；旧版本条目或 history 缺少 `client_msg_id` 时都不能自动确认，更不能由 agent 手工清状态替代核验。
 - **ack 抛异常按确认失败处理**：发送成功但 `inbox_ack.py` 子进程崩溃/超时抛异常时，条目记为 `unacked`（只重试 ack），绝不卡在 `sending`。
 - **状态文件损坏不静默**：`send_state.json` 加载时按 primary → `.tmp` → `.bak` 顺序尝试，每个候选都要过严格校验（版本号 == 2、`sends` 为 dict、每条 status 合法；未知版本号绝不"迁移"成空状态）。`.tmp` 是崩溃写一半留下的 fsync 过的**更新**版本，恢复安全；`.bak` 是上一次保存**之前**的旧版本——如果 primary 和 `.tmp` 都不可用而只有 `.bak` 可解析，恢复可能是 stale 的（会丢失已持久化的领取记录、把已发送的消息变回可发送），此时**拒绝恢复**：隔离证据并抛 `StateCorruptError`，consumer 在此期间**拒绝发送**（fail-closed），直到人工恢复经证明安全的副本。全部不可用时隔离为 `send_state.json.corrupt.<毫秒>.<primary|tmp|bak>`（每个来源独立后缀、证据不互相覆盖）并留 `.quarantined` 标记，重启也不许静默变空。
 

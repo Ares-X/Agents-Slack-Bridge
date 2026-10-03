@@ -111,6 +111,7 @@ hermes gateway status
   否则静默拒绝。每一步最多一条实质终稿，走正常 adapter final 后立即结束该回合并等待新事件；必要的接手、澄清、结果返回可继续有界多轮。不要在 terminal `sleep` 长轮询或 raw curl `chat.postMessage` 另发正文；引用旧消息把 @ 写成纯文本名字防二手回环，需要接手时在终稿明确 @ 对方。原生审批入口继续使用。
 - **频道连续协作**：固定 836 默认顶层历史按作者隔离，原生自动补史仅适用于真实 thread。可评估 [自然协作候选补丁](./patches/natural-collaboration-836.patch)，并按 [README](./README.md) 显式配置 workspace:channel 观察范围；候选与离线绿灯不代表已加载或完成真实协作验收。主回复使用 adapter 自动终稿；raw curl 绕过发送工具镜像，不能作为连续 assistant 历史来源。
 - **成功静默**：候选只额外允许配置范围内、通过现有授权的 Slack group bot 回合使用精确 `[SILENT]` 结束且不发正文；普通和 queued 作者逐回合判定。无需回复的 ACK/控制事件可静默，但不能隐藏实质工作、人类请求或失败；不要把事件改成 internal 来绕过授权。
+- **每轮规则加载**：[增量补丁](./patches/collaboration-turn-contract-836.patch) 在固定 836 + PR17 + PR19 的现有 trusted `channel_prompt` 路径为精确 workspace:channel group 注入短协作规则；DM/范围外保持默认。skill 只在新会话自动绑定，文件落盘不能代替运行时加载。新事件及其 queued 回合携带规则，已有会话通过原 prompt cache signature 生效，无需重置会话；已运行/已创建的旧事件不追溯更新。规则要求正文只走 adapter final、修订先说变化点、最新 ts 对账、未收回复 pending；不把旧版表态当新版接受，不凭沉默/自设冻结期宣称共同通过，遵守实际任务共识规则。加载与真实并发验收见 [README](./README.md#每轮协作规则的运行时加载)。
 - **排障**：DM 通频道不通 = `message.channels`/`message.groups` 事件 + `channels:history`/`groups:history` scope + 重装；改 scope/事件必重装
 - **升级后 slash 命令刷新**：`hermes slack manifest --agent-view --write` → App Manifest 页粘贴 → 按提示重装
 
