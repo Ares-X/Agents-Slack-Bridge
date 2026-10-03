@@ -40,8 +40,10 @@ def load_env(path):
 
 
 _ENV = load_env(ENV_PATH) if os.path.exists(ENV_PATH) else {}
-PROXY_URL = _ENV.get("PROXY_URL") or None      # 出站代理，直连留空
-CA_BUNDLE = _ENV.get("CA_BUNDLE") or None      # 自签 CA 路径，默认系统 CA 留空
+# 代理/CA 经 net_config 统一读取（issue #7）：.env > 标准环境变量 > 直连。
+# 仓库通用版不硬编码内网地址，部署值放在 .env，不禁用 TLS 验证。
+from net_config import read_proxy_config
+PROXY_URL, CA_BUNDLE = read_proxy_config(_ENV)
 
 # 多 agent 协作默认：放行其他 bot 的 @mention（自己的消息永远过滤，防自循环）。
 # 可选白名单：.env 里 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（逗号分隔）。

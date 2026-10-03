@@ -351,11 +351,14 @@ def _verify_hold(m, entry, state, bot_id, bot_user_id, why):
     return "uncertain-held"
 
 
-def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
-    mid = m["msg_id"]
-    ch = m["channel"]
-    thread_ts = m.get("thread_ts") or ""
+def _precheck(m, state, bot_id, bot_user_id):
+    """本轮前置检查：返回非 None 表示本轮已处理完毕，调用方直接返回
+    该结果字符串，不再继续。返回 None 表示可以进入领取/发送流程。
 
+    覆盖：retry_wait 未到期 -> 不发送；unacked -> 只重试 ack；
+    uncertain/sending -> 先严格核验，绝不盲目重发。
+    """
+    mid = m["msg_id"]
     # --- retry_wait：到期前不发送；unacked：只重试 ack ---
     entry = state.get(mid)
     if (entry and entry.get("status") == "retry_wait"
@@ -376,30 +379,29 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
             m, entry, state, bot_id, bot_user_id,
             why=("previous attempt unfinished"
                  if entry.get("status") == "sending" else "uncertain result"))
+    return None
 
-    # --- history 降级策略：失败先延迟，3 轮后降级进行并留可见标记 ---
-    hist, herr = channel_history(ch)
-    if herr:
-        n = state.get_hist_deferred(mid) + 1
-        state.set_hist_deferred(mid, n)
-        if n < HISTORY_DEFER_LIMIT:
-            print(f"deferring {mid}: history unavailable "
-                  f"({n}/{HISTORY_DEFER_LIMIT}): {herr}")
-            return "deferred"
-        print(f"WARNING: proceeding degraded for {mid}: history unavailable "
-              f"after {n} attempts: {herr}", file=sys.stderr)
-        degraded_note = (f"[degraded] history unavailable after {n} attempts: "
-                         f"{herr}")
-    else:
-        state.set_hist_deferred(mid, 0)
-        degraded_note = None
 
-    sess = sessions.setdefault(ch, [])
-    if degraded_note:
-        sess.append({"role": "system", "text": degraded_note})
+def deliver_one(m, text, mentions, state, bot_id=None, bot_user_id=None):
+    """单次投递：回复正文由调用方提供，与 handle_one 共享同一套
+    防重复发送状态机。
 
-    # --- 生成、领取、发送 ---
-    text, mentions = normalize_reply(generate_reply(ch, m, sess, hist))
+    handle_one 用它投递模型生成的正文；真实消费链路（hook -> side
+    chat -> agent，见 send_durable.py）用它投递 agent 的真实回复。
+    前置检查、持久领取、限流延期、不确定保持的语义完全一致。
+
+    m 只需要 msg_id / channel / thread_ts（agent 链路不传原文）。
+    mentions 是显式点名的 user id 列表（可为空）。
+    返回结果字符串，与 handle_one 相同。
+    """
+    r = _precheck(m, state, bot_id, bot_user_id)
+    if r is not None:
+        return r
+    mid = m["msg_id"]
+    ch = m["channel"]
+    thread_ts = m.get("thread_ts") or ""
+
+    # --- 领取、发送 ---
     # hash 必须对最终发出的正文计算（含 send.py 追加的显式 mention），
     # 否则核验时全文永远对不上。
     thash = text_hash(wire_text(text, mentions))
@@ -435,15 +437,9 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
     if result == "ok":
         if _ack_safe([mid]):
             state.resolve(mid)
-            sess.append({"role": "user", "text": m["text"]})
-            sess.append({"role": "assistant", "text": text})
-            sessions[ch] = sess[-40:]
             return "replied"
         # 发送成功但确认失败：记 unacked，只重试 ack
         state.set_unacked(mid)
-        sess.append({"role": "user", "text": m["text"]})
-        sess.append({"role": "assistant", "text": text})
-        sessions[ch] = sess[-40:]
         return "sent-unacked"
     if result == "fail":
         # 已证明未发送：释放 claim，下轮干净重试
@@ -463,6 +459,49 @@ def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
                         expected_client_msg_id=claim_entry.get("client_msg_id"))
     print(f"send result uncertain for {mid}, holding for verification")
     return "uncertain-held"
+
+
+def handle_one(m, sessions, state, bot_id=None, bot_user_id=None):
+    mid = m["msg_id"]
+    ch = m["channel"]
+
+    # 前置检查（顺序与原来一致：先于 history，避免 retry_wait 等
+    # 已决状态多一次 history 调用）。
+    r = _precheck(m, state, bot_id, bot_user_id)
+    if r is not None:
+        return r
+
+    # --- history 降级策略：失败先延迟，3 轮后降级进行并留可见标记 ---
+    hist, herr = channel_history(ch)
+    if herr:
+        n = state.get_hist_deferred(mid) + 1
+        state.set_hist_deferred(mid, n)
+        if n < HISTORY_DEFER_LIMIT:
+            print(f"deferring {mid}: history unavailable "
+                  f"({n}/{HISTORY_DEFER_LIMIT}): {herr}")
+            return "deferred"
+        print(f"WARNING: proceeding degraded for {mid}: history unavailable "
+              f"after {n} attempts: {herr}", file=sys.stderr)
+        degraded_note = (f"[degraded] history unavailable after {n} attempts: "
+                         f"{herr}")
+    else:
+        state.set_hist_deferred(mid, 0)
+        degraded_note = None
+
+    sess = sessions.setdefault(ch, [])
+    if degraded_note:
+        sess.append({"role": "system", "text": degraded_note})
+
+    # --- 生成正文（参考实现只是 echo；生产换真实模型，见 README §2.4）---
+    text, mentions = normalize_reply(generate_reply(ch, m, sess, hist))
+
+    # --- 领取、发送、确认：与 agent 链路（send_durable.py）共享 deliver_one ---
+    result = deliver_one(m, text, mentions, state, bot_id, bot_user_id)
+    if result in ("replied", "sent-unacked"):
+        sess.append({"role": "user", "text": m["text"]})
+        sess.append({"role": "assistant", "text": text})
+        sessions[ch] = sess[-40:]
+    return result
 
 
 def main():
