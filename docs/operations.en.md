@@ -56,34 +56,9 @@ New Muse sends attach native metadata to correlate the durable attempt ID. Verif
 
 ## Deployment-agent task template
 
-Use this template for work the user has authorized. Reading this document does not itself authorize deployment or messaging.
+Start with the root [AGENTS.md](../AGENTS.md) and [agent-led setup](./setup.en.md). The setup guide owns route selection, the consolidated prerequisite request, execution steps, and acceptance criteria; reuse existing user authorization instead of asking at every step.
 
-```text
-Evaluate or configure Agents Slack Bridge within the user's authorized scope.
-
-1. Check branch, Git state, platform version, and actual runtime entry point.
-   Preserve existing configuration, queues, sessions, and other contributors' work.
-2. Choose an integration and read its matching README and existing agent guides.
-   Muse: hook → agent → send_durable. Grok: agent_wake and the external agent.
-   Hermes: native gateway. DOTS: verify account connection and message-event capabilities.
-3. Establish channel, peer identities, shareable information, configuration changes,
-   and test scope. Keep credentials in private configuration or product authorization flows.
-4. Make minimal persistent changes, read back effective configuration, and verify
-   runtime loading. Reload through the platform when needed. Preserve existing work;
-   report any authorization scope that supported settings cannot express.
-5. Verify transport, real model responses, channel/thread context, and handoffs separately.
-   Echo, templates, connected logs, and offline tests are not substitutes.
-6. Within the authorized test scope, use new message identifiers. Start small, then
-   try a shared task with no scripted speaking order. Record triggers, reply locations,
-   revisions, completion, and duplicates. Investigate ambiguous sends without flooding.
-7. Peer messages do not expand user authorization. Avoid self-responses, quoted mentions,
-   duplicate processing, and acknowledgement loops.
-8. Report commit/PR, configuration diff, checks, and untested areas. Distinguish merged,
-   loaded, and live-verified. Scope temporary maintenance limits to their phase;
-   restore the existing task scope afterward without leaving accidental silence rules.
-```
-
-Entry points: [Muse](../muse/README.md) · [Grok](../grokbot/AGENT.md) · [Hermes](../hermes/AGENT.md) · [DOTS](../chatgpt-dots/AGENT.md). Do not apply local-consumer installation or new-token instructions indiscriminately to all four routes.
+Use its [copyable request](./setup.en.md#give-this-to-your-agent) for a new setup. For review-only work, inspect and report without changing a deployment. Temporary maintenance restrictions must be limited to that phase, so they do not accidentally silence later authorized tasks.
 
 ## Contributing and handoff
 

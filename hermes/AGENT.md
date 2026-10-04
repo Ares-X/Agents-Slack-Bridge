@@ -1,6 +1,6 @@
 # AGENT.md — 给任意 agent 的 Hermes×Slack 配置指令
 
-把本文件整段复制给任意 agent（Claude Code / Codex / 另一个 Hermes / 其他 CLI agent），它就能端到端把 Hermes Agent 接入 Slack。规则和步骤都是自包含的。
+供具备目标环境访问能力的 agent 配置 Hermes。先读顶层 [AGENTS.md](../AGENTS.md) 与[统一配置流程](../docs/setup.md)：检查现状，一次收集缺失的人工前提，再执行配置和验收；已有授权不重复询问。配置执行者不一定是 Hermes，路线取决于被接入的目标。
 
 ---
 
@@ -14,7 +14,7 @@
    无 `user_id` 的 bot 帖在 `allow_bots: mentions` + 明确 @ 下仍能进（授权细节见仓库 README「授权模型」，
    按 hermes-agent `b3059921bc` 核对）。
 4. 改 Slack App 的 scope/事件订阅后**必须重装 App** 才生效——提醒用户。
-5. 只在 Hermes 主目录（`~/.hermes`）和用户指定的目录操作；不要碰无关配置。
+5. 只在实际 Hermes 实例目录和用户指定的目录操作；默认目录是 `~/.hermes`，但先核实当前实例的配置来源、服务用户与加载路径。不要碰无关配置。
 6. 多 bot 频道：`allow_bots: mentions` 是安全默认，绝不建议 `all`（回环风险）。`allow_bots` 只管
    「bot 签名的消息受不受理」，不是身份白名单，也不是绝对防回环保证（还有 own-echo 丢弃、bot loop
    guard 兜底）。
@@ -23,15 +23,11 @@
 
 ### A. 已装 Hermes
 
-跳到步骤 2。
+检查安装版本、实际 executable、模型/provider 登录、现有 gateway 与 Slack App。复用已有连接和服务；需要新建或更新 App 时仍执行步骤 1 生成 manifest。只跳过已有且已核实完成的步骤，不重复安装或启动 gateway。
 
 ### B. 未装 Hermes
 
-```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-```
-
-（装完重开 shell 或 `source ~/.bashrc` 让 `hermes` 进 PATH。）
+把安装权限、目标路径和模型/provider 登录纳入一次前提清单。按 [Hermes 官方仓库](https://github.com/NousResearch/hermes-agent)当前安装说明完成所选环境的安装，核对 `hermes` 实际路径及可用模型；不把某一种 shell 初始化文件或 systemd 当跨平台前提。没有模型访问能力时，不能仅凭 Slack connected 宣称 agent 已可用。
 
 ## 步骤
 
@@ -45,16 +41,18 @@ hermes slack manifest --agent-view --write   # 写到 ~/.hermes/slack-manifest.j
 
 ### 2. 建 Slack App
 
+已有合适 App 时比较并更新必要字段，保留其他功能，不另建重复 App。用户必须处理的安装/授权动作与缺失凭据集中交接，agent 能查询的 ID 自己查询。
+
 1. <https://api.slack.com/apps> → **Create New App** → **From an app manifest**
 2. 选 workspace，粘贴 manifest 全文 → Create
 3. **Basic Information → App-Level Tokens → Generate Token**：勾 `connections:write` → 复制 `xapp-` token
 4. **Install App** → Install to Workspace → 复制 `xoxb-` token
-5. 让用户在 Slack 里查自己的 Member ID：头像 → Full profile → ⋮ → Copy member ID（`U` 开头）
+5. 通过授权连接核实用户 Member ID；没有可用查询入口才请用户复制该 ID（`U` 开头）
 
 ### 3. 写配置（token 不回显）
 
 ```bash
-# ~/.hermes/.env 追加（chmod 600）：
+# 默认实例 ~/.hermes/.env 的配置意图；实际修改时按键合并，不重复追加或回显值（chmod 600）：
 SLACK_BOT_TOKEN=<xoxb-，从安装页复制>
 SLACK_APP_TOKEN=<xapp-，从 App-Level Tokens 复制>
 SLACK_ALLOWED_USERS=<用户的 Member ID>
@@ -62,7 +60,7 @@ SLACK_HOME_CHANNEL=<可选：cron 默认频道 C…>
 ```
 
 ```bash
-# ~/.hermes/config.yaml 追加（顶层键，与 platforms: 同级不存在时新建）：
+# 合并到实际 config.yaml 的现有 platforms.slack；保留其他平台，不生成重复 YAML 键：
 ```
 
 ```yaml
@@ -78,14 +76,20 @@ platforms:
 
 或交互式：`hermes gateway setup` → 选 Slack。
 
+然后核对已授权频道、对端 user ID、对应版本的授权判断、来源线程回复和真实上下文加载。`home_channel` 是默认投递位置，不是频道访问白名单。若需要仓库中的 836 补丁，先按 [README](./README.md) 检查精确上游版本、前置补丁顺序、脏改及 `git apply --check`；不把示例候选字段直接当作所有版本都生效的配置。协作指引必须进入实际每轮入口，文件存在不代表已加载。
+
 ### 4. 启动
+
+先检查当前服务负责人和已有进程。以下用于尚无 gateway 的适用安装；已有实例使用该版本受支持的加载/重启方式，不再并行启动前台进程。
 
 ```bash
 hermes gateway            # 前台跑，看日志确认 slack adapter connected
-# 稳了再装服务：
+# 前台检查结束后，停止该检查实例；按实际 OS/版本支持安装或复用服务：
 hermes gateway install
 hermes gateway status
 ```
+
+核对最终服务的实际运行路径、配置、重启策略与新加载进程。不要假定所有 OS 都是 systemd；保留在途任务、会话、审批及其他平台工作。
 
 ### 5. 验收（全部通过才算完）
 
@@ -94,10 +98,12 @@ hermes gateway status
 3. 频道里 `@Hermes Agent hello` → bot 回（thread 或顶层，按 reply_in_thread）
 4. `python3 channel_history.py <channel_id> 5` 能列出消息（token 从 `~/.hermes/.env` 自动取）
 5. `hermes gateway status` 显示 slack 已连接
+6. 依照[统一验收清单](../docs/setup.md#4-验收实际效果)，确认模型实际使用此前频道事实和线程修正，再分别验收 A→B 与 B→A 的自动触发、正确回复位置和条数
+7. 用户要求自然协作时执行一次开放任务，观察自主审查、修订、共同终稿和结束；没有可用对端时报告单端已验收、协作 `NOT_EXERCISED`
 
 ### 6. 交付报告
 
-向用户报告：App 名、两个 token 已落盘（不回显）、gateway 状态、验收 1–4 结果、cron 示例一条。不输出任何 token。
+按[统一交付清单](../docs/setup.md#5-交付可用结果)报告：目标版本/ref、私有配置位置、加载证据、实际验收结果与对端方向、状态/日志/重载方法、剩余阻塞。不输出 token，不把保存配置或历史 CLI 成功等同于真实协作通过；不额外创建未要求的 cron。
 
 ## 速查（agent 常用）
 

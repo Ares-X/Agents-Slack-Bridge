@@ -2,13 +2,14 @@
 
 本目录是 **Grok Bot / Cursor Grok Bot** 用的 Slack 桥接包。Socket Mode 出站长连接，无需公网入口。
 
-与 `muse/` 的差异：
+本路线的行为（Muse 也默认接收其他 bot 的提及）：
 - **默认允许其他 bot 的 @mention**（多 agent 频道友好；仅丢弃自己）
 - **~5s 本地 consumer**（或可选 `pending.json` + agent `@every 5m` fallback）
 - **默认频道顶层回复**（`REPLY_IN_THREAD=0`），同伴 agent 看得见；本 bot 线程跟帖（`message.channels`，无需 @）强制同线程回
 - **先整体核对相关 pending 与当前任务，再拉频道/线程完整正文**（失败记录缺口，不假装已读）
 
 > 给另一个 agent 的完整配置清单见 **[AGENT.md](./AGENT.md)**（默认按多 agent 协作配置）。
+> 首次接入先读顶层 [AGENTS.md](../AGENTS.md) 和[统一配置流程](../docs/setup.md)，检查已有配置并一次收集缺失前提。
 > 唤醒：[wakeup.md](./wakeup.md) / [AGENT_WAKE.md](./AGENT_WAKE.md)；@-peer 常驻规则：[PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)。
 
 ## 多 agent 协作默认
@@ -17,18 +18,22 @@
 |---|---|---|
 | 其他 bot @ 本 bot | **允许**（仅丢弃自己） | 勿改回「丢弃全部 bot」；收紧用 `ALLOWED_BOT_*` |
 | 回复前读上下文 | **是** | `channel_history.py` / consumer 内置；失败要可见 |
-| 回复位置 | **频道顶层**（`REPLY_IN_THREAD=0`） | `1` = 跟帖；`kind=thread_reply` 始终同线程 |
+| 回复位置 | 无来源线程时默认**频道顶层**（`REPLY_IN_THREAD=0`） | `1` = 跟帖；已有线程 mention 和 `kind=thread_reply` 始终同线程 |
 | 协作礼仪 | 有用回复或带原因静默完成；仅具体请求下一步才 @ peer；不 @ 自己 | 允许已授权任务多轮讨论，通知/确认不必继续唤醒；每源最多一次回复，不是强制各回一次 |
 
 ## 快速开始
+
+以下仅用于新部署；已有实例保留 `.env`、队列及运行状态，使用原 supervisor 加载，不重复启动。先完成 [AGENT.md](./AGENT.md) 中的 Slack App 与真实 webhook/agent 接线。
 
 ```bash
 git clone https://github.com/Ares-X/Agents-Slack-Bridge.git
 cd Agents-Slack-Bridge/grokbot
 
-cp .env.example .env && chmod 600 .env   # 填 token；保持 REPLY_IN_THREAD=0；永不提交
+test -e .env || cp .env.example .env
+chmod 600 .env   # 合并 token 与 REPLY_MODE=agent_wake；永不提交
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 
+./venv/bin/python wake_agent.py --check   # 仅检查私有 webhook.env 的 URL/key 是否存在
 ./venv/bin/python bridge.py &            # Socket Mode：durable 入队后再 ACK
 ./venv/bin/python consumer/poll_consumer.py   # ~5s；模式见下，不是默认模板
 ```
@@ -51,7 +56,7 @@ consumer **不是**默认模板 stub（fail-closed）：
 | 私信 / @mention 出现在 `inbox.jsonl` | 桥接收正常 | Agent 集成完成 |
 | consumer 在显式 `REPLY_MODE=template` 时打出 `replied in …` | **模板 stub** 回过一次 | 默认模式；已接线 Grok / LLM |
 | `channel_history` 有真实行 | 上下文可读 | — |
-| 换成真实 `generate_reply()` / wake agent 且仍用 `history` | **Agent 集成完成** | — |
+| 真实入站自动触发已加载的模型/agent，使用历史并正确回复、持久完成 | **所测单端路线已验收** | 所有对端、方向或自然协作均已通过 |
 
 ## 文件树
 
@@ -119,26 +124,24 @@ grokbot/
 
 ## Keepalive
 
-`keepalive.sh` 只在 bridge / consumer 不在时拉起它们。不截断日志，不碰队列。脚本里没有 sleep。
+`keepalive.sh` 是 Linux 备用监督入口，只在 bridge / consumer 不在时拉起它们；不截断日志、不碰队列，启动后有短暂可见性等待。已有 systemd 等 supervisor 时不再并行使用它。使用前核对脚本要求的 Bash、`/proc`、`flock`、解释器路径与实际部署目录；通过 `KEEPALIVE_ROOT` 指定已确认目录，不把示例路径当作自己的部署。
 
-**30 秒循环**和 **5 分钟 agent 例程**调用的是同一个脚本，不要在例程里自己起 python：
+仅在选择该备用监督方式时，外层循环与 agent 例程调用同一个脚本，不在例程里自己起 python。先把 `KEEPALIVE_ROOT` 设为已核实的绝对部署目录：
 
 ```bash
-while true; do /workspace/slack-bridge-grokbot/keepalive.sh >> keepalive.log 2>&1; sleep 30; done
+: "${KEEPALIVE_ROOT:?Set the verified deployment directory}"
+export KEEPALIVE_ROOT
+cd "$KEEPALIVE_ROOT"
+while true; do "$KEEPALIVE_ROOT/keepalive.sh" >> keepalive.log 2>&1; sleep 30; done
 ```
 
 锁被别人拿着时，`flock -w 20 -E 11` 最多等 20 秒，打一行日志并以 **0** 退出（下一拍再试）。`flock` 不在 `PATH`、锁文件打不开、或 `flock` 返回别的状态（用法错误 / I/O，例如 **64**）会写明原因并以 **非 0** 退出，不会假装「已经等了 20 秒」。
 
 进程算「已在跑」必须同时满足：`argv0` 以 `/venv/bin/python` 结尾、某个参数等于该脚本、cwd 是部署根。不是 `pgrep -f`。shell 命令行里只是提到 `bridge.py` 不算。
 
-### 本分支 vs 正在跑的进程
+### 核对实际加载
 
-| | 代码 | flock |
-|---|---|---|
-| 本 PR（`fix/grokbot-keepalive` 的 `grokbot/keepalive.sh`） | cwd 身份 + `flock -E` | 有 |
-| 正在跑的 `/workspace/slack-bridge-grokbot/keepalive.sh` | 旧脚本（cmdline 匹配，无 cwd 锁） | **没有** |
-
-30 秒循环现在执行的是部署目录里的**旧脚本**。本 PR **还没有**换到运行中的进程上；合并或拷贝之前，跑着的 keepalive 不会因为这支分支而改变。
+仓库文件不能说明你的运行进程使用哪个版本。核对实际 supervisor、解释器、脚本路径与代码 ref/hash，再检查 listener 和 consumer 健康。保留队列与历史 uncertain 状态；需要更新时通过已有服务负责人加载，不新开一套循环。
 
 ## 测试
 

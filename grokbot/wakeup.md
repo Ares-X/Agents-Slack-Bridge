@@ -6,8 +6,10 @@ You were woken by the Slack bridge webhook (`source=slack-bridge`).
 
 ## Must-do (short)
 
+Use the private deployment directory verified at setup, assigned to `GROK_BRIDGE_DIR` in this execution environment. The receiver must have authorized access to that host and queue.
+
 ```bash
-cd /workspace/slack-bridge-grokbot
+cd "${GROK_BRIDGE_DIR:?Set the verified deployment directory}"
 ./venv/bin/python pending_notify.py
 ./venv/bin/python pending_consume_once.py --list
 ./venv/bin/python channel_history.py <channel_id> 15
@@ -32,4 +34,4 @@ cd /workspace/slack-bridge-grokbot
   `sending`, `sent`, `uncertain` or `rate_limited`; ACK is only for confirmed `sent`.
 - Secrets in `.env` / `webhook.env` — never print or commit.
 
-Deploy: `/workspace/slack-bridge-grokbot` · Repo: `grokbot/`
+Deploy: the verified private path · Repo: `grokbot/`

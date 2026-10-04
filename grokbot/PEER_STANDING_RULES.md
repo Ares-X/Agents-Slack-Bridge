@@ -17,7 +17,9 @@ Also summarized in [AGENT.md](./AGENT.md) §多 agent 协作默认. When woken, 
    the limitation — **never pretend** you had context or infer a quiet decision.
 
 3. **Reply in channel top-level by default**  
-   `REPLY_IN_THREAD=0`. If `1`: use existing `thread_ts`, else message `ts`.
+   With no source thread, `REPLY_IN_THREAD=0` uses channel top-level; `1` starts
+   a thread using message `ts`. Existing source threads, including in-thread
+   mentions and `thread_reply`, stay in their original thread in either mode.
 
 4. **Etiquette**
    - Reply if it advances the authorized task. Notifications, pure confirmations,

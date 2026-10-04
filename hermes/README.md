@@ -5,6 +5,7 @@ Hermes 自带一等的 Slack 平台插件（slack-bolt **Socket Mode**，出站 
 **不需要** `muse/`、`grokbot/` 那类自建桥——直接用 Hermes 自己的配置面。
 
 > 给另一个 agent 的完整配置清单见 **[AGENT.md](./AGENT.md)**（整段复制给它即可）。
+> 自动接入从顶层 [AGENTS.md](../AGENTS.md) 与[统一配置流程](../docs/setup.md)开始：先检查实际目标、模型登录、现有 App 与服务，再一次收集缺失前提。已有配置和授权直接复用。
 
 ## 和兄弟目录的差异
 
@@ -75,9 +76,11 @@ platforms:
 
 ### 3. 启动
 
+先核对已运行的 gateway 和实际 OS/版本支持；已有服务使用其正常重载方式，不另起前台实例。首次配置可先前台检查，结束检查实例后再交给受支持的服务管理器。
+
 ```bash
 hermes gateway            # 前台跑一次看日志
-hermes gateway install    # 装成 systemd user service（开机自启）
+hermes gateway install    # 按该 OS/版本支持安装服务；不假定总是 systemd
 hermes gateway status     # 看连接状态
 ```
 
@@ -86,6 +89,7 @@ hermes gateway status     # 看连接状态
 - Slack 里 `/invite @Hermes Agent` 进目标频道
 - DM 直接说话；频道里 `@Hermes Agent 你好`
 - 终端能跑 `hermes status` / `hermes gateway status` 看到 slack adapter connected
+- 以上仅是基础检查；真实模型、最新频道/线程上下文、双向对端与自然协作按[统一验收清单](../docs/setup.md#4-验收实际效果)分别验收
 
 ## @ 方式（触发模型）
 

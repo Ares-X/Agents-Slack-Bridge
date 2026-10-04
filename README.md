@@ -4,11 +4,13 @@
 
 **English** · [简体中文](./README.zh-CN.md)
 
-[Collaboration capabilities](#how-far-can-the-agents-collaborate) · [Choose an integration](#choose-an-integration) · [Get started](#get-started) · [Validation](./docs/validation.en.md)
+[Agent-led setup](#get-started) · [Collaboration capabilities](#how-far-can-the-agents-collaborate) · [Choose an integration](#choose-an-integration) · [Validation](./docs/validation.en.md)
 
 Use Slack as a shared workspace for AI agents. Start a task through a direct message or native mention, let agents from different platforms read the relevant context, ask questions, review and revise, and deliver a shared result.
 
 This repository contains **4 integration guides across 3 architectures**: local bridge implementations, native Hermes configuration and patches, and a hosted DOTS connection guide. Each route uses its own model and runtime; choose the one you need.
+
+**Here to configure an agent? Start with [AGENTS.md](./AGENTS.md).** The agent should identify its target runtime, inspect existing setup, ask once for missing prerequisites, then configure, load, and verify the integration. The [setup workflow](./docs/setup.en.md) spells out what the agent handles and what needs the user.
 
 ## How far can the agents collaborate?
 
@@ -38,18 +40,15 @@ Muse / Grok use outbound Socket Mode connections without a public inbound endpoi
 
 ## Get started
 
-1. **Choose a route from the table.** Inspect an existing deployment before changing its configuration. For a new setup, clone the repository:
+Send the repository URL to the agent you want connected, with this instruction:
 
-   ```bash
-   git clone https://github.com/Ares-X/Agents-Slack-Bridge.git
-   cd Agents-Slack-Bridge
-   ```
+> Set up this repository for my agent. Read the root AGENTS.md, identify the target runtime, and inspect existing configuration. Ask me once for all missing prerequisites and human-only actions; never ask for secrets in chat. Then complete configuration, load it, and verify real responses and collaboration in the agreed Slack channel. Preserve existing work and report any blockers with evidence.
 
-2. **Connect one agent using its guide.** Confirm the workspace, channel, allowed peers, and actual model entry point. Keep credentials in private configuration.
+The agent follows [agent-led setup](./docs/setup.en.md): **discover → collect missing prerequisites → configure → load → verify**. It should handle IDs, configuration edits, real model/hook wiring, supervision, and tests wherever its authorized tools allow. The user supplies only missing choices, consent, secure credential entry, or unavailable account access.
 
-   Muse's reference poll consumer defaults to echo. Grok's `agent_wake` needs an external agent, while its template mode is explicitly selected. Verify message receipt and real agent responses separately.
+This is a workflow for a capable agent, not a universal one-click installer. Muse still needs a real model consumer/hook; Grok needs an actual agent wake receiver; Hermes needs a working model and compatible gateway; DOTS needs account-supported events. Slack/admin authorization may require user interaction. If a prerequisite is absent, the agent must name it rather than report an echo as success. Fresh automatic setup across all platforms remains unverified.
 
-3. **Progress from one message to a shared task.** Test a DM or mention, then thread routing, context, and handoffs in both directions before trying an open discussion. See the [acceptance layers](./docs/validation.en.md#acceptance-layers).
+For manual setup, use the integration table and the same [acceptance checklist](./docs/setup.en.md#4-verify-the-intended-behavior).
 
 ### Try a shared task
 
@@ -73,6 +72,7 @@ Reproduce the acceptance checks in your own environment, including real agent wi
 
 | Document | Covers |
 |---|---|
+| [Agent entry point](./AGENTS.md) · [Setup workflow](./docs/setup.en.md) | Route selection, one prerequisite handoff, configuration, loading, and acceptance |
 | [Muse](./muse/README.md) / [Grok Bot](./grokbot/README.md) | Local bridges, real agent wiring, delivery and recovery |
 | [Hermes](./hermes/README.md) | Native gateway, authorization, mention plugin, and version-specific patches |
 | [ChatGPT DOTS](./chatgpt-dots/README.md) | Hosted connections, event capabilities, and configuration scope |
