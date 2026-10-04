@@ -1,72 +1,84 @@
 # Agents Slack Bridge
 
-**让 Muse、Grok Bot、Hermes 和 ChatGPT DOTS 在 Slack 中沟通与协作。**
+**Connect Muse, Grok Bot, Hermes, and ChatGPT DOTS for collaboration in Slack.**
 
-**简体中文** · [English](./README.en.md)
+**English** · [简体中文](./README.zh-CN.md)
 
-[选择接入方式](#选择接入方式) · [开始使用](#开始使用) · [协作与运维](./docs/operations.md) · [验证记录](./docs/validation.md)
+[Collaboration capabilities](#how-far-can-the-agents-collaborate) · [Choose an integration](#choose-an-integration) · [Get started](#get-started) · [Validation](./docs/validation.en.md)
 
-把 Slack 作为多个 AI agent 的共同工作空间：通过私信或原生提及发起任务，让不同平台的 agent 读取相关上下文、互相提问、审查和修订，最后交付共同结果。
+Use Slack as a shared workspace for AI agents. Start a task through a direct message or native mention, let agents from different platforms read the relevant context, ask questions, review and revise, and deliver a shared result.
 
-本仓库提供 **4 种接入指南、3 类架构**，包括本地桥接代码、Hermes 原生接入配置与补丁，以及 DOTS 托管连接指南。各路线复用自己的模型与运行环境，按需选择。
+This repository contains **4 integration guides across 3 architectures**: local bridge implementations, native Hermes configuration and patches, and a hosted DOTS connection guide. Each route uses its own model and runtime; choose the one you need.
 
-## 可以做什么
+## How far can the agents collaborate?
 
-- **在 Slack 中找 agent**：通过私信、频道提及和相关线程交互。
-- **让 agent 共同完成任务**：支持必要的原生提及交接、最新上下文读取和多轮修订。
-- **让对话在完成后停下来**：合并过时待办，对无新动作的确认消息静默处理，保留处理原因。
-- **保留消息处理证据**：本地桥接路线提供持久队列、去重和发送状态管理；发送结果不明时保留状态，避免盲目重发。
+**Demonstrated level: a single human brief can lead to a self-organized, multi-agent discussion, peer review, iterative revisions, and a shared final result.** With the integrations configured, the agents can continue the task by mentioning one another; the user does not need to relay every message or prescribe the speaking order.
 
-## 选择接入方式
+| Workflow | What the agents can do | Evidence |
+|---|---|---|
+| Direct assistance | Answer a native channel mention, or a DM where supported, using relevant task context | Channel replies observed from all four agents; DM support depends on the route and account |
+| Peer handoff | Ask another agent a question, request a review or next step, and incorporate its reply in the channel or task thread | Bidirectional handoffs tested across the four-agent deployment |
+| Open group discussion | Propose alternatives, choose roles and a writer, challenge omissions, withdraw older proposals, and revise together | Four agents completed an open text-design task without manual prompting between turns or a scripted relay |
+| Shared result and completion | Have one writer integrate accepted feedback, state unresolved issues, and finish without acknowledgement loops | Shared final version delivered; one redundant summary followed, with no continued loop |
 
-| Agent | 接入方式 | 需要准备 | 入口 |
+The agents retain their own models, tools, sessions, and permissions. They build shared task context by reading the relevant Slack messages and threads. Planning and judgment happen in those agents; the integrations provide the message paths and delivery handling.
+
+This can support workflows such as discussing a plan, reviewing a proposal, or asking a tool-enabled peer to implement and check a change. **Actual code edits, tests, deployments, and other actions depend on each agent's existing tools and user authorization.** End-to-end unattended software delivery has not been established by the collaboration test.
+
+## Choose an integration
+
+| Agent | Integration | Prerequisites | Start here |
 |---|---|---|---|
-| **Muse** | 本地 Socket Mode bridge → 队列 → hook / agent | Python 环境、Slack App、实际 agent 消费入口 | [部署指南](./muse/README.md) |
-| **Grok Bot** | 本地 Socket Mode bridge → 队列 → `agent_wake` | Python 环境、Slack App、外部 agent webhook | [部署指南](./grokbot/README.md) · [Agent 配置清单](./grokbot/AGENT.md) |
-| **Hermes** | Hermes 自带 Slack gateway / 平台适配器 | 已安装的 Hermes、Slack App、对应版本配置 | [部署指南](./hermes/README.md) · [Agent 配置清单](./hermes/AGENT.md) |
-| **ChatGPT DOTS** | 托管 Slack 连接与消息事件订阅 | 当前账号可用的 Slack 连接及事件能力 | [接入指南](./chatgpt-dots/README.md) · [Agent 配置清单](./chatgpt-dots/AGENT.md) |
+| **Muse** | Local Socket Mode bridge → queue → hook / agent | Python environment, Slack App, real agent consumer | [Setup guide](./muse/README.md) |
+| **Grok Bot** | Local Socket Mode bridge → queue → `agent_wake` | Python environment, Slack App, external agent webhook | [Setup guide](./grokbot/README.md) · [Agent checklist](./grokbot/AGENT.md) |
+| **Hermes** | Hermes' native Slack gateway / platform adapter | Installed Hermes, Slack App, configuration for that version | [Setup guide](./hermes/README.md) · [Agent checklist](./hermes/AGENT.md) |
+| **ChatGPT DOTS** | Hosted Slack connection and message event subscription | Slack connection and event capabilities available to the account | [Integration guide](./chatgpt-dots/README.md) · [Agent checklist](./chatgpt-dots/AGENT.md) |
 
-Muse / Grok 的 Socket Mode 使用出站连接，无需公网接收入口。Hermes 使用自己的 gateway。DOTS 路线依赖账号与组织策略，本目录提供社区指南，没有本地安装器；其配置示例也不是官方可导入格式。
+Muse / Grok use outbound Socket Mode connections without a public inbound endpoint. Hermes uses its own gateway. The DOTS route depends on account capabilities and organization policy: it is a community guide, has no local installer, and its example configuration is not an official import format. The integration-specific guides linked above are currently in Chinese.
 
-## 开始使用
+## Get started
 
-1. **选择上表中的路线。** 已有部署先检查当前配置；首次使用可克隆仓库：
+1. **Choose a route from the table.** Inspect an existing deployment before changing its configuration. For a new setup, clone the repository:
 
    ```bash
    git clone https://github.com/Ares-X/Agents-Slack-Bridge.git
    cd Agents-Slack-Bridge
    ```
 
-2. **按对应指南接入一个 agent。** 确认工作区、频道、允许协作的对端，以及实际模型入口。凭据保留在私有配置中。
+2. **Connect one agent using its guide.** Confirm the workspace, channel, allowed peers, and actual model entry point. Keep credentials in private configuration.
 
-   Muse 的参考 poll consumer 默认是 echo；Grok 的 `agent_wake` 需要外部 agent 接线，模板仅在显式选择时启用。桥接收到消息与真实 agent 能够作答，需要分别验证。
+   Muse's reference poll consumer defaults to echo. Grok's `agent_wake` needs an external agent, while its template mode is explicitly selected. Verify message receipt and real agent responses separately.
 
-3. **从单条消息验证到共同任务。** 先测试私信或提及，再确认线程路由、上下文和双向交接，最后尝试开放讨论。具体标准见[分层验收](./docs/validation.md#分层验收)。
+3. **Progress from one message to a shared task.** Test a DM or mention, then thread routing, context, and handoffs in both directions before trying an open discussion. See the [acceptance layers](./docs/validation.en.md#acceptance-layers).
 
-### 试一次共同任务
+### Try a shared task
 
-在已配置的协作频道中，用 Slack 的提及菜单选中参与者，再发送：
+In a configured collaboration channel, select the participants using Slack's mention menu, then send:
 
-> 一起设计一个三分钟、只用 Slack 文字就能玩的破冰游戏。请自行分工，互相指出规则中的问题并修订，选一位提交共同终稿；未解决的分歧请注明。只设计，不开局，完成后停止讨论。
+> Design a three-minute icebreaker that uses only text in Slack. Divide the work yourselves, identify and fix problems in each other's rules, and choose one writer to submit the shared final version. State any unresolved disagreements. Design it without starting the game, and stop discussing when finished.
 
-发言顺序和执笔者由 agent 自行协商。需要对方行动时原生提及对方；纯报告、引用和感谢不继续点名。更多规则见[协作与运维](./docs/operations.md)。
+The agents choose their own speaking order and writer. Use a native mention when asking a peer to act; reports, quotations, and thanks do not need another mention. See the [collaboration rules](./docs/operations.en.md).
 
-## 验证情况
+## Tested scope and limits
 
-2026-10-04，一次已配置的四 agent 部署完成了开放任务测试：自主提案、交叉审查与修订，形成共同终稿，期间没有人工催答或固定接力。Muse 的后续独立测试确认了单次发送、回执关联与持久 ACK。
+On **2026-10-04**, Muse, Grok Bot, Hermes, and DOTS designed a text-only Slack game together and reached a shared final version in **6 min 07 sec**. They chose the writer and corrected missing rules through peer feedback. A separate Muse task verified one send, matching receipts, and a durable ACK. These observations come from one configured deployment; the game itself was not run.
 
-这些结果针对该次部署。响应延迟、托管账号能力、版本兼容和故障恢复仍需在自己的环境验证；不能据此承诺任意并发场景或 exactly-once。测试范围、历史记录和已知限制集中在[验证记录](./docs/validation.md)。
+- **Human control remains in place.** The user defines the task and allowed scope. Peer messages do not grant new permissions, and actions that require approval still require it. The demonstrated autonomy is the conversation and revision process within that scope.
+- **Timing and scale are bounded by the runtime.** Separate single-agent checks took 36 sec and 137 sec end to end. These are observations, not latency targets. The test covered four participants in one channel; arbitrary concurrency, larger groups, and long-running unattended work remain unverified.
+- **Delivery has explicit uncertainty.** Local bridges retain queues and send state to prevent blind resends. Missing receipt evidence can leave a message awaiting resolution. Neither these tests nor the hosted routes establish a universal exactly-once guarantee.
 
-## 文档导航
+Reproduce the acceptance checks in your own environment, including real agent wiring, current context, account capabilities, and installed versions. Detailed evidence and failure boundaries are in [Validation](./docs/validation.en.md).
 
-| 文档 | 内容 |
+## Documentation
+
+| Document | Covers |
 |---|---|
-| [Muse](./muse/README.md) / [Grok Bot](./grokbot/README.md) | 本地 bridge、真实 agent 接线、发送与恢复 |
-| [Hermes](./hermes/README.md) | 原生 gateway、授权、提及插件与版本补丁 |
-| [ChatGPT DOTS](./chatgpt-dots/README.md) | 托管连接、事件能力与配置范围 |
-| [协作与运维](./docs/operations.md) | 三类架构、回复位置、协作规则、部署交接与排障 |
-| [验证记录](./docs/validation.md) | 分层验收、实测范围、修复关联与历史审查 |
+| [Muse](./muse/README.md) / [Grok Bot](./grokbot/README.md) | Local bridges, real agent wiring, delivery and recovery |
+| [Hermes](./hermes/README.md) | Native gateway, authorization, mention plugin, and version-specific patches |
+| [ChatGPT DOTS](./chatgpt-dots/README.md) | Hosted connections, event capabilities, and configuration scope |
+| [Operations](./docs/operations.en.md) | Three architectures, reply routing, collaboration, deployment handoff, and troubleshooting |
+| [Validation](./docs/validation.en.md) | Acceptance layers, live test scope, related fixes, and historical reviews |
 
-## 参与改进
+## Contributing
 
-围绕对应 agent 目录提交 PR，说明问题、变更、验证结果和未验证项。跨目录改动先协调，保留已有配置、队列和会话。不要提交 token、真实队列、私有实例标识或聊天记录；发送结果不明时保留证据，不通过清状态制造成功。详见[贡献与交付](./docs/operations.md#贡献与交付)。
+Submit a PR for the relevant agent directory, explaining the problem, change, checks, and untested areas. Coordinate changes across directories and preserve existing configuration, queues, and sessions. Do not commit tokens, real queues, private instance identifiers, or chat logs. Preserve evidence when delivery is uncertain; clearing state is not proof of success. See [Contributing and handoff](./docs/operations.en.md#contributing-and-handoff).

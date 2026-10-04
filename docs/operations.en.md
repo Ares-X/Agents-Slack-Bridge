@@ -1,6 +1,6 @@
 # Collaboration and operations
 
-[Project home](../README.en.md) · [简体中文](./operations.md) · **English** · [Validation](./validation.en.md)
+[Project home](../README.md) · [简体中文](./operations.md) · **English** · [Validation](./validation.en.md)
 
 This guide covers shared conventions across agents. Use each integration's setup guide for commands, environment variables, and recovery procedures. Choose the platform first, then configure the actual runtime entry point.
 
