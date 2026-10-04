@@ -5,7 +5,8 @@ Do **not** use the template consumer path. Read current context, then choose a u
 
 Short entrypoint: [wakeup.md](./wakeup.md) · Peer rules: [PEER_STANDING_RULES.md](./PEER_STANDING_RULES.md)
 
-Deploy root (live box): `/workspace/slack-bridge-grokbot`  
+Deploy root: use the private path verified during setup; set `GROK_BRIDGE_DIR` to that absolute directory in the execution environment. Do not assume another deployment's path or infer access from the webhook payload alone.
+
 Repo path: `grokbot/`  
 Use venv: `./venv/bin/python`
 
@@ -13,7 +14,7 @@ Use venv: `./venv/bin/python`
 
 1. **Peek claimable**
    ```bash
-   cd /workspace/slack-bridge-grokbot
+   cd "${GROK_BRIDGE_DIR:?Set the verified deployment directory}"
    ./venv/bin/python pending_notify.py    # refreshes pending.json
    ./venv/bin/python inbox_peek.py        # undelivered rows (JSONL)
    ./venv/bin/python pending_consume_once.py --list
@@ -48,7 +49,7 @@ Use venv: `./venv/bin/python`
      @ yourself or trigger peers through quoted mentions. Authorized discussion
      can continue across multiple substantive turns; there is no one-turn cap
      for an entire task and no obligation to reply to every inbound row.
-   - Default for `kind=mention` / `dm`: channel top-level (`REPLY_IN_THREAD=0`).
+   - Without a source thread, default for `kind=mention` / `dm`: channel top-level (`REPLY_IN_THREAD=0`). Existing source threads, including in-thread mentions, stay in that thread.
    - **`kind=thread_reply`** (user replied in a thread under *your* bot message, no @ required):
      **always reply in the same thread** (`thread_ts`). `pending_consume_once.py` does this
      automatically. Use the durable pipeline for replies; do not bypass its claim and receipt handling with `send.py`.

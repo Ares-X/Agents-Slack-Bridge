@@ -4,9 +4,11 @@
 
 > 仓库根目录还有 `grokbot/`（默认允许多 agent）、`hermes/`（原生插件）。请先 `git clone` 根仓库，再 `cd muse`。
 
+**由 agent 执行接入时，先读顶层 [AGENTS.md](../AGENTS.md) 和[统一配置流程](../docs/setup.md)。** 检查现有连接、真实模型/hook、服务和队列，再一次收集缺失前提；复用已有授权，不重复询问。已有部署复用原目录，不覆盖 clone 或配置。
+
 ### 多 agent 频道协作（默认开启）
 
-muse 桥**默认放行其他 bot 的 @mention**（自己的消息永远过滤，防自循环）——与 grokbot 行为一致，装完即可同频道互相 @、读上下文、协作：
+muse 桥**默认放行其他 bot 的 @mention**（自己的消息永远过滤，防自循环）——与 grokbot 行为一致。这只是入站过滤；完成真实 consumer/hook、模型与上下文接线并验收后，才能声称已支持协作：
 
 1. **互相 @**：默认无需配置。要收紧成白名单，在 `.env` 填 `ALLOWED_BOT_USERS` / `ALLOWED_BOT_IDS`（对方 U…/B…，逗号分隔；任一非空即白名单模式）。
 2. **每次回复前读最新原文**：`channel_history.py <channel> [N]`；线程另读 `--thread-ts <ts> --all`。需要更早上下文时用 `--all` 或 stderr 返回的 `next_cursor` 配合 `--cursor` 继续读取。正文不截断，保留身份、线程、全文哈希、发送关联 ID 和控制卡结构；失败退出 2，不能把失败当空历史或只凭摘要判断。
@@ -43,7 +45,8 @@ send_durable.py ──⑤ 持久化领取/发送/确认 ──▶ Slack
 git clone https://github.com/Ares-X/Agents-Slack-Bridge.git /opt/Agents-Slack-Bridge
 cd /opt/Agents-Slack-Bridge/muse
 
-cp .env.example .env && chmod 600 .env
+test -e .env || cp .env.example .env
+chmod 600 .env
 # 编辑 .env，填入 xoxb- / xapp-（以及代理配置，如果有）
 # 多 agent 协作：填 ALLOWED_BOT_USERS / ALLOWED_BOT_IDS（对端 U…/B…）
 
@@ -64,13 +67,13 @@ systemctl is-active slack-bridge.service   # → active
 tail -f bridge.log                          # → "socket mode connected, listening"
 ```
 
-> ⚠️ `/etc` 下的文件在容器/VM 重建后会消失。**正本永远留在本目录**，并配一个每分钟的健康检查（不存在则从仓库复制 + `daemon-reload` + `restart`）。
+> 以上是 systemd 示例，先确认宿主支持且没有已运行实例。Muse 与 Grok 的模板同名；同机部署时使用不同服务名和准确的绝对路径。保留既有 service owner，不再加另一个竞争拉起的 keepalive。配置和队列放在实际持久目录；临时容器重建会丢失未持久化内容，不能用盲目复制模板或清状态代替恢复。模型 consumer/hook 也需单独配置常驻或平台持久入口。
 
 ### 2.4 接消费层（二选一）
 
 | 方案 | 说明 | 延迟 | 上下文 |
 |---|---|---|---|
-| **A. `consumer/poll_consumer.py`**（参考实现） | 轮询 inbox → 按 channel 维护 `channel_sessions.json` 会话 → 调你的 LLM → `send.py` 发回 | ~1 分钟 | 按 channel 隔离，文件持久化 |
+| **A. `consumer/poll_consumer.py`**（参考实现） | 轮询 inbox → 按 channel 维护 `channel_sessions.json` 会话 → 调你的 LLM → 持久发送管线发回 | 默认 30 秒轮询，另加模型耗时 | 按 channel 隔离，文件持久化 |
 | **B. 平台 side chat**（如 Muse） | 定时任务把消息转给各 channel 的独立子对话，子对话里的 agent 回复 | 1~3 分钟 | 子对话天然隔离 |
 
 > ⚠️ 方案 A 的 `generate_reply()` **默认只是 echo 示例**（`收到：…`，mention 已脱敏），**不是真实回复**。生产使用必须换成你的模型调用：把函数体替换为 LLM 请求，返回 `str`（正文）或 `(str, [uid...])`（正文 + 显式点名，经 `send.py --mention` 发出真实 @）。
@@ -79,7 +82,9 @@ tail -f bridge.log                          # → "socket mode connected, listen
 >
 > 自动化验证范围：`tests/` 隔离行为测试（并发入队、跨频道同 ts、ack 语义、发送状态机、mention 脱敏、子类型过滤，详见 §8），不自行证明真实 Slack 验收。当前部署的一次受控 metadata 读回探针只验证 API 回执字段（见 §4b）；新代码加载后的 hook→agent→durable 完整路线仍需按 §6 验证。
 
-用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），`nohup`/`systemd` 跑起来即可。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。多 agent 协作前先配好 bot 白名单；回复位置跟随上下文（thread 里被 @ 就跟帖）。
+用 A：把 `generate_reply()` 换成你家 agent 的调用（务必使用传入的 `history` 上下文），按宿主已有 supervisor 管理常驻并验证真实回复。脚本会从 `muse/` 根目录调用 `inbox_peek.py` / `send.py` / `channel_history.py`。按已授权对端设置 bot 白名单；这些字段不是频道/人类用户访问控制。回复位置跟随上下文（thread 里被 @ 就跟帖）。
+
+用 B：仓库不提供 Muse 平台 hook、注册 API 或模型登录。执行者需要发现并配置宿主已有的 hook/调度能力，绑定实际部署路径、队列、agent/side chat 和下节的持久发送入口，把上下文与协作规则写入真正执行的指令并回读；不只在聊天里承诺。没有可用平台能力时明确报告缺失项，不能把 listener 已连接当作完成。A/B 选择一条，不为同一工作重复启动两套消费入口。
 
 ### 2.5 真实消费入口：`send_durable.py`（hook → agent 链路）
 
@@ -214,8 +219,9 @@ Agents-Slack-Bridge/
 ## 6. 最小验证
 
 1. `systemctl is-active` → active，日志出现 `socket mode connected`
-2. Slack 私信 bot → `python inbox_peek.py` 看到这条 → `echo hi | python send.py <DM频道ID>` → Slack 收到
-3. 拉 bot 进测试频道，`@bot hello` → 收到 mention → 消费层回复出现在频道
+2. Slack 私信或原生提及 bot → 自动入队 → 实际 hook/consumer 唤醒真实模型 → 持久管线回复 → 核对完成状态；不手动 raw send/ACK 代替消费者
+3. 用此前频道事实与线程修正验证真实上下文及原线程回复；echo 或套话不通过
+4. 按[统一验收清单](../docs/setup.md#4-验收实际效果)逐对验证自动双向交接与共同任务，区分已配置、已加载、已验收；无对端时注明协作未验收
 
 ## 8. 隔离行为测试
 

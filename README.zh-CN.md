@@ -4,11 +4,13 @@
 
 **简体中文** · [English](./README.md)
 
-[协作能力](#可以协作到什么程度) · [选择接入方式](#选择接入方式) · [开始使用](#开始使用) · [验证记录](./docs/validation.md)
+[让 Agent 配置](#开始使用) · [协作能力](#可以协作到什么程度) · [选择接入方式](#选择接入方式) · [验证记录](./docs/validation.md)
 
 把 Slack 作为多个 AI agent 的共同工作空间：通过私信或原生提及发起任务，让不同平台的 agent 读取相关上下文、互相提问、审查和修订，最后交付共同结果。
 
 本仓库提供 **4 种接入指南、3 类架构**，包括本地桥接代码、Hermes 原生接入配置与补丁，以及 DOTS 托管连接指南。各路线复用自己的模型与运行环境，按需选择。
+
+**要让 agent 自己完成接入？从 [AGENTS.md](./AGENTS.md) 开始。** Agent 应识别目标运行时、检查已有配置、一次收集缺失前提，再配置、加载并验收。[配置流程](./docs/setup.md)明确哪些由 agent 完成、哪些需要用户配合。
 
 ## 可以协作到什么程度？
 
@@ -38,18 +40,15 @@ Muse / Grok 的 Socket Mode 使用出站连接，无需公网接收入口。Herm
 
 ## 开始使用
 
-1. **选择上表中的路线。** 已有部署先检查当前配置；首次使用可克隆仓库：
+把仓库链接交给要接入的 agent，并发送：
 
-   ```bash
-   git clone https://github.com/Ares-X/Agents-Slack-Bridge.git
-   cd Agents-Slack-Bridge
-   ```
+> 请把这个仓库配置到我的 agent。先读顶层 AGENTS.md，识别目标运行时并检查已有配置。一次性告诉我全部缺失前提和必须人工完成的动作，不要让我在聊天里发送秘密。随后完成配置、加载，并在约定 Slack 频道验证真实回复与协作。保留已有工作，有阻塞就提供具体证据。
 
-2. **按对应指南接入一个 agent。** 确认工作区、频道、允许协作的对端，以及实际模型入口。凭据保留在私有配置中。
+Agent 按[完整配置流程](./docs/setup.md)执行：**发现现状 → 收集缺失前提 → 配置 → 加载 → 验收**。在已有工具和授权允许时，ID 查询、配置修改、真实模型/hook 接线、保活与测试都由 agent 完成；用户只补充缺失选择、同意授权、安全凭据录入或尚不可用的账号访问。
 
-   Muse 的参考 poll consumer 默认是 echo；Grok 的 `agent_wake` 需要外部 agent 接线，模板仅在显式选择时启用。桥接收到消息与真实 agent 能够作答，需要分别验证。
+这是供具备能力的 agent 执行的流程，不是通用一键安装器。Muse 仍需真实模型 consumer/hook，Grok 需要实际 agent 唤醒接收端，Hermes 需要可用模型与兼容 gateway，DOTS 需要账号开放事件能力；Slack/管理员授权可能需要人工操作。缺少前提时 agent 必须明确指出，不能把 echo 当成功。目前尚未逐个平台实测全新自动配置。
 
-3. **从单条消息验证到共同任务。** 先测试私信或提及，再确认线程路由、上下文和双向交接，最后尝试开放讨论。具体标准见[分层验收](./docs/validation.md#分层验收)。
+手动配置可使用接入表，并遵循同一份[验收清单](./docs/setup.md#4-验收实际效果)。
 
 ### 试一次共同任务
 
@@ -73,6 +72,7 @@ Muse / Grok 的 Socket Mode 使用出站连接，无需公网接收入口。Herm
 
 | 文档 | 内容 |
 |---|---|
+| [Agent 顶层入口](./AGENTS.md) · [配置流程](./docs/setup.md) | 路线选择、一次前提交接、配置、加载与验收 |
 | [Muse](./muse/README.md) / [Grok Bot](./grokbot/README.md) | 本地 bridge、真实 agent 接线、发送与恢复 |
 | [Hermes](./hermes/README.md) | 原生 gateway、授权、提及插件与版本补丁 |
 | [ChatGPT DOTS](./chatgpt-dots/README.md) | 托管连接、事件能力与配置范围 |
