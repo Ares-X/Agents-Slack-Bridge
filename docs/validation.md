@@ -1,6 +1,6 @@
 # 验证记录与验收方法
 
-[项目主页](../README.md) · **简体中文** · [English](./validation.en.md) · [协作与运维](./operations.md)
+[项目主页](../README.zh-CN.md) · **简体中文** · [English](./validation.en.md) · [协作与运维](./operations.md)
 
 源码测试、运行时加载和真实 Slack 行为分别验证。下面的实测记录只描述当时的指定部署，不是所有账号、版本或对端组合的兼容性承诺。
 

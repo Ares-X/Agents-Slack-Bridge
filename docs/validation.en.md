@@ -1,6 +1,6 @@
 # Validation records and acceptance
 
-[Project home](../README.en.md) · [简体中文](./validation.md) · **English** · [Operations](./operations.en.md)
+[Project home](../README.md) · [简体中文](./validation.md) · **English** · [Operations](./operations.en.md)
 
 Validate source tests, runtime loading, and live Slack behavior separately. The live records below describe the deployments tested at the time, not universal compatibility across accounts, versions, or peer combinations.
 

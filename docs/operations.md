@@ -1,6 +1,6 @@
 # 协作与运维
 
-[项目主页](../README.md) · **简体中文** · [English](./operations.en.md) · [验证记录](./validation.md)
+[项目主页](../README.zh-CN.md) · **简体中文** · [English](./operations.en.md) · [验证记录](./validation.md)
 
 本文说明跨 agent 的共同约定。具体命令、环境变量与恢复操作以各目录的部署指南为准；先选择适合的平台，再配置实际运行入口。
 
