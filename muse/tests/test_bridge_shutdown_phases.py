@@ -215,16 +215,18 @@ class SubprocessRateLimitTest(unittest.TestCase):
         return proc
 
     def _assert_clean_signal_exit(self, proc, sig, name):
+        # 用 communicate(timeout) 边等边排空管道: 先 wait() 再
+        # communicate() 会在子进程输出填满管道时假超时。
+        t0 = time.time()
+        proc.send_signal(sig)
         try:
-            t0 = time.time()
-            proc.send_signal(sig)
-            proc.wait(timeout=20)
-            elapsed = time.time() - t0
+            out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
             out, err = proc.communicate()
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                out, err = proc.communicate()
+            self.fail("%s: driver did not exit within 20s "
+                      "(stdout tail: %s)" % (name, out[-500:]))
+        elapsed = time.time() - t0
         # 1) bounded shutdown: Retry-After is 30s; exit must be ~1s-scale.
         self.assertLess(elapsed, 10,
                         "%s during SDK rate-limit wait took %.1fs to exit"
@@ -264,6 +266,95 @@ class SubprocessRateLimitTest(unittest.TestCase):
     def test_sigint_during_sdk_ratelimit_wait(self):
         proc = self._run_driver_until_ratelimit_wait()
         self._assert_clean_signal_exit(proc, signal.SIGINT, "SIGINT")
+
+
+# ---------------------------------------------------------------------------
+# Subprocess: stuck SDK executor task -> final deadline must kill the process
+# ---------------------------------------------------------------------------
+
+class SubprocessStuckExecutorTest(unittest.TestCase):
+    """A task stuck forever in the REAL SDK ThreadPoolExecutor: the process
+    itself must die within the final deadline (not just "supervisor
+    returned"), and the queue must keep its recovery semantics -- the
+    unacked record stays redeliverable, a redelivery is deduped, the file
+    is intact."""
+    DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "stuck_executor_driver.py")
+
+    def test_sigterm_with_stuck_executor_task_kills_process(self):
+        import shutil
+        import tempfile
+        inbox_dir = tempfile.mkdtemp(prefix="bridge-inbox-test-")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", self.DRIVER, inbox_dir, "2", "5"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.time() + 30
+            saw = False
+            while time.time() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if "DRIVER stuck task submitted" in line:
+                    saw = True
+                    break
+            self.assertTrue(saw, "driver did not submit stuck task (rc=%s)"
+                                 % proc.poll())
+            t0 = time.time()
+            proc.send_signal(signal.SIGTERM)
+            # communicate(timeout) drains pipes while waiting: no fake
+            # timeout from a full pipe.
+            try:
+                out, err = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                self.fail("process did not die within 30s of SIGTERM with "
+                          "a stuck executor task (stdout tail: %s)"
+                          % out[-500:])
+            elapsed = time.time() - t0
+            # bound: 2s close timeout + ~1s supervisor + 5s final deadline
+            self.assertLess(elapsed, 20,
+                            "final shutdown took %.1fs" % elapsed)
+            self.assertEqual(1, proc.returncode,
+                             "expected os._exit(1) from the final-deadline "
+                             "watchdog, got rc=%s" % proc.returncode)
+            self.assertIn("FINAL DEADLINE", out,
+                          "watchdog did not fire; stdout tail: %s"
+                          % out[-500:])
+            self.assertNotIn("Traceback", err,
+                             "traceback in stderr: %s" % err[-500:])
+            self.assertNotIn("DRIVER STILL ALIVE", out,
+                             "process outlived its final deadline")
+            # ---- recovery boundary: queue intact, unacked redeliverable ----
+            import inbox_store as inbox_store_mod
+            prev_inbox, prev_lock = (inbox_store_mod.INBOX_PATH,
+                                     inbox_store_mod.LOCK_PATH)
+            inbox_store_mod.INBOX_PATH = os.path.join(inbox_dir,
+                                                      "inbox.jsonl")
+            inbox_store_mod.LOCK_PATH = os.path.join(inbox_dir, "inbox.lock")
+            try:
+                undelivered = inbox_store_mod.read_undelivered()
+                ids = [r.get("msg_id") for r in undelivered]
+                self.assertIn("D_TEST:1234.5678", ids,
+                              "unacked record lost after hard exit: %s" % ids)
+                # Slack redelivers the unacked message: must dedupe, not dup.
+                redelivered = {"kind": "dm", "channel": "D_TEST",
+                               "ts": "1234.5678", "text": "unacked-probe"}
+                self.assertFalse(inbox_store_mod.append_record(redelivered),
+                                 "redelivery was not deduped")
+                with open(inbox_store_mod.INBOX_PATH,
+                          encoding="utf-8") as f:
+                    lines = [l for l in f if l.strip()]
+                bodies = [l for l in lines if "D_TEST:1234.5678" in l
+                          and '"type": "ack"' not in l]
+                self.assertEqual(1, len(bodies),
+                                 "duplicate queue entry after redelivery")
+            finally:
+                inbox_store_mod.INBOX_PATH = prev_inbox
+                inbox_store_mod.LOCK_PATH = prev_lock
+        finally:
+            shutil.rmtree(inbox_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

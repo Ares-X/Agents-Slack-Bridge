@@ -268,16 +268,18 @@ class SubprocessSignalTest(unittest.TestCase):
         return proc
 
     def _assert_clean_signal_exit(self, proc, sig, name):
+        # 用 communicate(timeout) 边等边排空管道: 先 wait() 再
+        # communicate() 会在子进程输出填满管道时假超时。
+        t0 = time.time()
+        proc.send_signal(sig)
         try:
-            t0 = time.time()
-            proc.send_signal(sig)
-            proc.wait(timeout=15)
-            elapsed = time.time() - t0
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
             out, err = proc.communicate()
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.communicate()
+            self.fail("%s: driver did not exit within 15s "
+                      "(stdout tail: %s)" % (name, out[-500:]))
+        elapsed = time.time() - t0
         self.assertLess(elapsed, 5,
                         "%s during backoff took %.1fs to exit" % (name, elapsed))
         self.assertNotIn("Traceback", err,
