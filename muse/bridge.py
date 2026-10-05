@@ -20,6 +20,7 @@ import os
 import signal
 import ssl
 import sys
+import threading
 import time
 
 import inbox_store
@@ -221,18 +222,54 @@ def resolve_thread_reply(event, me, my_bot_id, web, append):
 
 
 # --- 自愈监督层 (2026-10-05) ---
-# 背景: 出站 socket 常被代理掐断 (SSLEOFError)。SDK 有时能自己重连,
-# 有时异常会逃出 client 生命周期直接把进程带走, 只能靠外部保活重启。
-# 这一层保证: 任何 Python 层面的失败都会触发 client 重建 + 退避重试,
-# 进程只在收到明确停机信号 (SIGTERM / KeyboardInterrupt) 时退出。
-# systemd 的 Restart=always 是最后一道防线 (SIGKILL 等信号级死亡)。
+# 背景: 出站 socket 常被代理掐断 (SSLEOFError)。SDK 自带 auto_reconnect
+# (slack_sdk 3.45.0, 默认开启) 能处理 CLOSE 事件与会话失效 (实测 10-05
+# 01:03 一次 SSLEOFError 后 SDK 自行重建会话); 但构造后 connect() 失败、
+# 或异常逃出 client 生命周期时, 进程会直接退出, 之前只能靠外部保活重启。
+#
+# 覆盖范围 (按 slack_sdk 3.45.0 实测源码, builtin/client.py):
+#   * 主线程 client 生命周期内的任何失败: connect() 抛异常 (代理/SSL/
+#     握手失败)、client 意外返回、SDK 内部 sys.exit —— 全部触发重建。
+#     构造即起的后台线程 (IntervalRunner) 与线程池由 finally 中的 close()
+#     释放, 连续 connect 失败不会在进程里越积越多。
+#   * 干净停机: SIGTERM / SIGINT 的 handler 内只做一次布尔赋值
+#     (_shutdown = True), 不碰 logging/锁/IO —— 信号可能正好打断同个
+#     stream 的写操作, 在 handler 里做 I/O 会导致 reentrant call
+#     (2026-10-05 单测实测捕获)。退避等待以 1 秒粒度轮询 _shutdown,
+#     信号到达后最多 1 秒即干净退出, 不再重建 client, 无 traceback。
+#   * 信号级死亡 (SIGKILL 等): 由 systemd Restart=always 兜底。
+# 不覆盖 (如实说明, 未验证):
+#   * SDK 后台线程静默死亡 (主线程仍在 sleep, 表现为连接卡死): 本层
+#     检测不到; 目前唯一防线是 SDK 自己的会话监控与重连。
+#   * 长连接无 CLOSE 事件的半死状态: 同上, 依赖 SDK 重连。
 _shutdown = False
 
 
 def _handle_sigterm(signum, frame):
     global _shutdown
+    # 只做布尔赋值: logging/锁/IO 在信号 handler 里不安全, 见上。
+    # 退出日志由主循环检测到 _shutdown 后打印。
     _shutdown = True
-    logging.info("received SIGTERM, shutting down cleanly")
+
+
+def _handle_sigint(signum, frame):
+    global _shutdown
+    _shutdown = True
+
+
+def _wait_interruptible(secs):
+    """可被停机信号唤醒的等待。
+
+    1 秒粒度轮询 _shutdown; 信号到达后最多 1 秒返回。
+    不用 threading.Event: handler 里不碰锁, 杜绝重入/死锁可能。
+    用 monotonic 时钟, 不受 NTP 跳变影响。
+    """
+    deadline = time.monotonic() + secs
+    while not _shutdown:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
 
 
 def run_client_once(bot_token, app_token):
@@ -292,11 +329,14 @@ def run_client_once(bot_token, app_token):
         except Exception:
             logging.exception("ack send failed")
 
+    # 注意: SocketModeClient 构造即启动后台线程 (IntervalRunner +
+    # ThreadPoolExecutor, 见 slack_sdk 3.45.0 builtin/client.py __init__)。
+    # connect() 失败也必须 close(), 否则失败的 client 在进程里越积越多。
     smc = SocketModeClient(app_token=app_token, web_client=web, **_proxy_kw())
-    smc.socket_mode_request_listeners.append(handle)
-    smc.connect()
-    logging.info("socket mode connected, listening")
     try:
+        smc.socket_mode_request_listeners.append(handle)
+        smc.connect()
+        logging.info("socket mode connected, listening")
         while not _shutdown:
             time.sleep(1)
     finally:
@@ -307,27 +347,36 @@ def run_client_once(bot_token, app_token):
 
 
 def serve_forever(bot_token, app_token, runner=None,
-                  initial_backoff=5, max_backoff=300, sleep_fn=time.sleep):
+                  initial_backoff=5, max_backoff=300,
+                  wait_fn=None):
     """监督循环: runner 抛出的任何异常都会触发 client 重建 + 指数退避。
 
+    退避等待是可中断的 (1 秒粒度轮询 _shutdown): SIGTERM/SIGINT 到达后
+    最多 1 秒即干净退出, 不再重建 client, 不抛 traceback。
     runner 缺省为一次完整的 client 生命周期。只有 _shutdown
-    (SIGTERM) / KeyboardInterrupt 会干净退出; 配置缺失等硬错误
-    由 main() 在循环外直接退出, 不进重试。
+    (停机信号) 会干净退出; 配置缺失等硬错误由 main() 在循环外直接
+    退出, 不进重试。
     """
     global _shutdown
-    try:
-        signal.signal(signal.SIGTERM, _handle_sigterm)
-    except ValueError:
-        pass  # 非主线程 (如单测) 时跳过信号安装
+    for sig, handler in ((signal.SIGTERM, _handle_sigterm),
+                         (signal.SIGINT, _handle_sigint)):
+        try:
+            signal.signal(sig, handler)
+        except ValueError:
+            pass  # 非主线程 (如单测) 时跳过信号安装
     if runner is None:
         runner = lambda: run_client_once(bot_token, app_token)  # noqa: E731
+    if wait_fn is None:
+        wait_fn = _wait_interruptible
     backoff = initial_backoff
     while not _shutdown:
-        started = time.time()
+        started = time.monotonic()
         try:
             runner()
         except KeyboardInterrupt:
+            # 信号已由 handler 转为 _shutdown; 这里是直接 raise 时的兜底
             logging.info("keyboard interrupt, shutting down")
+            _shutdown = True
             break
         except SystemExit as e:
             logging.warning("client raised SystemExit(code=%s); rebuilding",
@@ -338,11 +387,15 @@ def serve_forever(bot_token, app_token, runner=None,
             break
         # 存活足够久说明是偶发抖动, 重置退避立即重建;
         # 连续速死则退避拉满, 防止热循环打爆日志和 API。
-        if time.time() - started > 300:
+        if time.monotonic() - started > 300:
             backoff = initial_backoff
         else:
-            sleep_fn(backoff)
+            wait_fn(backoff)  # 停机信号最多 1 秒内唤醒, 不再傻等满 300 秒
+            if _shutdown:
+                break
             backoff = min(backoff * 2, max_backoff)
+    if _shutdown:
+        logging.info("shutdown requested, exiting cleanly")
     logging.info("bridge supervisor exiting")
 
 
