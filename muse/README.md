@@ -67,23 +67,29 @@ systemctl is-active slack-bridge.service   # → active
 tail -f bridge.log                          # → "socket mode connected, listening"
 ```
 
-<<<<<<< HEAD
-> 以上是 systemd 示例，先确认宿主支持且没有已运行实例。Muse 与 Grok 的模板同名；同机部署时使用不同服务名和准确的绝对路径。保留既有 service owner，不再加另一个竞争拉起的 keepalive。配置和队列放在实际持久目录；临时容器重建会丢失未持久化内容，不能用盲目复制模板或清状态代替恢复。模型 consumer/hook 也需单独配置常驻或平台持久入口。
-=======
 > 以上是 systemd 示例，先确认宿主支持且没有已运行实例。Muse 与 Grok 的模板同名；同机部署时使用不同服务名和准确的绝对路径。保留既有 service owner，不再加另一个竞争拉起的 keepalive。配置和队列放在实际持久目录；临时容器重建会丢失未持久化内容，不能用盲目复制模板或清状态代替恢复。模型 consumer/hook 也需单独配置常驻或平台持久入口。
 >
 > **自愈（2026-10-05 起，不再依赖高频外部保活）**：`bridge.py` 内置
 > `serve_forever()` 监督循环——`connect()` 失败、client 意外退出、
 > SDK 内部 `sys.exit` 都会触发 SocketModeClient 重建 + 指数退避
 > （5s 起、300s 封顶）；失败的 client（含后台线程/线程池）每次都在
-> 下一次尝试前 `close()` 释放。SIGTERM/SIGINT 最多 1 秒干净退出。
-> systemd `Restart=always` 兜底信号级死亡。外部 keepalive 只保留
-> 每小时一次，专用于 VM 重建后从本目录重装 unit（`daemon-reload`）。
+> 下一次尝试前 `close()` 释放。systemd `Restart=always` 兜底信号级
+> 死亡。外部 keepalive 只保留每小时一次，专用于 VM 重建后从本目录
+> 重装 unit（`daemon-reload`）。
 >
-> 覆盖边界（按 slack_sdk 3.45.0 实测）：SDK 自带 auto_reconnect 处理
-> CLOSE 事件；本监督循环覆盖主线程 client 生命周期失败；**不覆盖**
-> SDK 后台线程静默死亡与无 CLOSE 事件的半死长连接（依赖 SDK 会话监控）。
->>>>>>> eb31f6b (muse: supervisor review fixes (resource cleanup, interruptible backoff, narrowed claims))
+> 停机上限分阶段（按 slack_sdk 3.45.0 实测，均有单测覆盖）：
+> - 退避等待 / 主监听循环：SIGTERM/SIGINT 到达后最多约 1 秒干净退出。
+> - SDK 限流重试（`apps.connections.open` 返回 ratelimited）：SDK 原生
+>   实现会 `time.sleep(Retry-After)` 后递归重试，信号来了也停不下来；
+>   本桥用实例补丁换成 1 秒粒度等待，信号后最多约 1 秒抛停机异常退出，
+>   停机后不再继续调用 `apps.connections.open`。
+> - `connect()` 握手：daemon 线程 + 1 秒粒度 join，信号后最多约 1 秒
+>   放弃等待并 `close()` 释放。
+> - `close()`：SDK 原生 close 会无超时 join 后台线程，这里加 15 秒上限。
+>
+> 覆盖边界：SDK 自带 auto_reconnect 处理 CLOSE 事件；本监督循环覆盖
+> 主线程 client 生命周期失败；**不覆盖** SDK 后台线程静默死亡与无
+> CLOSE 事件的半死长连接（依赖 SDK 会话监控）。
 
 ### 2.4 接消费层（二选一）
 

@@ -235,13 +235,26 @@ def resolve_thread_reply(event, me, my_bot_id, web, append):
 #   * 干净停机: SIGTERM / SIGINT 的 handler 内只做一次布尔赋值
 #     (_shutdown = True), 不碰 logging/锁/IO —— 信号可能正好打断同个
 #     stream 的写操作, 在 handler 里做 I/O 会导致 reentrant call
-#     (2026-10-05 单测实测捕获)。退避等待以 1 秒粒度轮询 _shutdown,
-#     信号到达后最多 1 秒即干净退出, 不再重建 client, 无 traceback。
+#     (2026-10-05 单测实测捕获)。各阻塞阶段以 1 秒粒度响应 _shutdown,
+#     信号到达后最多约 1 秒即干净退出, 不再重建 client, 无 traceback。
 #   * 信号级死亡 (SIGKILL 等): 由 systemd Restart=always 兜底。
 # 不覆盖 (如实说明, 未验证):
 #   * SDK 后台线程静默死亡 (主线程仍在 sleep, 表现为连接卡死): 本层
 #     检测不到; 目前唯一防线是 SDK 自己的会话监控与重连。
 #   * 长连接无 CLOSE 事件的半死状态: 同上, 依赖 SDK 重连。
+#
+# 停机上限分阶段 (均有单测覆盖, 见 tests/test_bridge_shutdown_phases.py):
+#   * 退避等待 / 主监听循环: 1 秒粒度轮询, 信号后最多约 1 秒退出。
+#   * SDK 限流重试: apps.connections.open 返回 ratelimited 时, SDK 原生
+#     实现会 time.sleep(Retry-After) 后递归重试, 信号来了也停不下来。
+#     这里用实例补丁换成 _issue_new_wss_url_bounded: Retry-After 以 1 秒
+#     粒度等待, 信号后最多约 1 秒抛 _ShutdownRequested, 停机后不再继续
+#     调用 apps.connections.open。补丁挂在 client 实例上, 初始 connect()
+#     与 SDK 后台重连线程 (monitor -> connect_to_new_endpoint) 都走它。
+#   * connect() 握手: _connect_bounded 放到 daemon 线程跑, 主线程 1 秒
+#     粒度 join; 信号后最多约 1 秒放弃等待, 由 finally 做 close() 释放。
+#   * close(): SDK 原生 close() 会无超时 join 后台线程; _close_bounded
+#     加 15 秒上限, 超时则记 error 日志并放弃 (进程仍会退出)。
 _shutdown = False
 
 
@@ -270,6 +283,102 @@ def _wait_interruptible(secs):
         if remaining <= 0:
             break
         time.sleep(min(1.0, remaining))
+
+
+class _ShutdownRequested(Exception):
+    """停机信号在阻塞的连接/重试中被请求。
+
+    信号 handler 只置 _shutdown 标志, 但主线程可能正阻塞在 SDK 内部
+    (限流重试等待 / connect 握手)。这些位置检测到 _shutdown 后抛此
+    异常, 把控制权交回监督循环干净退出, 而不是默默继续重试。
+    """
+
+
+def _issue_new_wss_url_bounded(smc):
+    """可被停机信号中断的 WSS URL 签发。
+
+    逐字对应 slack_sdk 3.45.0 BaseSocketModeClient.issue_new_wss_url 的
+    ratelimited 分支, 但把"不可中断的 time.sleep(delay)+递归重试"换成:
+    Retry-After 以 1 秒粒度等待 (_wait_interruptible), 期间 _shutdown
+    置位则抛 _ShutdownRequested —— 停机后不再继续 apps.connections.open
+    调用。挂到 client 实例上 (见 run_client_once), 初始 connect() 与
+    SDK 后台重连线程 (monitor -> connect_to_new_endpoint) 都走它。
+    """
+    from slack_sdk.errors import SlackApiError
+    while True:
+        try:
+            response = smc.web_client.apps_connections_open(
+                app_token=smc.app_token)
+            return response["url"]
+        except SlackApiError as e:
+            resp = getattr(e, "response", None) or {}
+            if (resp.get("error") == "ratelimited") and not _shutdown:
+                headers = getattr(resp, "headers", {}) or {}
+                delay = int(headers.get("Retry-After", "30"))
+                logging.info("Rate limited. Retrying in %d seconds...", delay)
+                _wait_interruptible(delay)
+                if _shutdown:
+                    raise _ShutdownRequested()
+                continue
+            raise
+
+
+def _connect_bounded(smc):
+    """带停机界的 smc.connect()。
+
+    connect() 内部可能阻塞在 socket 握手等 SDK 调用里, 那里读不到主线
+    程的 _shutdown 标志。放到 daemon 线程里跑, 主线程以 1 秒粒度 join
+    等待; _shutdown 置位则不再等待、抛 _ShutdownRequested, 由
+    run_client_once 的 finally 做 close() 释放。daemon 线程不阻止进程
+    退出; 它若事后成功/失败, 落在已关闭的 client 上, 无影响。
+    connect() 本身的异常原样抛回调用方 (触发监督重建)。
+    """
+    outcome = {}
+
+    def _do():
+        try:
+            smc.connect()
+        except BaseException as e:  # noqa: BLE001 -- 转交主线程原样抛出
+            outcome["error"] = e
+        else:
+            outcome["ok"] = True
+
+    t = threading.Thread(target=_do, name="smc-connect", daemon=True)
+    t.start()
+    while t.is_alive():
+        if _shutdown:
+            raise _ShutdownRequested()
+        t.join(timeout=1.0)
+    if "error" in outcome:
+        raise outcome["error"]
+
+
+def _close_bounded(smc, timeout=15):
+    """带停机界的 smc.close()。
+
+    SDK 3.45.0 的 close() 会无超时 join 后台线程
+    (IntervalRunner.shutdown / ThreadPoolExecutor.shutdown), 若某个
+    worker 卡住则 close() 本身卡死。放到 daemon 线程里跑, 最多等
+    `timeout` 秒。返回 True 表示 close() 完成; 超时返回 False 并记
+    error 日志 (进程仍会退出, 不无限傻等)。
+    """
+    done = threading.Event()
+
+    def _do():
+        try:
+            smc.close()
+        except Exception:
+            logging.exception("smc.close() raised")
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_do, name="smc-close", daemon=True)
+    t.start()
+    ok = done.wait(timeout)
+    if not ok:
+        logging.error("smc.close() did not finish within %ss; giving up",
+                      timeout)
+    return ok
 
 
 def run_client_once(bot_token, app_token):
@@ -333,17 +442,19 @@ def run_client_once(bot_token, app_token):
     # ThreadPoolExecutor, 见 slack_sdk 3.45.0 builtin/client.py __init__)。
     # connect() 失败也必须 close(), 否则失败的 client 在进程里越积越多。
     smc = SocketModeClient(app_token=app_token, web_client=web, **_proxy_kw())
+    # 实例补丁: 把 SDK 原生的递归重试 (apps.connections.open 返回
+    # ratelimited 时 time.sleep(Retry-After) 后递归, 信号来了也停不下来)
+    # 换成可中断的 _issue_new_wss_url_bounded。初始 connect() 与 SDK 后台
+    # 重连线程都经 self.issue_new_wss_url() 调用, 补丁对两者都生效。
+    smc.issue_new_wss_url = lambda: _issue_new_wss_url_bounded(smc)  # noqa: E731
     try:
         smc.socket_mode_request_listeners.append(handle)
-        smc.connect()
+        _connect_bounded(smc)
         logging.info("socket mode connected, listening")
         while not _shutdown:
             time.sleep(1)
     finally:
-        try:
-            smc.close()
-        except Exception:
-            pass
+        _close_bounded(smc)
 
 
 def serve_forever(bot_token, app_token, runner=None,
@@ -373,6 +484,11 @@ def serve_forever(bot_token, app_token, runner=None,
         started = time.monotonic()
         try:
             runner()
+        except _ShutdownRequested:
+            # 连接/重试/关闭阶段被停机信号打断: _shutdown 已置位, 不重建,
+            # 直接退出。各 bounded 阶段保证信号后 1 秒粒度内抛到这里。
+            logging.info("shutdown during connect/retry; exiting")
+            break
         except KeyboardInterrupt:
             # 信号已由 handler 转为 _shutdown; 这里是直接 raise 时的兜底
             logging.info("keyboard interrupt, shutting down")
