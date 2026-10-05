@@ -17,6 +17,7 @@ bot 的 thread 回复不入队，防回环），
 """
 import logging
 import os
+import signal
 import ssl
 import sys
 import time
@@ -219,13 +220,28 @@ def resolve_thread_reply(event, me, my_bot_id, web, append):
     return ("queued", record)
 
 
-def main():
-    bot_token = _ENV.get("SLACK_BOT_TOKEN")
-    app_token = _ENV.get("SLACK_APP_TOKEN")
-    if not bot_token or not app_token:
-        logging.error("missing SLACK_BOT_TOKEN / SLACK_APP_TOKEN in .env")
-        sys.exit(1)
+# --- 自愈监督层 (2026-10-05) ---
+# 背景: 出站 socket 常被代理掐断 (SSLEOFError)。SDK 有时能自己重连,
+# 有时异常会逃出 client 生命周期直接把进程带走, 只能靠外部保活重启。
+# 这一层保证: 任何 Python 层面的失败都会触发 client 重建 + 退避重试,
+# 进程只在收到明确停机信号 (SIGTERM / KeyboardInterrupt) 时退出。
+# systemd 的 Restart=always 是最后一道防线 (SIGKILL 等信号级死亡)。
+_shutdown = False
 
+
+def _handle_sigterm(signum, frame):
+    global _shutdown
+    _shutdown = True
+    logging.info("received SIGTERM, shutting down cleanly")
+
+
+def run_client_once(bot_token, app_token):
+    """一次 SocketModeClient 生命周期。阻塞直到 client 失败或收到停机信号。
+
+    正常情况只在 _shutdown 置位时返回; 其它任何退出 (异常/意外返回)
+    都由 serve_forever() 重建 client。事件处理逻辑 (handle/process_event)
+    原样不动。
+    """
     from slack_sdk.web import WebClient
     from slack_sdk.socket_mode import SocketModeClient
     from slack_sdk.socket_mode.request import SocketModeRequest
@@ -281,15 +297,62 @@ def main():
     smc.connect()
     logging.info("socket mode connected, listening")
     try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        pass
+        while not _shutdown:
+            time.sleep(1)
     finally:
         try:
             smc.close()
         except Exception:
             pass
+
+
+def serve_forever(bot_token, app_token, runner=None,
+                  initial_backoff=5, max_backoff=300, sleep_fn=time.sleep):
+    """监督循环: runner 抛出的任何异常都会触发 client 重建 + 指数退避。
+
+    runner 缺省为一次完整的 client 生命周期。只有 _shutdown
+    (SIGTERM) / KeyboardInterrupt 会干净退出; 配置缺失等硬错误
+    由 main() 在循环外直接退出, 不进重试。
+    """
+    global _shutdown
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except ValueError:
+        pass  # 非主线程 (如单测) 时跳过信号安装
+    if runner is None:
+        runner = lambda: run_client_once(bot_token, app_token)  # noqa: E731
+    backoff = initial_backoff
+    while not _shutdown:
+        started = time.time()
+        try:
+            runner()
+        except KeyboardInterrupt:
+            logging.info("keyboard interrupt, shutting down")
+            break
+        except SystemExit as e:
+            logging.warning("client raised SystemExit(code=%s); rebuilding",
+                            e.code)
+        except Exception:
+            logging.exception("socket client failed; rebuilding")
+        if _shutdown:
+            break
+        # 存活足够久说明是偶发抖动, 重置退避立即重建;
+        # 连续速死则退避拉满, 防止热循环打爆日志和 API。
+        if time.time() - started > 300:
+            backoff = initial_backoff
+        else:
+            sleep_fn(backoff)
+            backoff = min(backoff * 2, max_backoff)
+    logging.info("bridge supervisor exiting")
+
+
+def main():
+    bot_token = _ENV.get("SLACK_BOT_TOKEN")
+    app_token = _ENV.get("SLACK_APP_TOKEN")
+    if not bot_token or not app_token:
+        logging.error("missing SLACK_BOT_TOKEN / SLACK_APP_TOKEN in .env")
+        sys.exit(1)
+    serve_forever(bot_token, app_token)
 
 
 if __name__ == "__main__":
