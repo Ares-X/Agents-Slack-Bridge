@@ -70,7 +70,8 @@ class InboxDurabilityRecoveryTest(unittest.TestCase):
             modules[name] = module
         with mock.patch.dict(sys.modules, modules), mock.patch.object(
             bridge, "_ssl_ctx", return_value=None
-        ), mock.patch.object(bridge.time, "sleep", side_effect=KeyboardInterrupt):
+        ), mock.patch.object(bridge, "_start_final_deadline_watchdog"), \
+                mock.patch.object(bridge.time, "sleep", side_effect=KeyboardInterrupt):
             bridge.main()
         return socket.socket_mode_request_listeners[0], socket
 

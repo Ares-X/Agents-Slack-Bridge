@@ -153,6 +153,7 @@ class ThreadReplyHandlerTest(unittest.TestCase):
             modules[name] = m
         with mock.patch.dict(sys.modules, modules), \
              mock.patch.object(bmod, "_ssl_ctx", return_value=None), \
+             mock.patch.object(bmod, "_start_final_deadline_watchdog"), \
              mock.patch.object(bmod.time, "sleep",
                                side_effect=KeyboardInterrupt):
             bmod.main()

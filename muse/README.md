@@ -68,6 +68,36 @@ tail -f bridge.log                          # → "socket mode connected, listen
 ```
 
 > 以上是 systemd 示例，先确认宿主支持且没有已运行实例。Muse 与 Grok 的模板同名；同机部署时使用不同服务名和准确的绝对路径。保留既有 service owner，不再加另一个竞争拉起的 keepalive。配置和队列放在实际持久目录；临时容器重建会丢失未持久化内容，不能用盲目复制模板或清状态代替恢复。模型 consumer/hook 也需单独配置常驻或平台持久入口。
+>
+> **自愈（2026-10-05 起，不再依赖高频外部保活）**：`bridge.py` 内置
+> `serve_forever()` 监督循环——`connect()` 失败、client 意外退出、
+> SDK 内部 `sys.exit` 都会触发 SocketModeClient 重建 + 指数退避
+> （5s 起、300s 封顶）；失败的 client（含后台线程/线程池）每次都在
+> 下一次尝试前 `close()` 释放。systemd `Restart=always` 兜底信号级
+> 死亡。外部 keepalive 只保留每小时一次，专用于 VM 重建后从本目录
+> 重装 unit（`daemon-reload`）。
+>
+> 停机上限分阶段（按 slack_sdk 3.45.0 实测，均有单测覆盖）：
+> - 退避等待 / 主监听循环：SIGTERM/SIGINT 到达后最多约 1 秒干净退出。
+> - SDK 限流重试（`apps.connections.open` 返回 ratelimited）：SDK 原生
+>   实现会 `time.sleep(Retry-After)` 后递归重试，信号来了也停不下来；
+>   本桥用实例补丁换成 1 秒粒度等待，信号后最多约 1 秒抛停机异常退出，
+>   停机后不再继续调用 `apps.connections.open`。
+> - `connect()` 握手：daemon 线程 + 1 秒粒度 join，信号后最多约 1 秒
+>   放弃等待并 `close()` 释放。
+> - `close()`：SDK 原生 close 会无超时 join 后台线程，这里加 15 秒上限。
+> - 进程级最终停机：`close()` 的上限只管主线程等待；若 SDK 线程池里有
+>   卡住的任务，Python 退出钩子仍会等待它。看门狗观察到停机请求或监督
+>   循环结束后计时 30 秒（`FINAL_DEADLINE_SECS`，另有最多约 1 秒轮询
+>   延迟），进程仍未退出则直接 `os._exit(1)`。这一步不写日志或标准输出，
+>   因此不依赖输出管道畅通，也不等待 `close()` 返回才开始计时。已持久化
+>   未 ACK 的记录可恢复，Slack 重投通过 `msg_id` 去重；撕裂尾行由
+>   `_quarantine_torn_tail` 隔离，未完整落盘的事件仍需 Slack 重投。
+>   systemd 模板另设 `TimeoutStopSec=45` 做外层兜底。
+>
+> 覆盖边界：SDK 自带 auto_reconnect 处理 CLOSE 事件；本监督循环覆盖
+> 主线程 client 生命周期失败；**不覆盖** SDK 后台线程静默死亡与无
+> CLOSE 事件的半死长连接（依赖 SDK 会话监控）。
 
 ### 2.4 接消费层（二选一）
 
@@ -204,7 +234,7 @@ Agents-Slack-Bridge/
 ## 5. 踩坑清单（实测）
 
 1. **"向此应用发送消息的功能已关闭"** → manifest 漏了 `messages_tab_enabled: true`，去 App Home 手动开。
-2. **`/etc` 文件消失** → 见 §2.3 警告，正本放本目录 + 健康检查自愈。
+2. **`/etc` 文件消失** → 见 §2.3：正本放本目录；bridge 进程内自愈 + systemd `Restart=always` 处理运行时死亡；每小时 keepalive 只负责 VM 重建后重装 unit。
 3. **出站代理/TLS 拦截** → `.env` 配 `PROXY_URL` / `CA_BUNDLE`，三个脚本都会读。
 4. **频道必须先邀请 bot**，否则收不到 `app_mention`。
 5. **thread 回复唤醒**：人类用户在 bot 消息的 thread 下回复也会入队（kind=`thread_reply`，bot 的 thread 回复不入队以防回环）。这需要 App 的 Event Subscriptions 里订阅 `message.channels`（见 `manifest.yaml`）；订阅缺失时 thread 回复事件根本发不到桥上。处理顺序是**先查父消息、再落盘、最后 ACK**：用 `conversations_replies(limit=1)` 确认父消息是自己发的才入队；查询失败/父消息不明/落盘失败一律不 ACK，靠 Slack 重发重试，绝不当成非目标消息丢弃。
@@ -228,7 +258,7 @@ Agents-Slack-Bridge/
 ```bash
 cd muse && python3 -m unittest discover -s tests -v
 ```
-测试覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。`test_reliability.py` 另有行为测试：旧队列升级（含 delivered=false→true 顺序无关的完成标记优先）、发送结果判定、发送后崩溃恢复、并发 claim 互斥、存储失败（fsync/损坏隔离）、错误回执匹配、wire text 哈希（含 mention 追加）、队尾截断、compact 后重投。`test_reliability_round2.py` 覆盖 stale `.bak` 恢复拒绝、严格版本/结构校验、分来源隔离证据、ack 异常、旧快照、`client_msg_id` 核验和目录持久化。恢复测试另外覆盖目录持续故障下真实 bridge handler 不 ACK、完成记录读取失败不重发，以及限流 60/120 秒跨重启等待、到期领取互斥、错误期限拒绝和迟到核验。`test_natural_collaboration.py` 另覆盖频道/线程分页去重、完整正文和控制卡、分页失败不输出部分成功、静默原因/来源持久化及 compact 保留、并发领取互斥、所有未完成发送状态拒绝静默、fsync 故障与重复确认。仅标准库与模拟网络，无新增依赖。
+测试覆盖：并发入队不丢不重、跨频道同 `ts`、tombstone ack 语义、compact、事件子类型过滤、bot 白名单两种模式、mention 脱敏/显式点名、ack 失败不重发、发送结果不确定不盲目重发、历史失败延迟→降级。`test_reliability.py` 另有行为测试：旧队列升级（含 delivered=false→true 顺序无关的完成标记优先）、发送结果判定、发送后崩溃恢复、并发 claim 互斥、存储失败（fsync/损坏隔离）、错误回执匹配、wire text 哈希（含 mention 追加）、队尾截断、compact 后重投。`test_reliability_round2.py` 覆盖 stale `.bak` 恢复拒绝、严格版本/结构校验、分来源隔离证据、ack 异常、旧快照、`client_msg_id` 核验和目录持久化。恢复测试另外覆盖目录持续故障下真实 bridge handler 不 ACK、完成记录读取失败不重发，以及限流 60/120 秒跨重启等待、到期领取互斥、错误期限拒绝和迟到核验。`test_natural_collaboration.py` 另覆盖频道/线程分页去重、完整正文和控制卡、分页失败不输出部分成功、静默原因/来源持久化及 compact 保留、并发领取互斥、所有未完成发送状态拒绝静默、fsync 故障与重复确认。`test_bridge_supervisor.py` 覆盖监督循环：异常重建与指数退避/封顶/长稳重置、SystemExit 重建、KeyboardInterrupt 与配置缺失的干净退出、SIGTERM/SIGINT handler 语义、**真实 `run_client_once` 路径** 5 次连续 connect 失败各释放 client（线程回收、恢复后无重建、线程数回基线）、**真实子进程**退避阶段 SIGTERM/SIGINT（<5 秒退出、不重建、无 traceback）。仅标准库与模拟网络，无新增依赖。
 
 `test_receipt_recovery.py` 覆盖：响应丢失后通过第二页原生回执确认且只有一次 POST/ACK，缺失/错误回执与分页故障保持 uncertain，顶层收到回复的 thread 语义，正向时钟偏差，普通长正文/mention 保留，安全诊断字段及身份解析恢复。
 

@@ -2,6 +2,9 @@
 Description=Agent Slack Bridge Muse (Socket Mode)
 After=network-online.target
 Wants=network-online.target
+# 热循环保护: 10 分钟内最多重启 30 次, 超限则不再拉起 (与线上一致)
+StartLimitIntervalSec=600
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -11,6 +14,9 @@ ExecStart=/path/to/venv/bin/python /path/to/Agents-Slack-Bridge/muse/bridge.py
 WorkingDirectory=/path/to/Agents-Slack-Bridge/muse
 Restart=always
 RestartSec=10
+# 停机上限分层: 请求停机后, 进程内看门狗 30s + 最多约 1s 轮询后硬退出;
+# 若仍未退出, systemd 从停机请求起 45s 后 SIGKILL。
+TimeoutStopSec=45
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
