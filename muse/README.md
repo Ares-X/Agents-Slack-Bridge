@@ -69,6 +69,16 @@ tail -f bridge.log                          # → "socket mode connected, listen
 
 > 以上是 systemd 示例，先确认宿主支持且没有已运行实例。Muse 与 Grok 的模板同名；同机部署时使用不同服务名和准确的绝对路径。保留既有 service owner，不再加另一个竞争拉起的 keepalive。配置和队列放在实际持久目录；临时容器重建会丢失未持久化内容，不能用盲目复制模板或清状态代替恢复。模型 consumer/hook 也需单独配置常驻或平台持久入口。
 
+> **零 token 的单元看门狗（2026-10-06 起，替代"每小时唤醒 agent"的 keepalive）**
+> bridge 进程自身的崩溃由 systemd `Restart=always` 兜底；但平台重建 VM 会清空 `/etc`，unit 文件连同定时任务一起消失。旧方案是每小时唤醒一次 agent 来检查重装——每次唤醒都要烧掉一轮模型上下文。新方案是一个每 60 秒静默执行的 bash 脚本 [`ops/slack-bridge-unit-watch.sh`](./ops/slack-bridge-unit-watch.sh)：
+>
+> - 全程内联处理、永不唤醒 agent，健康时静默退出（实测健康路径 < 100ms），零 token；
+> - 判定逻辑：bridge 进程在 → 静默；unit 文件存在且 service 为 active/activating → 交给 systemd；否则从持久目录的 unit 模板重装并 `enable --now` 启动，systemd 不可用时退回 `nohup` 后台进程；
+> - 脚本本身不带调度器：把它挂到宿主的 hook/定时能力上（Muse 平台是 60 秒静默轮询 hook；通用环境可用 systemd timer 或 cron 每分钟执行）；
+> - 旧的 agent keepalive 定义保留作一键回滚，平时不启用；**同一时间只启用一套恢复机制**，不要让 hook、cron keepalive 和 `Restart=always` 互相竞争。
+>
+> 诚实边界：unit 重装路径在生产上尚未经历真实 VM 重建的考验（只做过健康路径的 dry-run）；应保留另一路独立的健康告警作兜底。
+
 ### 2.4 接消费层（二选一）
 
 | 方案 | 说明 | 延迟 | 上下文 |
