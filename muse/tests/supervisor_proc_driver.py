@@ -25,8 +25,14 @@ def failing_runner():
     raise RuntimeError("simulated client failure")
 
 
+def wait_in_backoff(seconds):
+    print("DRIVER entering backoff", flush=True)
+    bridge._wait_interruptible(seconds)
+
+
 if __name__ == "__main__":
     backoff = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
     bridge.serve_forever("x", "y", runner=failing_runner,
-                         initial_backoff=backoff, max_backoff=backoff)
+                         initial_backoff=backoff, max_backoff=backoff,
+                         wait_fn=wait_in_backoff)
     print("DRIVER exiting cleanly", flush=True)

@@ -20,6 +20,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from subprocess_helpers import start_driver
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -251,21 +252,8 @@ class SubprocessSignalTest(unittest.TestCase):
                           "supervisor_proc_driver.py")
 
     def _run_driver_until_backoff(self):
-        proc = subprocess.Popen(
-            [sys.executable, self.DRIVER, "30"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.time() + 25
-        saw = False
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            if "DRIVER runner failed #1" in line:
-                saw = True
-                break
-        self.assertTrue(saw, "driver did not reach backoff (rc=%s)"
-                             % proc.poll())
-        return proc
+        return start_driver(self, [sys.executable, self.DRIVER, "30"],
+                            "DRIVER entering backoff", timeout=25)
 
     def _assert_clean_signal_exit(self, proc, sig, name):
         # 用 communicate(timeout) 边等边排空管道: 先 wait() 再

@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import unittest
+from subprocess_helpers import start_driver
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -198,21 +199,8 @@ class SubprocessRateLimitTest(unittest.TestCase):
                           "rate_limit_driver.py")
 
     def _run_driver_until_ratelimit_wait(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-u", self.DRIVER],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.time() + 30
-        saw = False
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            if "Rate limited. Retrying in" in line:
-                saw = True
-                break
-        self.assertTrue(saw, "driver did not enter SDK rate-limit wait "
-                             "(rc=%s)" % proc.poll())
-        return proc
+        return start_driver(self, [sys.executable, "-u", self.DRIVER],
+                            "Rate limited. Retrying in")
 
     def _assert_clean_signal_exit(self, proc, sig, name):
         # 用 communicate(timeout) 边等边排空管道: 先 wait() 再
@@ -285,21 +273,11 @@ class SubprocessStuckExecutorTest(unittest.TestCase):
         import shutil
         import tempfile
         inbox_dir = tempfile.mkdtemp(prefix="bridge-inbox-test-")
+        proc = None
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-u", self.DRIVER, inbox_dir, "2", "5"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            deadline = time.time() + 30
-            saw = False
-            while time.time() < deadline:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                if "DRIVER stuck task submitted" in line:
-                    saw = True
-                    break
-            self.assertTrue(saw, "driver did not submit stuck task (rc=%s)"
-                                 % proc.poll())
+            proc = start_driver(
+                self, [sys.executable, "-u", self.DRIVER, inbox_dir, "2", "5"],
+                "DRIVER stuck task submitted")
             t0 = time.time()
             proc.send_signal(signal.SIGTERM)
             # communicate(timeout) drains pipes while waiting: no fake
@@ -313,15 +291,14 @@ class SubprocessStuckExecutorTest(unittest.TestCase):
                           "a stuck executor task (stdout tail: %s)"
                           % out[-500:])
             elapsed = time.time() - t0
-            # bound: 2s close timeout + ~1s supervisor + 5s final deadline
+            # The final deadline starts on the shutdown request, not after close.
+            self.assertGreaterEqual(elapsed, 5)
             self.assertLess(elapsed, 20,
                             "final shutdown took %.1fs" % elapsed)
             self.assertEqual(1, proc.returncode,
                              "expected os._exit(1) from the final-deadline "
                              "watchdog, got rc=%s" % proc.returncode)
-            self.assertIn("FINAL DEADLINE", out,
-                          "watchdog did not fire; stdout tail: %s"
-                          % out[-500:])
+            self.assertIn("DRIVER supervisor returned", out)
             self.assertNotIn("Traceback", err,
                              "traceback in stderr: %s" % err[-500:])
             self.assertNotIn("DRIVER STILL ALIVE", out,
@@ -354,7 +331,45 @@ class SubprocessStuckExecutorTest(unittest.TestCase):
                 inbox_store_mod.INBOX_PATH = prev_inbox
                 inbox_store_mod.LOCK_PATH = prev_lock
         finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
             shutil.rmtree(inbox_dir, ignore_errors=True)
+
+
+class WatchdogOutputTest(unittest.TestCase):
+    def test_full_stdout_cannot_block_final_exit(self):
+        # A real full pipe blocks print/flush. Keep the supervisor unfinished
+        # so this also proves the deadline starts before cleanup can return.
+        code = r'''
+import os, signal, sys, time
+import bridge
+read_fd, write_fd = os.pipe()
+os.set_blocking(write_fd, False)
+try:
+    while True:
+        os.write(write_fd, b'x' * 4096)
+except BlockingIOError:
+    pass
+os.set_blocking(write_fd, True)
+sys.stdout = os.fdopen(write_fd, 'w', buffering=1)
+signal.signal(signal.SIGTERM, bridge._handle_sigterm)
+bridge._start_final_deadline_watchdog(deadline_secs=1)
+os.kill(os.getpid(), signal.SIGTERM)
+time.sleep(8)
+os._exit(99)
+'''
+        for trigger in ("os.kill(os.getpid(), signal.SIGTERM)",
+                        "bridge._shutdown_decided.set()"):
+            with self.subTest(trigger=trigger):
+                started = time.monotonic()
+                result = subprocess.run(
+                    [sys.executable, "-c", code.replace(
+                        "os.kill(os.getpid(), signal.SIGTERM)", trigger)],
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6)
+                self.assertEqual(1, result.returncode, result.stderr)
+                self.assertLess(time.monotonic() - started, 5)
 
 
 if __name__ == "__main__":

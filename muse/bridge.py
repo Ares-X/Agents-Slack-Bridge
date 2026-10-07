@@ -255,11 +255,11 @@ def resolve_thread_reply(event, me, my_bot_id, web, append):
 #     粒度 join; 信号后最多约 1 秒放弃等待, 由 finally 做 close() 释放。
 #   * close(): SDK 原生 close() 会无超时 join 后台线程; _close_bounded
 #     加 CLOSE_TIMEOUT_SECS (15s) 上限, 超时则记 error 日志并放弃
-#     (进程仍会退出)。
+#     (最终进程退出由看门狗和服务监管兜底)。
 #   * 进程级最终停机上限: _close_bounded 只限制主线程等待。若 SDK
-#     ThreadPoolExecutor 里有卡住的任务 (worker 是非 daemon 线程),
-#     Python 退出钩子仍会等它, 进程退不掉。最终停机看门狗在监督循环
-#     决定退出 (_shutdown_decided) 后计时, FINAL_DEADLINE_SECS (30s)
+#     ThreadPoolExecutor 里有卡住的任务,
+#     Python 退出钩子仍会等它, 进程退不掉。最终停机看门狗在
+#     收到停机请求或监督循环决定退出后计时, FINAL_DEADLINE_SECS (30s)
 #     后仍未退出则 os._exit(1) 硬结束 —— 实际进程结束, 有单测覆盖。
 #     恢复语义不受影响: 未 ACK 的 Slack 会重发 (msg_id 去重), 撕裂的
 #     append 由 _quarantine_torn_tail 隔离。
@@ -391,14 +391,14 @@ def _close_bounded(smc, timeout=15):
 
 # ---- 进程级最终停机上限 ----
 # _close_bounded 只限制主线程等待 close() 的时长。若 SDK ThreadPoolExecutor
-# 里有卡住的任务, worker 线程是非 daemon 的 (3.12 实测), Python 退出钩子仍
+# 里有卡住的任务, Python 退出钩子仍
 # 会等它, 进程退不掉 —— 2026-10-05 实测: SIGTERM 后 helper 15s 返回 False、
-# 监督循环返回, 但 18s 时进程仍活着。看门狗在监督循环决定退出后计时, 到期
+# 监督循环返回, 但 18s 时进程仍活着。看门狗在停机请求到达后计时, 到期
 # 仍未退出则 os._exit(1) 硬结束。这是实际进程结束, 不是"打印了退出"、
 # 也不是再套一层 daemon 包装。
 # 恢复语义: 卡住的 handler 若已落盘但未 ACK, Slack 会重发, msg_id 去重保证
 # 不重复入队; 若正好死在 append 中间, 下次启动 _quarantine_torn_tail 会隔离
-# 撕裂行 (见 inbox_store)。所以硬结束不丢消息、不坏队列。
+# 撕裂行 (见 inbox_store)。已持久化记录可恢复; 未确认事件仍需 Slack 重投。
 CLOSE_TIMEOUT_SECS = 15
 FINAL_DEADLINE_SECS = 30
 
@@ -409,10 +409,10 @@ _watchdog_epoch = 0
 def _start_final_deadline_watchdog(deadline_secs=None):
     """启动最终停机看门狗 (daemon 线程)。
 
-    监督循环结束并置 _shutdown_decided 后开始计时; deadline_secs 秒后
-    进程仍活着, 说明 stuck 的非 daemon 线程拖住了 Python 退出, 则
+    观察到停机请求或 _shutdown_decided 后开始计时; deadline_secs 秒后
+    进程仍活着, 说明退出未完成 (例如 executor 任务卡住), 则
     os._exit(1) 硬结束。epoch 防止旧看门狗误杀新一轮监督循环
-    (单测里多次调用 serve_forever)。
+    (重复启动看门狗时)。
     """
     if deadline_secs is None:
         deadline_secs = FINAL_DEADLINE_SECS
@@ -421,7 +421,10 @@ def _start_final_deadline_watchdog(deadline_secs=None):
     epoch = _watchdog_epoch
 
     def _watch():
-        while not _shutdown_decided.is_set():
+        # 不等待 close() 或退出日志: 它们本身也可能被 I/O 卡住。
+        while not (_shutdown or _shutdown_decided.is_set()):
+            if epoch != _watchdog_epoch:
+                return
             time.sleep(1)
         deadline = time.monotonic() + deadline_secs
         while time.monotonic() < deadline:
@@ -430,12 +433,7 @@ def _start_final_deadline_watchdog(deadline_secs=None):
             time.sleep(1)
         if epoch != _watchdog_epoch:
             return
-        # 此时解释器可能正在 teardown, 不用 logging; 打印失败也不影响硬退出。
-        try:
-            print("FINAL DEADLINE: process did not exit within %ss after "
-                  "shutdown decided; os._exit(1)" % deadline_secs, flush=True)
-        except Exception:
-            pass
+        # 硬停机不能依赖任何输出: 满管道或被占用的日志锁都会阻塞 print/log。
         os._exit(1)
 
     threading.Thread(target=_watch, name="final-deadline",
@@ -529,7 +527,7 @@ def serve_forever(bot_token, app_token, runner=None,
     (停机信号) 会干净退出; 配置缺失等硬错误由 main() 在循环外直接
     退出, 不进重试。
     进程级最终停机上限: 由 main() 启动最终停机看门狗; 监督循环结束
-    (置 _shutdown_decided) 后 FINAL_DEADLINE_SECS 秒内进程仍未退出
+    或收到停机请求后 FINAL_DEADLINE_SECS 秒内进程仍未退出
     (如 SDK executor 里有卡住的非 daemon 任务), 看门狗 os._exit(1)
     硬结束。见 _start_final_deadline_watchdog。
     """
@@ -588,7 +586,7 @@ def main():
     if not bot_token or not app_token:
         logging.error("missing SLACK_BOT_TOKEN / SLACK_APP_TOKEN in .env")
         sys.exit(1)
-    # 进程级最终停机上限: 监督循环决定退出后, 若 stuck 的非 daemon 线程
+    # 进程级最终停机上限: 请求停机后, 若 stuck 的非 daemon 线程
     # 拖住 Python 退出, 看门狗在 FINAL_DEADLINE_SECS 秒后 os._exit(1)。
     _start_final_deadline_watchdog()
     serve_forever(bot_token, app_token)

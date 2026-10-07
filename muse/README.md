@@ -87,11 +87,13 @@ tail -f bridge.log                          # → "socket mode connected, listen
 >   放弃等待并 `close()` 释放。
 > - `close()`：SDK 原生 close 会无超时 join 后台线程，这里加 15 秒上限。
 > - 进程级最终停机：`close()` 的上限只管主线程等待；若 SDK 线程池里有
->   卡住的任务（worker 是非 daemon 线程，Python 退出钩子会等它），看门狗
->   在监督循环决定退出后 30 秒（`FINAL_DEADLINE_SECS`）仍未退出则
->   `os._exit(1)` 硬结束——是实际进程结束。未 ACK 的消息 Slack 会重发
->   （`msg_id` 去重），撕裂的落盘由 `_quarantine_torn_tail` 隔离，队列
->   不丢不坏。systemd 模板另设 `TimeoutStopSec=45` 做外层兜底。
+>   卡住的任务，Python 退出钩子仍会等待它。看门狗观察到停机请求或监督
+>   循环结束后计时 30 秒（`FINAL_DEADLINE_SECS`，另有最多约 1 秒轮询
+>   延迟），进程仍未退出则直接 `os._exit(1)`。这一步不写日志或标准输出，
+>   因此不依赖输出管道畅通，也不等待 `close()` 返回才开始计时。已持久化
+>   未 ACK 的记录可恢复，Slack 重投通过 `msg_id` 去重；撕裂尾行由
+>   `_quarantine_torn_tail` 隔离，未完整落盘的事件仍需 Slack 重投。
+>   systemd 模板另设 `TimeoutStopSec=45` 做外层兜底。
 >
 > 覆盖边界：SDK 自带 auto_reconnect 处理 CLOSE 事件；本监督循环覆盖
 > 主线程 client 生命周期失败；**不覆盖** SDK 后台线程静默死亡与无

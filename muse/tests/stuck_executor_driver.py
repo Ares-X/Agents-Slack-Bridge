@@ -93,13 +93,12 @@ if __name__ == "__main__":
         print("DRIVER stuck task submitted to SDK executor", flush=True)
 
     threading.Thread(target=_inject_stuck_task, daemon=True).start()
-    # serve_forever() 本身不启动看门狗 (由 main() 负责); 本测试显式启动,
-    # 以验证进程级最终停机上限。
-    bridge._start_final_deadline_watchdog()
+    # Exercise the production entry point, including watchdog startup.
+    bridge._ENV = {"SLACK_BOT_TOKEN": "test-only", "SLACK_APP_TOKEN": "test-only"}
     with mock.patch("slack_sdk.web.WebClient", FakeWebClient), \
          mock.patch("slack_sdk.socket_mode.SocketModeClient",
                     CapturingSocketModeClient):
-        bridge.serve_forever("x", "y")
+        bridge.main()
     print("DRIVER supervisor returned", flush=True)
     # 3) the watchdog should have os._exit()d by now; reaching here with
     #    the process still alive past deadline+margin means the bound failed.
