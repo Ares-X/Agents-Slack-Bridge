@@ -78,6 +78,10 @@ tail -f bridge.log                          # → "socket mode connected, listen
 > - 旧的 agent keepalive 定义保留作一键回滚，平时不启用；**同一时间只启用一套恢复机制**，不要让 hook、cron keepalive 和 `Restart=always` 互相竞争。
 >
 > 诚实边界：unit 重装路径在生产上尚未经历真实 VM 重建的考验（只做过健康路径的 dry-run）；应保留另一路独立的健康告警作兜底。
+>
+> **唤醒守卫（2026-10-07 起）**：watcher hook 每轮轮询时先把 inbox 队列喂给 [`ops/slack-wake-guard.py`](./ops/slack-wake-guard.py)，由它决定哪些未投递消息可以唤醒 agent。预算规则：同一条消息最多唤醒两次（首次一次；30 分钟后仍未 ack 再升级一次；之后永久静默）。这曾是一条漏 ack 的 #general 消息导致 hook 每 5 秒重复唤醒 worker、烧掉约 60M token 的教训——把预算写进脚本里治本。环境变量配置：`WATCH_CHANNEL`（监听的 channel）、`WAKE_STATE`（状态文件路径）、`ESCALATE_AFTER`（升级秒数，默认 1800）、`WATCH_DRY=1` 只读试运行。
+>
+> systemd 模板里的 `StartLimitIntervalSec` / `StartLimitBurst` 必须放在 `[Unit]` 段——放错到 `[Service]` 会被 systemd 忽略（只报 Unknown key），崩溃循环保护等于没生效。模板已修正。
 
 ### 2.4 接消费层（二选一）
 

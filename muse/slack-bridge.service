@@ -2,6 +2,10 @@
 Description=Agent Slack Bridge Muse (Socket Mode)
 After=network-online.target
 Wants=network-online.target
+# 注意: StartLimit* 必须放在 [Unit] 段。放在 [Service] 会被 systemd 忽略
+# （只报 Unknown key 告警），等于崩溃循环保护没生效。
+StartLimitIntervalSec=600
+StartLimitBurst=30
 
 [Service]
 Type=simple
