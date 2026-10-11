@@ -1,5 +1,6 @@
-"""keepalive.sh process identity and flock. No live Slack. No live PIDs killed.
+"""keepalive.sh process identity, flock, and socket probe restart.
 
+No live Slack. No live deploy PIDs killed.
 The fake interpreter is a symlink to the system python, and bridge.py /
 consumer/poll_consumer.py under the temp root only record their PID and sleep.
 Cleanup signals only PIDs those scripts recorded.
@@ -333,6 +334,82 @@ class KeepaliveTests(unittest.TestCase):
         self.assertIn("not starting", proc.stdout)
         self.assertNotIn("cannot keep alive", proc.stdout)
         self.assertFalse((self.root / "starts.txt").exists())
+
+
+    def _write_probe(self, script_body: str) -> Path:
+        p = Path(self.tmp.name) / "fake_probe.sh"
+        p.write_text("#!/bin/bash\n" + script_body + "\n")
+        p.chmod(0o755)
+        return p
+
+    def test_socket_probe_ok_does_not_restart(self):
+        proc = self._run(real_proc=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        before = (self.root / "starts.txt").read_text()
+        probe = self._write_probe('echo "probe ok (heartbeat age=3s < 120s)"; exit 0')
+        proc2 = self._run(
+            real_proc=True,
+            extra_env={"KEEPALIVE_SOCKET_PROBE": str(probe)},
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr + proc2.stdout)
+        self.assertIn("probe ok", proc2.stdout)
+        self.assertNotIn("stopping bridge.py", proc2.stdout)
+        self.assertNotIn("restarting", proc2.stdout)
+        self.assertEqual((self.root / "starts.txt").read_text(), before)
+
+    def test_socket_probe_restart_kills_and_starts_bridge_only(self):
+        proc = self._run(real_proc=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        first_pids = _recorded_pids(self.root)
+        self.assertEqual(len(first_pids), 2)
+        bridge_pid = None
+        for line in (self.root / "starts.txt").read_text().splitlines():
+            pid_s, script = line.split(" ", 1)
+            if script.endswith("bridge.py"):
+                bridge_pid = int(pid_s)
+        self.assertIsNotNone(bridge_pid)
+        probe = self._write_probe(
+            'echo "probe fail: heartbeat stale but auth.test ok; restarting bridge.py"; exit 1'
+        )
+        proc2 = self._run(
+            real_proc=True,
+            extra_env={"KEEPALIVE_SOCKET_PROBE": str(probe)},
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr + proc2.stdout)
+        self.assertIn("restarting bridge.py", proc2.stdout)
+        self.assertIn("stopping bridge.py", proc2.stdout)
+        self.assertIn("started bridge.py pid=", proc2.stdout)
+        # Consumer must not be restarted by the probe path.
+        self.assertNotIn("started consumer/poll_consumer.py pid=", proc2.stdout)
+        self.assertIn("consumer/poll_consumer.py already running", proc2.stdout)
+        # Old bridge should be gone; a new bridge start recorded.
+        all_pids = _recorded_pids(self.root)
+        self.assertGreaterEqual(len(all_pids), 3)
+        try:
+            os.kill(bridge_pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+        self.assertFalse(alive, "old bridge pid should be dead")
+        scripts = sorted(args[0] for _pid, args in _live_matches(self.root) if args)
+        self.assertEqual(scripts, ["bridge.py", "consumer/poll_consumer.py"])
+
+    def test_socket_probe_no_restart_when_auth_fails(self):
+        proc = self._run(real_proc=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        before = (self.root / "starts.txt").read_text()
+        probe = self._write_probe(
+            'echo "probe fail: heartbeat missing; auth.test error: Timeout; not restarting"; exit 2'
+        )
+        proc2 = self._run(
+            real_proc=True,
+            extra_env={"KEEPALIVE_SOCKET_PROBE": str(probe)},
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr + proc2.stdout)
+        self.assertIn("not restarting", proc2.stdout)
+        self.assertNotIn("stopping bridge.py", proc2.stdout)
+        self.assertEqual((self.root / "starts.txt").read_text(), before)
+
 
 
 if __name__ == "__main__":
