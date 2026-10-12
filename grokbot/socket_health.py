@@ -245,11 +245,18 @@ def decide_probe(
     if heartbeat_age is not None and heartbeat_age < float(stale_sec):
         return PROBE_OK, f"probe ok (heartbeat age={heartbeat_age:.0f}s < {stale_sec:.0f}s)"
 
-    # No heartbeat yet, but bridge just started → wait (avoid restart storm).
-    if heartbeat_age is None and bridge_age is not None and bridge_age < float(stale_sec):
+    # Bridge just started → wait for a fresh heartbeat. Covers both a missing
+    # file and a leftover stale file from the previous process (otherwise
+    # keepalive restart-storms every tick until ping/pong arrives).
+    if bridge_age is not None and bridge_age < float(stale_sec):
+        if heartbeat_age is None:
+            return (
+                PROBE_OK,
+                f"probe ok (waiting for first heartbeat; bridge age={bridge_age:.0f}s < {stale_sec:.0f}s)",
+            )
         return (
             PROBE_OK,
-            f"probe ok (waiting for first heartbeat; bridge age={bridge_age:.0f}s < {stale_sec:.0f}s)",
+            f"probe ok (warmup; leftover heartbeat age={heartbeat_age:.0f}s; bridge age={bridge_age:.0f}s < {stale_sec:.0f}s)",
         )
 
     if heartbeat_age is None:
@@ -293,14 +300,16 @@ def probe_once(
     if bridge_age is None and root is not None:
         bridge_age = bridge_uptime_sec(root=root, proc=proc, now=now)
 
-    if age is None and bridge_age is not None and bridge_age < float(stale_sec):
-        return decide_probe(
-            heartbeat_age=age,
-            auth_ok=True,
-            auth_detail="skipped",
-            stale_sec=stale_sec,
-            bridge_age=bridge_age,
-        )
+    # Young bridge: do not auth.test+restart on missing OR leftover-stale hb.
+    if bridge_age is not None and bridge_age < float(stale_sec):
+        if age is None or age >= float(stale_sec):
+            return decide_probe(
+                heartbeat_age=age,
+                auth_ok=True,
+                auth_detail="skipped",
+                stale_sec=stale_sec,
+                bridge_age=bridge_age,
+            )
 
     if auth_fn is not None:
         ok, detail = auth_fn()

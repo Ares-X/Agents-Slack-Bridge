@@ -204,6 +204,9 @@ if proc_matches "bridge.py"; then
   probe_rc=$?
   if [ "$probe_rc" -eq 1 ]; then
     kill_bridge
+    # Drop leftover heartbeat so the next tick cannot treat the prior
+    # process's stamp as proof the brand-new bridge is already dead.
+    rm -f "$ROOT/socket_heartbeat"
     start_bridge || true
   fi
 else

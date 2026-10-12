@@ -160,5 +160,38 @@ class SocketHealthTests(unittest.TestCase):
 
 
 
+    def test_decide_probe_warmup_with_leftover_stale_heartbeat(self):
+        # Leftover file from previous process must not restart a young bridge.
+        code, reason = decide_probe(
+            heartbeat_age=200.0,
+            auth_ok=True,
+            auth_detail="auth.test ok",
+            stale_sec=120,
+            bridge_age=30.0,
+        )
+        self.assertEqual(code, PROBE_OK)
+        self.assertIn("warmup", reason)
+        self.assertIn("leftover heartbeat", reason)
+
+    def test_probe_once_stale_hb_young_bridge_skips_auth(self):
+        write_heartbeat(self.hb, now=1000.0)
+        calls = []
+
+        def auth_fn():
+            calls.append(1)
+            return True, "auth.test ok"
+
+        code, reason = probe_once(
+            heartbeat_path=self.hb,
+            stale_sec=120,
+            now=1300.0,
+            auth_fn=auth_fn,
+            bridge_age=10.0,
+        )
+        self.assertEqual(code, PROBE_OK)
+        self.assertEqual(calls, [])
+        self.assertIn("warmup", reason)
+
+
 if __name__ == "__main__":
     unittest.main()
