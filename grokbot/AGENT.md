@@ -151,6 +151,19 @@
 | `pending_notify.py` | 未处理 → `pending.json`（5min agent fallback） |
 | `manifest.yaml` | 建 App 用 |
 | `tests/` | 无 live Slack 单元测试 |
+| `keepalive.sh` | 30s 本机保活：缺进程则拉起；Socket Mode 靠 `socket_heartbeat`+`auth.test` 探活，假死只重启 bridge |
+| `socket_health.py` | bridge 写心跳；keepalive 探活（事件静默≠死亡） |
+
+
+## Socket Mode 本机保活（不耗 agent 额度）
+
+进程保活 ≠ 长连接保活。`keepalive.sh` 每 ~30s：
+
+1. 缺 `bridge.py` / `consumer` 则拉起（flock + cwd 身份，不双开）。
+2. bridge 在跑时读 `socket_heartbeat`（由 `bridge.py` 在 Socket Mode **ping/pong 新鲜**时写入）。频道无消息的静默不算死亡。
+3. 心跳过期（默认 120s）且 `auth.test` 成功 → 只杀/重启 `bridge.py`（队列、consumer、凭据不动）。`auth.test` 失败 → 只打日志，避免网络故障时疯狂重启。
+
+不要用「每 5 分钟唤醒 agent」代替本脚本。
 
 ## 测试
 

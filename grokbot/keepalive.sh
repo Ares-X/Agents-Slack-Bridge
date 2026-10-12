@@ -12,6 +12,13 @@
 # I/O, exit 64, …) log the real reason and exit non-zero. They must not
 # look like a 20s wait.
 #
+# Socket Mode heal (local, no agent quota):
+#   bridge.py writes $ROOT/socket_heartbeat when the live session has a fresh
+#   ping/pong. This script runs socket_probe.py: event silence is NOT death.
+#   Stale/missing heartbeat + successful auth.test → kill/restart bridge.py
+#   only (queues, consumer, credentials untouched). auth.test failure → log
+#   and do not thrash. Override: SOCKET_PROBE_STALE_SEC (default 120).
+#
 # Double-start:
 #   Exclusive flock on $ROOT/keepalive.lock around the check and the start.
 #   Process identity is not pgrep -f. A match requires all of:
@@ -56,6 +63,31 @@ proc_matches() {
   return 1
 }
 
+# Print matching PIDs (one per line) for needle; empty if none.
+proc_pids() {
+  local needle="$1"
+  local d cwd a
+  local -a args
+  for d in "$PROC"/[0-9]*; do
+    [ -r "$d/cmdline" ] || continue
+    cwd=$(readlink -f "$d/cwd" 2>/dev/null || true)
+    [ "$cwd" = "$ROOT_REAL" ] || continue
+    args=()
+    mapfile -d '' args < "$d/cmdline" || true
+    [ "${#args[@]}" -ge 1 ] || continue
+    case "${args[0]}" in
+      */venv/bin/python) ;;
+      *) continue ;;
+    esac
+    for a in "${args[@]:1}"; do
+      if [ "$a" = "$needle" ] || [ "$a" = "$ROOT/$needle" ] || [ "$a" = "$ROOT_REAL/$needle" ]; then
+        echo "${d##*/}"
+        break
+      fi
+    done
+  done
+}
+
 wait_visible() {
   local needle="$1"
   local i
@@ -66,6 +98,80 @@ wait_visible() {
     sleep 0.1
   done
   return 1
+}
+
+start_bridge() {
+  if [ ! -x "$PY" ]; then
+    echo "$(ts) keepalive: bridge.py not running, python not executable ($PY); not starting"
+    return 1
+  fi
+  echo "$(ts) keepalive: bridge.py not running, starting"
+  # 9>&- so the child does not inherit the flock fd and pin the lock.
+  nohup "$PY" bridge.py >> "$ROOT/bridge.log" 2>&1 < /dev/null 9>&- &
+  echo "$(ts) keepalive: started bridge.py pid=$!"
+  if ! wait_visible "bridge.py"; then
+    echo "$(ts) keepalive: bridge.py start not visible yet pid=$!"
+  fi
+  return 0
+}
+
+# Kill matching bridge.py PIDs (SIGTERM then SIGKILL). Real /proc only.
+kill_bridge() {
+  local pids pid i
+  pids=$(proc_pids "bridge.py" || true)
+  if [ -z "${pids}" ]; then
+    echo "$(ts) keepalive: no bridge.py pid to kill"
+    return 0
+  fi
+  echo "$(ts) keepalive: stopping bridge.py pids=${pids//$'\n'/ }"
+  for pid in $pids; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if ! proc_matches "bridge.py"; then
+      echo "$(ts) keepalive: bridge.py stopped"
+      return 0
+    fi
+    sleep 0.1
+  done
+  pids=$(proc_pids "bridge.py" || true)
+  for pid in $pids; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  sleep 0.1
+  echo "$(ts) keepalive: bridge.py kill completed"
+}
+
+# Socket Mode probe. Exit codes from socket_health.probe_once:
+#   0 ok, 1 restart bridge, 2 unhealthy but do not restart (e.g. auth.test fail).
+# Tests may set KEEPALIVE_SOCKET_PROBE to a stand-in command (stdout=reason).
+run_socket_probe() {
+  local out rc
+  if [ -n "${KEEPALIVE_SOCKET_PROBE:-}" ]; then
+    out=$($KEEPALIVE_SOCKET_PROBE 2>&1)
+    rc=$?
+  else
+    if [ ! -x "$PY" ]; then
+      echo "$(ts) keepalive: socket probe skipped; python not executable"
+      return 0
+    fi
+    if [ ! -f "$ROOT/socket_health.py" ]; then
+      echo "$(ts) keepalive: socket probe skipped; socket_health.py missing"
+      return 0
+    fi
+    out=$(KEEPALIVE_ROOT="$ROOT" "$PY" "$ROOT/socket_health.py" 2>&1)
+    rc=$?
+  fi
+  echo "$(ts) keepalive: $out"
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    2) return 2 ;;
+    *)
+      echo "$(ts) keepalive: socket probe unexpected rc=$rc; not restarting"
+      return 0
+      ;;
+  esac
 }
 
 # 11 is only the contended/timeout status (flock -E). util-linux uses
@@ -93,18 +199,18 @@ fi
 
 if proc_matches "bridge.py"; then
   echo "$(ts) keepalive: bridge.py already running"
-else
-  if [ ! -x "$PY" ]; then
-    echo "$(ts) keepalive: bridge.py not running, python not executable ($PY); not starting"
-  else
-    echo "$(ts) keepalive: bridge.py not running, starting"
-    # 9>&- so the child does not inherit the flock fd and pin the lock.
-    nohup "$PY" bridge.py >> "$ROOT/bridge.log" 2>&1 < /dev/null 9>&- &
-    echo "$(ts) keepalive: started bridge.py pid=$!"
-    if ! wait_visible "bridge.py"; then
-      echo "$(ts) keepalive: bridge.py start not visible yet pid=$!"
-    fi
+  # Probe Socket Mode via heartbeat + auth.test (no agent wake).
+  run_socket_probe
+  probe_rc=$?
+  if [ "$probe_rc" -eq 1 ]; then
+    kill_bridge
+    # Drop leftover heartbeat so the next tick cannot treat the prior
+    # process's stamp as proof the brand-new bridge is already dead.
+    rm -f "$ROOT/socket_heartbeat"
+    start_bridge || true
   fi
+else
+  start_bridge || true
 fi
 
 if proc_matches "consumer/poll_consumer.py"; then

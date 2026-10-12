@@ -343,9 +343,63 @@ def main():
     smc.socket_mode_request_listeners.append(handle)
     smc.connect()
     logging.info("socket mode connected, listening")
+
+    # Local Socket Mode heal (no agent quota): write socket_heartbeat when
+    # ping/pong is fresh. keepalive.sh restarts this process if the file goes
+    # stale while auth.test still works. Silence of channel events is not death.
+    # Right after connect, missing pong is "warmup" — do not force-reconnect.
+    from socket_health import (
+        DEFAULT_PING_STALE_SEC,
+        connection_health_state,
+        write_heartbeat,
+    )
+    health_every = float(os.environ.get("SOCKET_HEALTH_INTERVAL_SEC") or 30)
+    ping_stale = float(os.environ.get("SOCKET_PING_STALE_SEC") or DEFAULT_PING_STALE_SEC)
+    connected_at = time.time()
+    unhealthy_streak = 0
     try:
         while True:
-            time.sleep(60)
+            try:
+                state = connection_health_state(
+                    smc,
+                    ping_stale_sec=ping_stale,
+                    connected_at=connected_at,
+                )
+                if state == "ok":
+                    write_heartbeat()
+                    if unhealthy_streak:
+                        logging.info(
+                            "socket health recovered after %s bad checks",
+                            unhealthy_streak,
+                        )
+                    unhealthy_streak = 0
+                elif state == "warmup":
+                    if unhealthy_streak == 0:
+                        logging.info("socket health warmup (waiting for first ping/pong)")
+                    unhealthy_streak = 0
+                else:
+                    unhealthy_streak += 1
+                    logging.warning(
+                        "socket unhealthy (streak=%s); forcing reconnect",
+                        unhealthy_streak,
+                    )
+                    try:
+                        smc.connect_to_new_endpoint(force=True)
+                        connected_at = time.time()
+                    except Exception:
+                        logging.exception("forced socket reconnect failed")
+                    state2 = connection_health_state(
+                        smc,
+                        ping_stale_sec=ping_stale,
+                        connected_at=connected_at,
+                    )
+                    if state2 == "ok":
+                        write_heartbeat()
+                        logging.info("socket health ok after forced reconnect")
+                        unhealthy_streak = 0
+            except Exception:
+                logging.exception("socket health check error")
+            time.sleep(health_every)
     except KeyboardInterrupt:
         pass
     finally:
